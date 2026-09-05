@@ -353,7 +353,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
     void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&dsurv,&survcap,&dctr};
     CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
     unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8));
-    if(nsurv>survcap){ fprintf(stderr,"  WARN: survivors %llu > cap %llu (dropped; perf-only)\n",nsurv,survcap); nsurv=survcap; }
+    if(nsurv>survcap){ fprintf(stderr,"ERROR: survivors %llu exceeded the compaction buffer (cap %llu) -- dropping any survivor risks a FALSE not-found (the winner could be dropped). Re-run without --compact, or with a smaller --count window.\n",nsurv,survcap); return 2; }
     void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
     CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize());
     gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
