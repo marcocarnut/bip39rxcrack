@@ -110,7 +110,8 @@ node gate/e2e.js  # xpub end-to-end: plant → crack → assert index / mnemonic
 Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` |
 `--target-chaincode`; `--purpose --change --index --no-checksum`; `--nth` /
 `--no-nth`; `--no-compact` (compaction is on by default); sharding
-`--start --count --limit`; `--rank` (librxe index of an arrangement).
+`--start --count --limit`; `--rank` (librxe index of an arrangement);
+`--resume LOG` (continue a killed run from its progress log).
 
 **Progress & logging.** `-p` prints a live status line (~1/s: elapsed, swept/total,
 rate, ETA — the ETA uses a recent-window rate so it tracks the real throughput):
@@ -125,6 +126,20 @@ rate, ETA — the ETA uses a recent-window rate so it tracks the real throughput
 equals `swept` for a passphrase search, ≈`swept`/16 for a 12-word checksum-sieved
 search). Every mode is windowed, so a run also **early-exits** as soon as it finds
 a hit instead of sweeping the whole space.
+
+The CSV header records **every parameter** of the run as explicit `# key: value`
+lines (`input_kind`, `wp`, `pp`, `target`, `purpose`, `gap`, `change`, `start`,
+`total`, …). **`--resume LOG`** reads that header, reconstructs the run, reads the
+last progress row to see how far it got, and continues from there — appending to
+the same log so the `swept`/`total` columns stay continuous (they are global, so a
+resumed log can itself be resumed). It refuses gracefully if the log already found
+a hit or already swept its whole window.
+
+```sh
+# a long run, killed (Ctrl-C / power loss) — the CSV is all you need to pick up
+bip39rxcrack --pattern "…" --address 1Ap… --gap 5 --loginterval 1000:run.csv
+bip39rxcrack --resume run.csv        # continues from the last logged position
+```
 
 ## Performance
 

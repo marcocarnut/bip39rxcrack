@@ -43,10 +43,57 @@ static int hexnib(int c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')retu
 static int hex2bin(const char*s,uint8_t*o,int max){ int n=0; while(s[0]&&s[1]&&n<max){int hi=hexnib(s[0]),lo=hexnib(s[1]); if(hi<0||lo<0)break; o[n++]=(hi<<4)|lo; s+=2;} return n; }
 static void tohex_(const uint8_t*b,int n,char*o){ static const char*hx="0123456789abcdef"; for(int i=0;i<n;i++){o[i*2]=hx[b[i]>>4];o[i*2+1]=hx[b[i]&15];} o[n*2]=0; }
 
+/* ----------------------------- --resume: parse a saved CSV log ---------- */
+typedef struct { char input_kind[16],target_kind[16],purpose[64],wp[1024],pp[256],target[256],found[256];
+  int change,gap,checksum,nth,compact,loginterval_ms;
+  unsigned long long start,total,swept,hashed; int have_data,outcome_found; } Resume;
+/* copy the value of a "# key: value" header line (first match) into out */
+static void rz_val(const char*content,const char*key,char*out,int outmax){
+  out[0]=0; char pfx[64]; snprintf(pfx,sizeof pfx,"# %s: ",key); size_t pl=strlen(pfx);
+  for(const char*p=content;p;){ const char*nl=strchr(p,'\n'); size_t len=nl?(size_t)(nl-p):strlen(p);
+    if(len>=pl && !strncmp(p,pfx,pl)){ size_t v=len-pl; if(v>=(size_t)outmax) v=outmax-1;
+      memcpy(out,p+pl,v); out[v]=0; return; }
+    p=nl?nl+1:0; }
+}
+static int resume_load(const char*path,Resume*R){
+  FILE*f=fopen(path,"rb"); if(!f){ fprintf(stderr,"--resume: cannot open %s\n",path); return -1; }
+  fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); char*b=malloc(n+1);
+  if(fread(b,1,n,f)!=(size_t)n){ fclose(f); free(b); fprintf(stderr,"--resume: read %s\n",path); return -1; }
+  b[n]=0; fclose(f);
+  memset(R,0,sizeof *R); R->change=R->gap=1; R->checksum=R->compact=1; R->nth=-1;
+  char t[1024];
+  rz_val(b,"input_kind",R->input_kind,sizeof R->input_kind);
+  rz_val(b,"wp",R->wp,sizeof R->wp);  rz_val(b,"pp",R->pp,sizeof R->pp);
+  rz_val(b,"target_kind",R->target_kind,sizeof R->target_kind);
+  rz_val(b,"target",R->target,sizeof R->target);
+  rz_val(b,"purpose",R->purpose,sizeof R->purpose);
+  rz_val(b,"change",t,sizeof t); if(t[0])R->change=atoi(t);
+  rz_val(b,"gap",t,sizeof t);    if(t[0])R->gap=atoi(t);
+  rz_val(b,"checksum",t,sizeof t);if(t[0])R->checksum=atoi(t);
+  rz_val(b,"nth",t,sizeof t);    if(t[0])R->nth=atoi(t);
+  rz_val(b,"compact",t,sizeof t);if(t[0])R->compact=atoi(t);
+  rz_val(b,"start",t,sizeof t);  R->start=t[0]?strtoull(t,0,10):0;
+  rz_val(b,"total",t,sizeof t);  R->total=t[0]?strtoull(t,0,10):0;
+  rz_val(b,"loginterval_ms",t,sizeof t); if(t[0])R->loginterval_ms=atoi(t);
+  rz_val(b,"outcome",t,sizeof t); if(!strcmp(t,"FOUND")){ R->outcome_found=1; rz_val(b,"found",R->found,sizeof R->found); }
+  /* last DATA row (leading digit): columns t_ms,swept,swept_total,pct,rate,hashed,eta */
+  { char*p=b,*last=0; while(p&&*p){ char*nl=strchr(p,'\n'); if(*p>='0'&&*p<='9') last=p; p=nl?nl+1:0; }
+    if(last){ R->have_data=1; unsigned long long fld[7]={0}; int k=0; char*q=last;
+      while(k<7&&q){ fld[k++]=strtoull(q,0,10); q=strchr(q,','); if(q)q++; }
+      R->swept=fld[1]; R->hashed=fld[5]; } }
+  free(b); return 0;
+}
+
 /* ------------------------ NVRTC build (with include inliner) ------------ */
 static CUcontext g_ctx; static CUmodule g_mod;
 static int g_pflag=0, g_loginterval_ms=0, g_csv_own=0; static double g_p_secs=0; static FILE *g_csv=0;
 static const char *g_target_str=0, *g_pattern_str=0;
+/* resume/header params (recorded in the CSV header, reconstructed by --resume) */
+static const char *g_input_kind=0,*g_wp=0,*g_pp=0,*g_target_kind=0,*g_purpose_str=0;
+static int g_change_v=1,g_gap_v=1,g_checksum_v=1,g_nth_v=-1,g_compact_v=1;
+static unsigned long long g_orig_start=0;
+/* --resume overrides: report global progress over the ORIGINAL job window */
+static unsigned long long g_prog_total=0, g_swept_base=0, g_hashed_base=0; static int g_resuming=0;
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
   char dir[512]; snprintf(dir,sizeof dir,"%s",cu); char*sl=strrchr(dir,'/'); if(sl)*sl=0; else strcpy(dir,".");
@@ -115,12 +162,13 @@ static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?
  *      MS[:FILE] : CSV every MS ms (reseed39 browser log shape: # header, rows,
  *      # footer). The two cadences are INDEPENDENT. hashed = cumulative
  *      survivors that reached PBKDF2 (the real work). */
-typedef struct { unsigned long long total,swept,hashed; double t0;
+typedef struct { unsigned long long total,swept,hashed,swept_base,hashed_base; double t0;
   int p; double p_interval,p_last,p_win_t; unsigned long long p_win_swept;   /* -p cadence */
   FILE*csv; int csv_own; double csv_interval,csv_last; } Prog;               /* CSV cadence */
 static double now_s(void){ struct timeval tv; gettimeofday(&tv,0); return tv.tv_sec+tv.tv_usec/1e6; }
 static void prog_init(Prog*P, unsigned long long total, int p, double p_secs, int loginterval_ms, FILE*csv, int csv_own){
-  memset(P,0,sizeof *P); P->total=total; P->p=p; P->csv=csv; P->csv_own=csv_own;
+  memset(P,0,sizeof *P); P->total = g_prog_total?g_prog_total:total; P->p=p; P->csv=csv; P->csv_own=csv_own;
+  P->swept_base=g_swept_base; P->hashed_base=g_hashed_base;
   P->p_interval = p_secs>0?p_secs:1.0;
   P->csv_interval = loginterval_ms>0?loginterval_ms/1000.0:0.0;
   P->t0=P->p_last=P->csv_last=P->p_win_t=now_s();
@@ -135,27 +183,39 @@ static double prog_intv(const Prog*P){
 static void prog_hdr(Prog*P,const char*mode,const char*target,const char*pattern,const char*path,
                      unsigned long long chunk,unsigned long long budget_mb){
   if(!P->csv) return;
+  if(g_resuming){   /* appending to an existing log: just a marker, header already present */
+    fprintf(P->csv,"# --- resumed: from swept=%llu (global index %llu) ts_ms=%.0f ---\n",
+      g_swept_base, g_orig_start+g_swept_base, now_s()*1000.0); fflush(P->csv); return; }
+  /* explicit, one-per-line "# key: value" so --resume can reconstruct the run */
   fprintf(P->csv,"# bip39rxcrack progress log\n# engine: cuda NVRTC13->compute_120->sm_120  device: RTX 5090\n");
-  fprintf(P->csv,"# mode: %s\n# target: %s  path: %s\n# pattern: %s\n",mode,target?target:"",path?path:"",pattern?pattern:"");
-  fprintf(P->csv,"# total: %llu  chunk: %llu  budget_mb: %llu\n# start_ts_ms: %.0f\n",P->total,chunk,budget_mb,now_s()*1000.0);
+  fprintf(P->csv,"# mode: %s\n",mode);
+  fprintf(P->csv,"# input_kind: %s\n# wp: %s\n# pp: %s\n",g_input_kind?g_input_kind:"",g_wp?g_wp:"",g_pp?g_pp:"");
+  fprintf(P->csv,"# target_kind: %s\n# target: %s\n# path: %s\n",g_target_kind?g_target_kind:"",target?target:"",path?path:"");
+  fprintf(P->csv,"# purpose: %s\n# change: %d\n# gap: %d\n# checksum: %d\n# nth: %d\n# compact: %d\n",
+    g_purpose_str?g_purpose_str:"auto",g_change_v,g_gap_v,g_checksum_v,g_nth_v,g_compact_v);
+  fprintf(P->csv,"# start: %llu\n# total: %llu\n# chunk: %llu\n# budget_mb: %llu\n# loginterval_ms: %d\n# start_ts_ms: %.0f\n",
+    g_orig_start,P->total,chunk,budget_mb,g_loginterval_ms,now_s()*1000.0);
   fprintf(P->csv,"t_ms,swept,swept_total,pct,rate,hashed,eta_s\n"); fflush(P->csv);
+  (void)pattern;
 }
 /* -p human line: ETA from a TRAILING-window rate (settles faster than cumulative). */
 static void prog_emit_p(Prog*P){
   double now=now_s(), el=now-P->t0, cum=el>0?P->swept/el/1e6:0.0;
+  unsigned long long gsw=P->swept_base+P->swept, ghash=P->hashed_base+P->hashed;
   double dwt=now-P->p_win_t; unsigned long long dsw=P->swept-P->p_win_swept;
-  double inst=dwt>0.01?dsw/dwt/1e6:cum, pct=P->total?100.0*P->swept/P->total:0.0;
-  double eta=(inst>0&&P->total>P->swept)?(P->total-P->swept)/(inst*1e6):0.0;
+  double inst=dwt>0.01?dsw/dwt/1e6:cum, pct=P->total?100.0*gsw/P->total:0.0;
+  double eta=(inst>0&&P->total>gsw)?(P->total-gsw)/(inst*1e6):0.0;
   fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
-      el,P->swept/1e6,P->total/1e6,pct,inst,P->hashed/1e6,eta);
+      el,gsw/1e6,P->total/1e6,pct,inst,ghash/1e6,eta);
   P->p_last=now; P->p_win_t=now; P->p_win_swept=P->swept;
 }
 /* CSV row: cumulative rate (t_ms+swept let you derive instantaneous by deltas). */
 static void prog_emit_csv(Prog*P){
-  double now=now_s(), el=now-P->t0, cum=el>0?P->swept/el/1e6:0.0;
-  double pct=P->total?100.0*P->swept/P->total:0.0;
-  double eta=(cum>0&&P->total>P->swept)?(P->total-P->swept)/(cum*1e6):0.0;
-  fprintf(P->csv,"%.0f,%llu,%llu,%.3f,%.3f,%llu,%.1f\n",el*1000.0,P->swept,P->total,pct,cum,P->hashed,eta);
+  double now=now_s(), el=now-P->t0, cum=el>0?P->swept/el/1e6:0.0;   /* rate is THIS run's throughput */
+  unsigned long long gsw=P->swept_base+P->swept, ghash=P->hashed_base+P->hashed;
+  double pct=P->total?100.0*gsw/P->total:0.0;
+  double eta=(cum>0&&P->total>gsw)?(P->total-gsw)/(cum*1e6):0.0;
+  fprintf(P->csv,"%.0f,%llu,%llu,%.3f,%.3f,%llu,%.1f\n",el*1000.0,gsw,P->total,pct,cum,ghash,eta);
   fflush(P->csv); P->csv_last=now;
 }
 static void prog_tick(Prog*P, unsigned long long swept, unsigned long long hashed){
@@ -194,7 +254,7 @@ static void load_wordlist(char names[2048][16]){
 static int bip39_index(char names[2048][16],const char*w){ for(int i=0;i<2048;i++) if(!strcmp(names[i],w)) return i; return -1; }
 static void parse_words(Words*W,const char*csv){
   static char names[2048][16]; load_wordlist(names);
-  W->n=0; char buf[1024]; snprintf(buf,sizeof buf,"%s",csv);
+  W->n=0; char buf[2048]; snprintf(buf,sizeof buf,"%s",csv);
   char*s=strtok(buf," ,\t\r\n");
   while(s){ if(W->n>=32){fprintf(stderr,"max 32 words (v1)\n");exit(2);} snprintf(W->word[W->n],16,"%s",s);
     int bi=bip39_index(names,s); if(bi<0){fprintf(stderr,"'%s' is not a BIP39 English word\n",s);exit(2);}
@@ -780,6 +840,9 @@ static void usage(void){
    "  --loginterval MS[:FILE] CSV log every MS ms (to stderr, or FILE); columns\n"
    "                            t_ms,swept,swept_total,pct,rate,hashed,eta_s\n"
    "                          (-p and --loginterval cadences are independent)\n"
+   "  --resume LOG            reconstruct a killed run from its CSV LOG (header\n"
+   "                          carries every param) and continue from the last\n"
+   "                          swept row, appending to the same LOG\n"
    "\n"
    "GATES/UTIL:\n"
    "  --ec-gate [F] --addr-gate [F] --recon-gate [N] --dump-valid N --rank \"..\" --decode ADDR\n");
@@ -795,6 +858,7 @@ int main(int argc,char**argv){
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
+  const char *resumearg=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -825,7 +889,39 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--change")&&i+1<argc) a_changes=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--gap")&&i+1<argc) a_gap=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
+    else if(!strcmp(argv[i],"--resume")&&i+1<argc) resumearg=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
+  }
+  /* --resume LOG: reconstruct the run from a saved CSV log and continue from
+     the last swept position. The log header carries every parameter; the last
+     data row says how far it got (columns are GLOBAL, so re-resume also works). */
+  if(resumearg){
+    Resume R; if(resume_load(resumearg,&R)) return 2;
+    if(R.outcome_found){ printf("--resume: log already reports FOUND: %s\n",R.found); return 0; }
+    if(!R.have_data){ fprintf(stderr,"--resume: no progress rows in %s (nothing to resume)\n",resumearg); return 2; }
+    if(R.total && R.swept>=R.total){ printf("--resume: window already complete (%llu/%llu swept, not found)\n",R.swept,R.total); return 1; }
+    /* input axis */
+    if(!strcmp(R.input_kind,"pattern"))      patt=R.wp;
+    else if(!strcmp(R.input_kind,"template"))templ=R.wp;
+    else if(!strcmp(R.input_kind,"passphrase")){ mnemonic=R.wp; passphrase=R.pp; }
+    else if(!strcmp(R.input_kind,"words"))   words=R.wp;
+    else { fprintf(stderr,"--resume: unknown input_kind '%s'\n",R.input_kind); return 2; }
+    /* target axis */
+    if(!strcmp(R.target_kind,"address"))       address=R.target;
+    else if(!strcmp(R.target_kind,"xpub"))     xpub=R.target;
+    else if(!strcmp(R.target_kind,"chaincode"))tcc_hex=R.target;
+    /* purpose: "auto" => re-derive from the address; else the recorded list */
+    if(R.purpose[0] && strcmp(R.purpose,"auto")){ npurp=0; purpose_set=1;
+      char pb[64]; snprintf(pb,sizeof pb,"%s",R.purpose); char*sp=strtok(pb,","); while(sp&&npurp<8){purposes[npurp++]=(uint32_t)atoi(sp);sp=strtok(0,",");} }
+    a_changes=(uint32_t)R.change; a_gap=(uint32_t)R.gap; require_ck=R.checksum; nthmode=R.nth; compact=R.compact;
+    cstart = R.start + R.swept;                 /* resume from where it left off */
+    ccount = (R.total>R.swept)?(R.total-R.swept):0;
+    /* report GLOBAL progress over the ORIGINAL window; continue the same log */
+    g_orig_start=R.start; g_swept_base=R.swept; g_hashed_base=R.hashed; g_prog_total=R.total; g_resuming=1;
+    if(!g_csv){ g_csv=fopen(resumearg,"a"); g_csv_own=1; if(!g_csv){fprintf(stderr,"--resume: cannot append %s\n",resumearg);return 2;}
+      if(R.loginterval_ms>0) g_loginterval_ms=R.loginterval_ms; }
+    fprintf(stderr,"--resume: %s | resuming at global index %llu (%llu/%llu, %.1f%%), %llu remaining\n",
+      resumearg,cstart,R.swept,R.total,R.total?100.0*R.swept/R.total:0.0,ccount);
   }
   /* --pattern: a raw librxe mnemonic pattern (== reseed39 wp). {{..}} => words
      permutation; else a missing-word template with [:dict:] wildcards. */
@@ -835,6 +931,18 @@ int main(int argc,char**argv){
   g_target_str = address?address:(xpub?xpub:tcc_hex);
   if(patt) g_pattern_str = patt;
   g_pattern_str = words?words:(templ?templ:passphrase);
+  /* record the run's parameters for the CSV header / --resume (fresh runs) */
+  if(!g_resuming){
+    g_orig_start=cstart;
+    g_change_v=(int)a_changes; g_gap_v=(int)a_gap; g_checksum_v=require_ck; g_nth_v=nthmode; g_compact_v=compact;
+    g_input_kind = patt?"pattern":(templ?"template":((mnemonic&&passphrase)?"passphrase":(words?"words":"")));
+    g_wp = patt?patt:(templ?templ:((mnemonic&&passphrase)?mnemonic:(words?words:"")));
+    g_pp = (mnemonic&&passphrase)?passphrase:"";
+    g_target_kind = address?"address":(xpub?"xpub":(tcc_hex?"chaincode":""));
+    static char purpbuf[64];
+    if(purpose_set){ int L=0; for(int i=0;i<npurp;i++) L+=snprintf(purpbuf+L,sizeof purpbuf-L,"%s%u",i?",":"",purposes[i]); g_purpose_str=purpbuf; }
+    else g_purpose_str="auto";
+  }
   /* gate/util modes need no pattern */
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
