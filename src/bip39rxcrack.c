@@ -44,6 +44,8 @@ static void tohex_(const uint8_t*b,int n,char*o){ static const char*hx="01234567
 
 /* ------------------------ NVRTC build (with include inliner) ------------ */
 static CUcontext g_ctx; static CUmodule g_mod;
+static int g_pflag=0, g_loginterval_ms=0, g_csv_own=0; static FILE *g_csv=0;
+static const char *g_target_str=0, *g_pattern_str=0;
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
   char dir[512]; snprintf(dir,sizeof dir,"%s",cu); char*sl=strrchr(dir,'/'); if(sl)*sl=0; else strcpy(dir,".");
@@ -105,6 +107,64 @@ static void build_module(const char *cu_path){
 }
 static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
 static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?n:1)); if(n&&h) CU(cuMemcpyHtoD(d,h,n)); return d; }
+
+/* ------------------------- progress reporting -------------------------- */
+/* -p : ~1/sec human line to stderr (ETA from a TRAILING-window rate, which
+ *      settles faster than the cumulative rate). --loginterval MS[:FILE] : CSV
+ *      matching the (re)seed39 browser log shape (# header, rows, # footer).
+ *      hashed = cumulative survivors that reached PBKDF2 (the real work). */
+typedef struct { unsigned long long total,swept,hashed; double t0,t_last,win_t; unsigned long long win_swept;
+                 int p; double interval; FILE*csv; int csv_own; } Prog;
+static double now_s(void){ struct timeval tv; gettimeofday(&tv,0); return tv.tv_sec+tv.tv_usec/1e6; }
+static void prog_init(Prog*P, unsigned long long total, int p, int loginterval_ms, FILE*csv, int csv_own){
+  memset(P,0,sizeof *P); P->total=total; P->p=p; P->csv=csv; P->csv_own=csv_own;
+  P->interval = loginterval_ms>0 ? loginterval_ms/1000.0 : (p?1.0:0.0);
+  P->t0=P->t_last=P->win_t=now_s();
+}
+static void prog_hdr(Prog*P,const char*mode,const char*target,const char*pattern,const char*path,
+                     unsigned long long chunk,unsigned long long budget_mb){
+  if(!P->csv) return;
+  fprintf(P->csv,"# bip39rxcrack progress log\n# engine: cuda NVRTC13->compute_120->sm_120  device: RTX 5090\n");
+  fprintf(P->csv,"# mode: %s\n# target: %s  path: %s\n# pattern: %s\n",mode,target?target:"",path?path:"",pattern?pattern:"");
+  fprintf(P->csv,"# total: %llu  chunk: %llu  budget_mb: %llu\n# start_ts_ms: %.0f\n",P->total,chunk,budget_mb,now_s()*1000.0);
+  fprintf(P->csv,"t_ms,swept,swept_total,pct,rate,hashed,eta_s\n"); fflush(P->csv);
+}
+static void prog_emit(Prog*P){
+  double now=now_s(), el=now-P->t0;
+  double cum=el>0?P->swept/el/1e6:0.0;
+  double dwt=now-P->win_t; unsigned long long dsw=P->swept-P->win_swept;
+  double inst=dwt>0.01?dsw/dwt/1e6:cum;
+  double pct=P->total?100.0*P->swept/P->total:0.0;
+  double eta=(inst>0&&P->total>P->swept)?(P->total-P->swept)/(inst*1e6):0.0;
+  if(P->p) fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
+      el,P->swept/1e6,P->total/1e6,pct,inst,P->hashed/1e6,eta);
+  if(P->csv) fprintf(P->csv,"%.0f,%llu,%llu,%.3f,%.3f,%llu,%.1f\n",el*1000.0,P->swept,P->total,pct,cum,P->hashed,eta);
+  if(P->csv) fflush(P->csv);
+  P->t_last=now; P->win_t=now; P->win_swept=P->swept;
+}
+static void prog_tick(Prog*P, unsigned long long swept, unsigned long long hashed){
+  P->swept=swept; P->hashed=hashed;
+  if(P->interval>0 && now_s()-P->t_last>=P->interval) prog_emit(P);
+}
+static void prog_finish(Prog*P, const char*outcome, const char*found, const char*path){
+  if(P->interval>0) prog_emit(P);
+  if(P->p) fprintf(stderr,"\n");
+  if(P->csv){ fprintf(P->csv,"# outcome: %s\n# found: %s  path: %s\n# elapsed_ms: %.0f\n",
+      outcome,found?found:"",path?path:"",(now_s()-P->t0)*1000.0); fflush(P->csv); if(P->csv_own) fclose(P->csv); }
+}
+/* choose a chunk so reports land ~every interval; smaller when reporting is on. */
+static unsigned long long report_chunk(int reporting){ return reporting ? (1ULL<<20) : (64ULL<<20); }
+/* size the NEXT chunk so it takes ~interval seconds (report lands ~every tick). */
+static unsigned long long next_chunk(unsigned long long ccount,double csecs,double interval,int reporting){
+  if(!reporting) return 64ULL<<20;
+  if(csecs<=0||interval<=0) return ccount;
+  double c=(double)ccount/csecs*interval;               /* candidates in ~interval */
+  unsigned long long r=(unsigned long long)c;
+  if(r<(1ULL<<20)) r=1ULL<<20;                          /* min 1M: launch overhead */
+  if(r>(64ULL<<20)) r=64ULL<<20;                        /* max 64M: bounded buffer */
+  return r;
+}
+
 
 /* ------------------------- base words / wordlist ------------------------ */
 typedef struct { int n; char word[32][16]; uint32_t bip39[32]; } Words;
@@ -305,21 +365,35 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
   if(start_lo+count>total_u) count=total_u-start_lo;
   int n=W->n,size=W->n;
   int tpb=128, grid=1024;   /* grid-stride covers the whole shard */
-  void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start_lo,&start_hi,&count,&dpu,&npurp,&dtc,&require_ck,&dhi,&dfound,&dpur};
-  fprintf(stderr,"enumerating %llu candidates from index %llu (checksum-%s, %d purpose%s) on GPU...\n",
+  unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
+  unsigned long long cstart=start_lo,ccount=0;
+  void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&start_hi,&ccount,&dpu,&npurp,&dtc,&require_ck,&dhi,&dfound,&dpur,&dhashed};
+  int reporting=(g_pflag||g_loginterval_ms);
+  char path[64]; snprintf(path,sizeof path,"xpub account chaincode (%d purpose%s)",npurp,npurp>1?"s":"");
+  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  prog_hdr(&P,"xpub (words, EC-free)",g_target_str,g_pattern_str,path,0,0);
+  double intv=P.interval>0?P.interval:1.0;
+  fprintf(stderr,"enumerating %llu candidates from %llu (checksum-%s, %d purpose%s)...\n",
           count,start_lo,require_ck?"ON":"OFF",npurp,npurp>1?"s":"");
-  struct timeval t0,t1; gettimeofday(&t0,0);
-  CU(cuLaunchKernel(kern("g_crack"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-  gettimeofday(&t1,0);
-  double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (raw enumerate+sieve%s)\n",
-          count,secs,count/secs/1e6, require_ck?"->PBKDF2 on survivors":"+PBKDF2 all");
-  int found=0,fpur=0; unsigned long long hidx=0;
-  CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8)); CU(cuMemcpyDtoH(&fpur,dpur,4));
-  if(!found){ printf("NOT FOUND (no candidate derived the target chain code)\n"); return 1; }
+  int found=0; unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
+  for(cstart=start_lo; cstart<start_lo+count; ){
+    ccount=(start_lo+count-cstart<chunk)?(start_lo+count-cstart):chunk; double c0=now_s();
+    CU(cuLaunchKernel(kern("g_crack"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+    CU(cuMemcpyDtoH(&hashed,dhashed,8)); prog_tick(&P,swept,require_ck?hashed:swept);
+    CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,reporting);
+  }
+  double secs=now_s()-tt0;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (enumerate+sieve%s%s)\n",
+          swept,secs,swept/secs/1e6, require_ck?"->PBKDF2 on survivors":"+PBKDF2 all", swept<count?", early-exit":"");
+  int fpur=0; unsigned long long hidx=0;
+  CU(cuMemcpyDtoH(&hidx,dhi,8)); CU(cuMemcpyDtoH(&fpur,dpur,4));
+  if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND (no candidate derived the target chain code)\n"); return 1; }
   /* render the found mnemonic via librxe (canonical) */
   mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
   char*t=buf; while(*t==' ')t++;
+  prog_finish(&P,"FOUND",t,path);
   printf("FOUND\n");
   printf("  index   : %llu\n",hidx);
   printf("  mnemonic: %s\n",t);
@@ -344,7 +418,12 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   unsigned long long start=ustart>total_u?total_u:ustart;
   unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
   int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
-  int tpb=128,grid=1024; struct timeval t0,t1; double secs=0;
+  int tpb=128,grid=1024; struct timeval t0,t1; double secs=0; (void)t0;(void)t1;
+  int reporting=(g_pflag||g_loginterval_ms);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  double intv=P.interval>0?P.interval:1.0;
+  unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
   int used_compact=0;
   if(compact && require_ck){
     /* CHUNKED compaction: size the survivor buffer for a chunk's FULL size
@@ -361,13 +440,13 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
     if(dsurv){
       used_compact=1;
       unsigned long long z64=0; CUdeviceptr dctr=up(&z64,8);
-      unsigned long long nchunks=(count+C-1)/C;
-      fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates in %llu chunk(s) of <=%llu (buffer %llu MiB) -> m/%d'/0'/0'/%u/%u ...\n",
-              count, nchunks, C, C*8/1024/1024, purpose,change,index);
-      gettimeofday(&t0,0);
-      int found=0; unsigned long long tot_surv=0, swept=0;
-      for(unsigned long long cs=start; cs<start+count; cs+=C){
-        unsigned long long cc = (start+count-cs < C) ? (start+count-cs) : C; swept+=cc;
+      prog_hdr(&P,"regime B (words, compacted)",g_target_str,g_pattern_str,path,C,C*8/1024/1024);
+      fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates, buffer %llu MiB -> %s ...\n",count,C*8/1024/1024,path);
+      double tt0=now_s(); int found=0; unsigned long long tot_surv=0, swept=0;
+      unsigned long long cchunk = reporting?(1ULL<<20):C;
+      for(unsigned long long cs=start; cs<start+count; ){
+        unsigned long long cc = (start+count-cs < cchunk) ? (start+count-cs) : cchunk;
+        double c0=now_s();
         CU(cuMemcpyHtoD(dctr,&z64,8));
         void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&cs,&cc,&dsurv,&C,&dctr};
         CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
@@ -375,30 +454,41 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
         if(nsurv>C){ fprintf(stderr,"ERROR: chunk survivors %llu > chunk size %llu -- impossible (bug)\n",nsurv,C); return 2; }
         if(nsurv){ void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
           CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
-        CU(cuMemcpyDtoH(&found,dfound,4));
-        if(found) break;   /* this chunk holds the global-lowest hit */
+        double csecs=now_s()-c0; swept+=cc; cs+=cc; prog_tick(&P,swept,tot_surv);
+        CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
+        cchunk=next_chunk(cc,csecs,intv,reporting); if(cchunk>C) cchunk=C;
       }
-      gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-      cuMemFree(dsurv);
+      secs=now_s()-tt0; cuMemFree(dsurv);
       fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s  (%llu survivors -> dense PBKDF2%s)\n",swept,secs,swept/secs/1e6,tot_surv,swept<count?", early-exit":"");
     } else {
       fprintf(stderr,"regime B: compaction buffer won't allocate on this GPU -- falling back to fused.\n");
     }
   }
+  int found=0;
   if(!used_compact){
-    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound};
-    fprintf(stderr,"regime B: %llu permutations from %llu (checksum-%s) -> m/%d'/0'/0'/%u/%u ...\n",
-            count,start,require_ck?"ON":"OFF",purpose,change,index);
-    gettimeofday(&t0,0);
-    CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-    gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors)\n",count,secs,count/secs/1e6);
+    unsigned long long cstart=start,ccount=0;
+    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&ccount,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound,&dhashed};
+    prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
+    fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path);
+    double tt0=now_s(); unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
+    for(cstart=start; cstart<start+count; ){
+      ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk;
+      double c0=now_s();
+      CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+      double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+      CU(cuMemcpyDtoH(&hashed,dhashed,8)); prog_tick(&P,swept,require_ck?hashed:swept);
+      CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
+      chunk=next_chunk(ccount,csecs,intv,reporting);
+    }
+    secs=now_s()-tt0;
+    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors%s)\n",swept,secs,swept/secs/1e6,swept<count?", early-exit":"");
   }
   (void)secs;
-  int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
-  if(!found){ printf("NOT FOUND\n"); return 1; }
+  unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
   char*t=buf; while(*t==' ')t++;
+  prog_finish(&P,"FOUND",t,path);
   printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : m/%d'/0'/0'/%u/%u\n",hidx,t,purpose,change,index);
   mpz_clear(j); rxe_free(r); return 0;
 }
@@ -449,26 +539,40 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
   unsigned long long init=~0ULL; int zero=0;
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4),dhg=up(0,W*sizeof(uint32_t));
-  uint32_t pu=(uint32_t)purpose; int Uarg = nth ? U : U;   /* kernel U: nth uses U-1 others but reads U-1; pass total for nth */
-  int passU = nth ? U : U;
-  void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&start,&count,&pu,&change,&index,&dtp,&dhi,&dfound,&dhg};
-  int tpb=128,grid=1024;
-  fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (m/%d'/0'/0'/%u/%u)...\n",
-          nth?"[:Nth:] CONSTRUCTION":"baseline sieve", W, U, nth?" (last=checksum-constructed)":"", count, purpose, change, index);
-  struct timeval t0,t1; gettimeofday(&t0,0);
-  CU(cuLaunchKernel(kern(nth?"g_crack_nth":"g_crack_missing"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-  gettimeofday(&t1,0); double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-  fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s)\n",count,secs,count/secs/1e6,
-          nth?"all valid, no sieve":"sieve->PBKDF2+EC on survivors");
-  int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
-  if(!found){ printf("NOT FOUND\n"); return 1; }
+  uint32_t pu=(uint32_t)purpose; int passU=U;
+  unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
+  unsigned long long cstart=start,ccount=0;
+  void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&cstart,&ccount,&pu,&change,&index,&dtp,&dhi,&dfound,&dhg,&dhashed};
+  int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  prog_hdr(&P, nth?"missing-word [:Nth:]":"missing-word baseline", g_target_str,g_pattern_str,path,0,0);
+  double intv=P.interval>0?P.interval:1.0;
+  fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
+          nth?"[:Nth:] CONSTRUCTION":"baseline sieve", W, U, nth?" (last=checksum-constructed)":"", count, path);
+  int found=0; unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
+  for(cstart=start; cstart<start+count; ){
+    ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
+    CU(cuLaunchKernel(kern(nth?"g_crack_nth":"g_crack_missing"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+    if(nth) hashed=swept; else CU(cuMemcpyDtoH(&hashed,dhashed,8));
+    prog_tick(&P,swept,hashed);
+    CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,reporting);
+  }
+  double secs=now_s()-tt0;
+  fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s%s)\n",swept,secs,swept/secs/1e6,
+          nth?"all valid, no sieve":"sieve->PBKDF2+EC on survivors", swept<count?", early-exit":"");
+  unsigned long long hidx=0; CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   uint32_t hg[32]; CU(cuMemcpyDtoH(hg,dhg,W*sizeof(uint32_t)));
   printf("FOUND\n  index    : %llu\n  found words:",hidx);
   for(int i=0;i<U;i++) printf(" [pos %d]=%s",upos[i],WLNAME((int)hg[upos[i]]));
   printf("\n  mnemonic :");
   for(int p=0;p<W;p++) printf(" %s",WLNAME((int)hg[p]));
   printf("\n  path     : m/%d'/0'/0'/%u/%u\n",purpose,change,index);
-  (void)CS;(void)Uarg; return 0;
+  { char fw[256]; int L=0; for(int i=0;i<U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[upos[i]])); prog_finish(&P,"FOUND",fw,path); }
+  (void)CS; return 0;
 }
 
 /* --------------------------- EC gate (vs oracle) ------------------------ */
@@ -557,16 +661,31 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
   unsigned long long init=~0ULL; int zero=0;
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
   uint32_t pu=(uint32_t)purpose;
-  void*args[]={&dhctx,&pwidth,&start,&count,&pu,&change,&index,&dtp,&dhi,&dfound};
-  int tpb=128,grid=1024;
+  unsigned long long cstart=start,ccount=0;
+  void*args[]={&dhctx,&pwidth,&cstart,&ccount,&pu,&change,&index,&dtp,&dhi,&dfound};
+  int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
+  unsigned long long chunk=reporting?report_chunk(1):(64ULL<<20); if(chunk==0)chunk=1;
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  prog_hdr(&P,"regime A (passphrase)",g_target_str,g_pattern_str,path,chunk,0);
   fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d)...\n",pwidth,count,start,purpose);
-  struct timeval t0,t1; gettimeofday(&t0,0);
-  CU(cuLaunchKernel(kern("g_crack_pass"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-  gettimeofday(&t1,0); double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (PBKDF2+EC every candidate)\n",count,secs,count/secs/1e6);
-  int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
-  if(!found){ printf("NOT FOUND\n"); return 1; }
+  int found=0; unsigned long long swept=0; double tt0=now_s();
+  double intv = P.interval>0?P.interval:1.0;
+  for(cstart=start; cstart<start+count; ){
+    ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk;
+    double c0=now_s();
+    CU(cuLaunchKernel(kern("g_crack_pass"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    double csecs=now_s()-c0;
+    swept+=ccount; cstart+=ccount; prog_tick(&P,swept,swept);   /* no sieve: hashed==swept */
+    CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,reporting);
+  }
+  double secs=now_s()-tt0;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (PBKDF2+EC every candidate%s)\n",swept,secs,swept/secs/1e6,swept<count?", early-exit":"");
+  unsigned long long hidx=0; CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   char pass[24]; unsigned long long q=hidx; for(int p=pwidth-1;p>=0;p--){ pass[p]=(char)('0'+(int)(q%10)); q/=10; } pass[pwidth]=0;
+  prog_finish(&P,"FOUND",pass,path);
   printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : m/%d'/0'/0'/%u/%u\n",hidx,pass,purpose,change,index);
   return 0;
 }
@@ -604,6 +723,10 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--no-checksum")) require_ck=0;
     else if(!strcmp(argv[i],"--compact")) compact=1;
     else if(!strcmp(argv[i],"--no-compact")) compact=0;
+    else if(!strcmp(argv[i],"-p")) g_pflag=1;
+    else if(!strcmp(argv[i],"--loginterval")&&i+1<argc){ char*a=argv[++i]; char*colon=strchr(a,':');
+      if(colon){ *colon=0; g_loginterval_ms=atoi(a); g_csv=fopen(colon+1,"w"); g_csv_own=1; if(!g_csv){fprintf(stderr,"cannot open %s\n",colon+1);return 2;} }
+      else { g_loginterval_ms=atoi(a); g_csv=stderr; } }
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
@@ -623,6 +746,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
+  g_target_str = address?address:(xpub?xpub:tcc_hex);
+  g_pattern_str = words?words:(templ?templ:passphrase);
   /* gate/util modes need no pattern */
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
