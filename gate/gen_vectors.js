@@ -33,6 +33,7 @@ if (WORDS.length !== 2048) { console.error(`wordlist not 2048 (${WORDS.length})`
 
 const OUT = path.join(__dirname, '..', 'vectors');
 fs.mkdirSync(OUT, { recursive: true });
+const hex = b => Buffer.from(b).toString('hex');
 
 // Anchor the oracle to published ground truth: the generator itself asserts the
 // FIPS SHA-512 KAT and BIP32 test-vector-1 constants before emitting anything.
@@ -64,7 +65,6 @@ function rnd() {
 function rbyte() { return Math.floor(rnd() * 256) & 0xff; }
 function rbytes(n) { const a = Buffer.alloc(n); for (let i = 0; i < n; i++) a[i] = rbyte(); return a; }
 function rint(n) { return Math.floor(rnd() * n); }
-const hex = b => Buffer.from(b).toString('hex');
 
 // ---- entropy -> valid BIP39 mnemonic (standard SHA-256 checksum) -----------
 // English wordlist is pure ASCII so the mnemonic bytes == UTF-8 == NFKD(mnemonic).

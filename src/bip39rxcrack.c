@@ -85,7 +85,22 @@ static void build_module(const char *cu_path){
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
   cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
   CU(cuCtxCreate(&g_ctx,0,dev)); CU(cuModuleLoadDataEx(&g_mod,ptx,0,0,0));
+  /* Build the fixed-base comb table once, then point the device global d_comb
+     at it so k*G uses the comb (64 adds) instead of double-and-add (~384 ops). */
+  { CUdeviceptr tbl; CU(cuMemAlloc(&tbl,(size_t)64*16*8*sizeof(unsigned long long)));
+    CUfunction gi; if(cuModuleGetFunction(&gi,g_mod,"g_comb_init")==CUDA_SUCCESS){
+      void*a[]={&tbl}; CU(cuLaunchKernel(gi,1,1,1,1,1,1,0,0,a,0)); CU(cuCtxSynchronize());
+      CUdeviceptr sym; size_t sz; if(cuModuleGetGlobal(&sym,&sz,g_mod,"d_comb")==CUDA_SUCCESS) CU(cuMemcpyHtoD(sym,&tbl,sizeof tbl));
+    } }
   fprintf(stderr,"device: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n",name,M,m);
+  if(getenv("KERN_INFO")){
+    const char*ks[]={"g_crack_pass","g_crack_addr","g_crack"};
+    for(int i=0;i<3;i++){ CUfunction f; if(cuModuleGetFunction(&f,g_mod,ks[i])!=CUDA_SUCCESS) continue;
+      int regs=0,lmem=0,smem=0,maxb=0; cuFuncGetAttribute(&regs,CU_FUNC_ATTRIBUTE_NUM_REGS,f);
+      cuFuncGetAttribute(&lmem,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,f); cuFuncGetAttribute(&smem,CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,f);
+      cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxb,f,128,0);
+      fprintf(stderr,"  [kern] %-13s regs=%d local=%dB shared=%dB maxblocks@128=%d\n",ks[i],regs,lmem,smem,maxb); }
+  }
   free(ptx);
 }
 static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
@@ -422,13 +437,16 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
   build_module(cu);
   int mnlen=(int)strlen(mnemonic);
   CUdeviceptr dmn=up(mnemonic,mnlen), dtp=up(tprog,32);
+  /* precompute the fixed-mnemonic HMAC key context once (regime A) */
+  CUdeviceptr dhctx; CU(cuMemAlloc(&dhctx,16*sizeof(unsigned long long)));
+  { void*ia[]={&dmn,&mnlen,&dhctx}; CU(cuLaunchKernel(kern("g_hctx_init"),1,1,1,1,1,1,0,0,ia,0)); CU(cuCtxSynchronize()); }
   unsigned long long total=1; for(int i=0;i<pwidth;i++) total*=10ULL;
   unsigned long long start=ustart>total?total:ustart;
   unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
   unsigned long long init=~0ULL; int zero=0;
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
   uint32_t pu=(uint32_t)purpose;
-  void*args[]={&dmn,&mnlen,&pwidth,&start,&count,&pu,&change,&index,&dtp,&dhi,&dfound};
+  void*args[]={&dhctx,&pwidth,&start,&count,&pu,&change,&index,&dtp,&dhi,&dfound};
   int tpb=128,grid=1024;
   fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d)...\n",pwidth,count,start,purpose);
   struct timeval t0,t1; gettimeofday(&t0,0);

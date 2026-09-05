@@ -116,7 +116,7 @@ __device__ void s512_resume(S512 *s, const u64 mid[8]){
   for(int i=0;i<8;i++) s->H[i]=mid[i];
   s->blen=0; s->total=128;                 // one 128-byte pad block already absorbed
 }
-__device__ void hmac512_ctx(const u8 *key, u32 klen, HCTX *h){
+__device__ __noinline__ void hmac512_ctx(const u8 *key, u32 klen, HCTX *h){
   u8 kb[128]; hmac512_key(key,klen,kb);
   u8 pad[128]; S512 s;
   for(int i=0;i<128;i++) pad[i]=kb[i]^0x36; s512_init(&s); s512_block(&s,pad);
@@ -124,10 +124,29 @@ __device__ void hmac512_ctx(const u8 *key, u32 klen, HCTX *h){
   for(int i=0;i<128;i++) pad[i]=kb[i]^0x5c; s512_init(&s); s512_block(&s,pad);
   for(int i=0;i<8;i++) h->so[i]=s.H[i];
 }
-__device__ void hmac512_run(const HCTX *h, const u8 *msg, u32 mlen, u8 out[64]){
+__device__ __noinline__ void hmac512_run(const HCTX *h, const u8 *msg, u32 mlen, u8 out[64]){
   S512 s; s512_resume(&s,h->si); s512_update(&s,msg,mlen);
   u8 inner[64]; s512_final(&s,inner);
   s512_resume(&s,h->so); s512_update(&s,inner,64); s512_final(&s,out);
+}
+/* Fast HMAC for a fixed 64-byte message (the PBKDF2 inner loop): each half is a
+ * single SHA-512 block built directly from the midstate -- no streaming buffer,
+ * no byte-at-a-time padding (s512_final's big cost). msg len = 128(pad)+64 = 192
+ * bytes -> 1536-bit length = 0x600 in the last two bytes. */
+__device__ __forceinline__ void s512_out(const u64 H[8], u8 out[64]){
+  for(int i=0;i<8;i++){ out[i*8]=(u8)(H[i]>>56);out[i*8+1]=(u8)(H[i]>>48);out[i*8+2]=(u8)(H[i]>>40);out[i*8+3]=(u8)(H[i]>>32);
+    out[i*8+4]=(u8)(H[i]>>24);out[i*8+5]=(u8)(H[i]>>16);out[i*8+6]=(u8)(H[i]>>8);out[i*8+7]=(u8)H[i]; }
+}
+__device__ __noinline__ void hmac512_fast64(const HCTX *h, const u8 in[64], u8 out[64]){
+  u8 blk[128]; S512 s;
+  #pragma unroll
+  for(int i=0;i<64;i++) blk[i]=in[i];
+  blk[64]=0x80; for(int i=65;i<128;i++) blk[i]=0; blk[126]=0x06; blk[127]=0x00;
+  s512_resume(&s,h->si); s512_block(&s,blk); u8 inner[64]; s512_out(s.H,inner);
+  #pragma unroll
+  for(int i=0;i<64;i++) blk[i]=inner[i];
+  blk[64]=0x80; for(int i=65;i<128;i++) blk[i]=0; blk[126]=0x06; blk[127]=0x00;
+  s512_resume(&s,h->so); s512_block(&s,blk); s512_out(s.H,out);
 }
 
 /* ======================= SHA-256 (single block, <=55B) ================== */
@@ -208,22 +227,28 @@ __device__ void modn_add(const u8 a_be[32], const u8 b_be[32], u8 r_be[32]){
 
 /* ==================== Reusable pipeline device functions ================= */
 
-/* PBKDF2-HMAC-SHA512, dkLen=64 (one block) -- BIP39 seed. */
-__device__ void pbkdf2_seed(const u8 *pw, u32 pwlen, const u8 *salt, u32 slen,
+/* PBKDF2-HMAC-SHA512, dkLen=64 (one block), given a PRECOMPUTED key context h.
+ * Used by regime A where the mnemonic key is constant across all candidates. */
+__device__ __noinline__ void pbkdf2_seed_ctx(const HCTX *h, const u8 *salt, u32 slen,
+                            int iters, u8 out[64]){
+  u8 U[64],T[64];
+  { S512 s; s512_resume(&s,h->si); s512_update(&s,salt,slen);
+    u8 be[4]={0,0,0,1}; s512_update(&s,be,4); u8 inner[64]; s512_final(&s,inner);
+    s512_resume(&s,h->so); s512_update(&s,inner,64); s512_final(&s,U); }
+  for(int j=0;j<64;j++) T[j]=U[j];
+  for(int it=1; it<iters; it++){ hmac512_fast64(h,U,U); for(int j=0;j<64;j++) T[j]^=U[j]; }
+  for(int j=0;j<64;j++) out[j]=T[j];
+}
+/* PBKDF2-HMAC-SHA512, dkLen=64 -- BIP39 seed (computes the key context). */
+__device__ __noinline__ void pbkdf2_seed(const u8 *pw, u32 pwlen, const u8 *salt, u32 slen,
                             int iters, u8 out[64]){
   HCTX h; hmac512_ctx(pw,pwlen,&h);
-  u8 U[64],T[64];
-  { S512 s; s512_resume(&s,h.si); s512_update(&s,salt,slen);
-    u8 be[4]={0,0,0,1}; s512_update(&s,be,4); u8 inner[64]; s512_final(&s,inner);
-    s512_resume(&s,h.so); s512_update(&s,inner,64); s512_final(&s,U); }
-  for(int j=0;j<64;j++) T[j]=U[j];
-  for(int it=1; it<iters; it++){ hmac512_run(&h,U,64,U); for(int j=0;j<64;j++) T[j]^=U[j]; }
-  for(int j=0;j<64;j++) out[j]=T[j];
+  pbkdf2_seed_ctx(&h,salt,slen,iters,out);
 }
 
 /* seedToMaster + `nlev` hardened ckdHardened steps (EC-free) -> chaincode+priv.
  * idx[] are FULL hardened indices (0x80000000|i). */
-__device__ void derive_hardened(const u8 *seed, u32 seedlen, const u32 *idx, int nlev,
+__device__ __noinline__ void derive_hardened(const u8 *seed, u32 seedlen, const u32 *idx, int nlev,
                                 u8 out_c[32], u8 out_k[32]){
   const u8 bs[12]={'B','i','t','c','o','i','n',' ','s','e','e','d'};
   HCTX hm; hmac512_ctx(bs,12,&hm);

@@ -148,14 +148,33 @@ __device__ __noinline__ void j_add(jpt *r, const jpt *p, const jpt *q){
   fe_set(&r->X,&X3); fe_set(&r->Y,&Y3); fe_set(&r->Z,&Z3); r->inf=0;
 }
 
-/* k*G (k = 32 big-endian bytes) -> Jacobian point (double-and-add). */
-__device__ __noinline__ void scalar_mul_G_j(const u8 k[32], jpt *R){
+/* k*G (k = 32 big-endian bytes) -> Jacobian point (double-and-add). Used to
+ * BUILD the comb table; the hot path uses scalar_mul_G_j (comb) below. */
+__device__ __noinline__ void scalar_mul_G_dbl(const u8 k[32], jpt *R){
   j_set_inf(R);
   jpt G; fe_set(&G.X,(const fe*)FE_GX); fe_set(&G.Y,(const fe*)FE_GY); fe_set_u64(&G.Z,1); G.inf=0;
   for(int i=0;i<256;i++){
     j_double(R,R);
     int byte=k[i>>3]; int bit=(byte>>(7-(i&7)))&1;   // MSB-first
     if(bit) j_add(R,R,&G);
+  }
+}
+/* ---- fixed-base comb (4-bit windows) --------------------------------------
+ * Table d_comb holds, for each of 64 nibble positions i and value j in 1..15,
+ * the AFFINE point (j << 4i)*G as 8 u64 (x[4] || y[4]). k*G = sum over nibbles
+ * of table[i][nibble_i] -- <=64 adds, no doublings (~6x fewer point ops than
+ * double-and-add). Built once on-device by g_comb_init. */
+__device__ u64 *d_comb = 0;          // set by the host after g_comb_init
+__device__ __noinline__ void scalar_mul_G_j(const u8 k[32], jpt *R){
+  if(!d_comb){ scalar_mul_G_dbl(k,R); return; }
+  j_set_inf(R);
+  for(int i=0;i<64;i++){
+    int byte=k[31-(i>>1)]; int nib=(byte>>((i&1)*4))&15;
+    if(!nib) continue;
+    const u64 *e=d_comb+((size_t)(i*16+nib))*8;
+    jpt Q; Q.X.v[0]=e[0];Q.X.v[1]=e[1];Q.X.v[2]=e[2];Q.X.v[3]=e[3];
+    Q.Y.v[0]=e[4];Q.Y.v[1]=e[5];Q.Y.v[2]=e[6];Q.Y.v[3]=e[7]; fe_set_u64(&Q.Z,1); Q.inf=0;
+    j_add(R,R,&Q);
   }
 }
 /* Jacobian -> affine (x,y) with cond-normalized limbs. */

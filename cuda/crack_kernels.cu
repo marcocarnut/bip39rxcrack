@@ -110,7 +110,12 @@ extern "C" __global__ void g_addr(const u8 *seed, const u32 *purpose, const u32 
  * odometer). No checksum sieve (fixed mnemonic already valid). Each thread:
  * passphrase digits from its index -> salt="mnemonic"+digits -> PBKDF2 ->
  * derive_address -> compare 20-byte program. */
-extern "C" __global__ void g_crack_pass(const u8 *mn, int mnlen, int pwidth,
+/* one-time: build the fixed-mnemonic HMAC key context (regime A). */
+extern "C" __global__ void g_hctx_init(const u8 *mn, int mnlen, HCTX *out){
+  if(blockIdx.x*blockDim.x+threadIdx.x!=0) return;
+  hmac512_ctx(mn,(u32)mnlen,out);
+}
+extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
                                         unsigned long long start, unsigned long long count,
                                         u32 purpose, u32 change, u32 index,
                                         const u8 *target_prog,
@@ -121,7 +126,7 @@ extern "C" __global__ void g_crack_pass(const u8 *mn, int mnlen, int pwidth,
     u8 salt[8+16]; salt[0]='m';salt[1]='n';salt[2]='e';salt[3]='m';salt[4]='o';salt[5]='n';salt[6]='i';salt[7]='c';
     unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
     u32 slen=8+pwidth;
-    u8 seed[64]; pbkdf2_seed(mn,(u32)mnlen,salt,slen,2048,seed);
+    u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
     u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
     int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
@@ -148,5 +153,23 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
     int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+  }
+}
+
+/* Build the fixed-base comb table (one thread; one-time). d_comb must be set to
+ * `table` by the host AFTER this returns. table = 64*16*8 u64 (x[4]||y[4]). */
+extern "C" __global__ void g_comb_init(u64 *table){
+  if(blockIdx.x*blockDim.x+threadIdx.x!=0) return;
+  jpt base; fe_set(&base.X,(const fe*)FE_GX); fe_set(&base.Y,(const fe*)FE_GY); fe_set_u64(&base.Z,1); base.inf=0;
+  for(int i=0;i<64;i++){
+    jpt acc=base;                         // j=1 : 16^i * G
+    for(int j=1;j<16;j++){
+      fe x,y; j_affine(&acc,&x,&y);
+      u64 *e=table+((size_t)(i*16+j))*8;
+      e[0]=x.v[0];e[1]=x.v[1];e[2]=x.v[2];e[3]=x.v[3];
+      e[4]=y.v[0];e[5]=y.v[1];e[6]=y.v[2];e[7]=y.v[3];
+      if(j<15) j_add(&acc,&acc,&base);    // (j+1)*16^i*G
+    }
+    for(int d=0;d<4;d++) j_double(&base,&base);   // base *= 16
   }
 }

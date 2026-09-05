@@ -77,16 +77,29 @@ engine `--start --count --limit --kernels`; gates `--ec-gate --addr-gate
 
 | run | rate |
 |-----|------|
-| xpub (EC-free): PBKDF2 + hardened derive, every candidate | ~0.32 Mseed/s |
-| address: PBKDF2 + full derive + EC, every candidate | ~0.31 Mcand/s |
-| checksum-ON effective raw (12w, sieve → PBKDF2+EC on ~1/16) | ~0.55 Mcand/s |
+| **regime B (words, checksum-ON) raw** — sieve rejects ~15/16, PBKDF2+EC on survivors | **~1.17 Mcand/s** |
+| regime A (passphrase, every candidate PBKDF2 + full derive + EC) | ~0.67 Mcand/s (p2wpkh) · ~0.61 (p2tr) |
+| PBKDF2 seed rate (the PLAN metric) | ~0.69 Mseed/s |
 
-The EC-free and with-EC per-candidate rates are nearly identical, confirming the
-tool is **PBKDF2-bound** (the whole point of the architecture). Deep-winner
-wall-clock: T7 `[0-9]{7}` (10M) → pin 9317864 in **31.9s**. Compute-bound at
-450 W. Headroom is in occupancy (the per-thread PBKDF2 + EC state is large) and,
-secondarily, the correctness-only EC (fixed-base comb `k·G` + batch inversion) —
-the next levers toward the PLAN's 1–2 M seeds/s.
+Example B (full 479M sweep) recovers in **411 s** (was 864 s); T7 deep-winner
+`[0-9]{7}` (10M) → 9317864 in **~15 s** (was 32 s). Compute-bound at 450 W.
+
+**What moved the needle (and what didn't):** the tool is **PBKDF2-bound**, not
+EC-bound — the EC-free (xpub) and with-EC (address) per-candidate rates are
+nearly identical. So:
+- **Fast fixed-block HMAC** (build each SHA-512 block directly from the ipad/opad
+  midstate instead of the general streaming path — the old code padded *one byte
+  at a time* through the update function): **~2.2× overall.** The real win.
+- Fixed-base comb `k·G` and the regime-A fixed-key HMAC-midstate precompute: both
+  correct and gated, but ~0 speedup **because the workload is PBKDF2-bound**, not
+  EC-bound. Kept (they don't hurt); an honest null result.
+- Capping registers for higher occupancy: net-negative (spilling) — reverted.
+
+The remaining ceiling is SHA-512 itself: it is 64-bit-integer-bound, and consumer
+GeForce silicon runs 64-bit ops at a reduced rate, so ~0.69 M PBKDF2-seeds/s
+(≈2.8 GH/s of SHA-512 blocks) is near this card's practical limit. Regime B
+clears 1 M cand/s because its checksum sieve does full PBKDF2 on only ~1/16 of
+candidates.
 
 ## Layout
 
