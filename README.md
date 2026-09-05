@@ -46,10 +46,13 @@ than limited by how fast a host can feed it.
   free entropy bits, SHA-256 the entropy, append the checksum bits — instead of
   sweeping all 2048. That's `2^cs`× fewer candidates (16× at 12 words, 256× at 24)
   with zero rejected work (auto-detected; `--nth` / `--no-nth`).
-- **Stream compaction** (`--compact`): sieve into a dense survivor array, then run
-  a full-warp PBKDF2 kernel over it. This recovers the GPU throughput otherwise
-  lost to warp divergence when only a fraction of candidates survive the checksum
-  (**9.1×** on the permutation sweep — see Performance).
+- **Stream compaction** (default; `--no-compact` to disable): sieve into a dense
+  survivor array, then run a full-warp PBKDF2 kernel over it. This recovers the GPU
+  throughput otherwise lost to warp divergence when only a fraction of candidates
+  survive the checksum (**9.1×** on the permutation sweep — see Performance). The
+  sweep is chunked so the survivor buffer is bounded (a chunk's worst case is every
+  candidate surviving, so it can't overflow), ~1 GiB by default (`COMPACT_BUDGET_MB`
+  to tune); it falls back to the fused path if that buffer won't allocate.
 
 ### Examples
 
@@ -106,8 +109,8 @@ node gate/e2e.js  # xpub end-to-end: plant → crack → assert index / mnemonic
 
 Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` |
 `--target-chaincode`; `--purpose --change --index --no-checksum`; `--nth` /
-`--no-nth`; `--compact`; sharding `--start --count --limit`; `--rank` (librxe
-index of an arrangement).
+`--no-nth`; `--no-compact` (compaction is on by default); sharding
+`--start --count --limit`; `--rank` (librxe index of an arrangement).
 
 ## Performance
 
@@ -115,13 +118,14 @@ Measured on 1× RTX 5090 (native sm_120), correctness-only kernels:
 
 | run | rate |
 |-----|------|
-| words, checksum-ON, `--compact` (dense PBKDF2) | **~10.6 Mcand/s** |
-| words, checksum-ON, fused sieve→PBKDF2 | ~1.17 Mcand/s |
+| words, checksum-ON — compaction, dense PBKDF2 (default) | **~10.6 Mcand/s** |
+| words, checksum-ON — fused sieve→PBKDF2 (`--no-compact`) | ~1.17 Mcand/s |
 | passphrase (every candidate: PBKDF2 + full derive + EC) | ~0.67 Mcand/s (p2wpkh) |
 | PBKDF2 seed rate | ~0.69 Mseed/s |
 
-The full 479M-permutation example recovers in **45 s** with `--compact` (411 s
-fused). A `[0-9]{7}` (10M) passphrase deep-winner is found in ~15 s.
+The full 479M-permutation example recovers in **~46 s** by default (411 s with
+`--no-compact`); with an actual winner it early-exits far sooner. A `[0-9]{7}`
+(10M) passphrase deep-winner is found in ~15 s.
 
 **What moves the needle:** the tool is **PBKDF2-bound**, not EC-bound — the EC-free
 (xpub) and with-EC (address) per-candidate rates are nearly identical. The two
@@ -159,8 +163,6 @@ gate/gen_*.js, gate.c,     oracle-driven vector generators + gate harnesses
 - **EC / occupancy tuning.** secp256k1 is correctness-only (double-and-add `k·G` +
   Fermat inverse); a fixed-base comb, batch inversion and occupancy work are the
   levers for the EC-heavier paths.
-- **`--compact` as a safe default** — needs chunked survivor memory (bounded
-  buffer per window) so it never OOMs or drops a survivor.
 - **Multi-GPU** fork/exec — the range-shard machinery (`--start/--count`) is
   already in place.
 - **Electrum** seeds; full reseed39 job-file (`--job`/`--link`) parity.
