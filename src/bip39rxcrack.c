@@ -125,6 +125,11 @@ static int xpub_chaincode(const char*xp,uint8_t cc[32]){
 /* base58check P2PKH/P2SH address (25B = version||h160(20)||checksum(4)) ->
  * 20-byte program + purpose class (44 for version 0x00, 49 for 0x05). */
 static int decode_address(const char*addr,uint8_t prog[20],int*purpose){
+  /* bech32/bech32m targets (bc1q p2wpkh / bc1p p2tr) not decodable yet -- the
+     derive side supports 84/86 (seed->address gate), only target-decode is
+     missing. Reject clearly rather than misinterpret (parity contract). */
+  if(!strncmp(addr,"bc1",3)||!strncmp(addr,"tb1",3)||!strncmp(addr,"bcrt1",5)){
+    fprintf(stderr,"bech32 target decode not yet supported in v1 (p2wpkh bc1q / p2tr bc1p) -- use a p2pkh/p2sh (base58) target, or reseed39\n"); return -1; }
   uint8_t raw[64]; int n=b58decode(addr,raw,sizeof raw);
   if(n!=25){ fprintf(stderr,"address base58 decode length %d (want 25)\n",n); return -1; }
   int ver=raw[0]; memcpy(prog,raw+1,20);

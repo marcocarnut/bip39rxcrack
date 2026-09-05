@@ -102,14 +102,26 @@ src/bip39rxcrack.c         librxe-linked host (enumerate, decode, launch, report
 gate/gen_*.js, gate.c, e2e.js   oracle-driven vector generators + harnesses
 ```
 
-## Roadmap
+## Known follow-ups (none block the two real examples — both are base58)
 
-- Feistel keyed-shuffle (`{{N!?}}`, librxe `permute.c`) for partial-search
-  sampling parity (reported-index parity already holds — canonical rank matches
-  reseed39's found_index).
-- `[:Nth:]` last-word checksum construction; p2tr (BIP86, taproot); Electrum.
-- EC/occupancy perf pass. Multi-GPU fork/exec (range-shard machinery is in place
-  via `--start/--count`). Full (re)seed39 `--job`/`--link` parity (§13).
+1. **bech32 target decode.** `decode_address` handles base58 only (p2pkh 0x00 →
+   BIP44, p2sh 0x05 → BIP49). p2wpkh (`bc1q`) and p2tr (`bc1p`) address *targets*
+   aren't decodable yet, so they're rejected with a clear message. The *derive*
+   side already produces p2wpkh(84)/p2tr(86) programs (seed→address gate covers
+   84; 86/TapTweak is next) — only target decode is missing. Needed for BIP84/86
+   address examples and full reseed39 parity.
+2. **EC / occupancy perf.** secp256k1 is correctness-only (double-and-add `k·G` +
+   Fermat inverse). Fixed-base comb `k·G`, batch/Montgomery inversion, regime-A
+   fixed-key HMAC-midstate precompute, and occupancy tuning are the levers toward
+   the PLAN's 1–2 M seeds/s.
+3. **Feistel keyed-shuffle** (`{{N!?}}`, librxe `permute.c`). Reported-index
+   parity already holds (canonical rank 8952072 == reseed39's found_index); the
+   shuffle only changes partial-search (`--limit`/`--range`/shard) *sampling
+   order*, not any recovered seed. Full sweeps are unaffected.
+
+Further out: `[:Nth:]` last-word checksum construction; Electrum; multi-GPU
+fork/exec (range-shard machinery is in place via `--start/--count`); full
+(re)seed39 `--job`/`--link` parity (PLAN §13).
 
 ## Collaboration model
 
