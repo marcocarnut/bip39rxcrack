@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <cuda.h>
 #include <nvrtc.h>
 
@@ -64,10 +65,10 @@ static char *inline_includes(char *src, const char *cu_path){
 }
 static void build_module(const char *cu_path){
   char *src=inline_includes(slurp(cu_path),cu_path);
-  const char *opts[]={ "--gpu-architecture=compute_90", "--device-int128" };
+  const char *opts[]={ "--gpu-architecture=compute_120" };
   nvrtcProgram prog;
   NVR(nvrtcCreateProgram(&prog,src,"gate_kernels.cu",0,0,0));
-  nvrtcResult cr=nvrtcCompileProgram(prog,2,opts);
+  nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
   size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
   if(logn>1){
     char*log=malloc(logn); nvrtcGetProgramLog(prog,log);
@@ -84,7 +85,7 @@ static void build_module(const char *cu_path){
   cuDeviceGetAttribute(&ccm,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
   CU(cuCtxCreate(&g_ctx,0,dev));
   CU(cuModuleLoadDataEx(&g_mod,ptx,0,0,0));
-  printf("device: %s (sm_%d%d), NVRTC->compute_90 PTX->driver JIT\n\n",name,ccM,ccm);
+  printf("device: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n\n",name,ccM,ccm);
   free(ptx); free(src);
 }
 static CUfunction kern(const char *n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
@@ -231,6 +232,9 @@ static int gate_account(const char *dir){
 }
 
 int main(int argc,char**argv){
+  { const char *nl="/usr/local/cuda-13.2/lib64"; const char *cur=getenv("LD_LIBRARY_PATH");
+    if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
+      setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); } }
   const char *dir = argc>1?argv[1]:"vectors";
   const char *cu  = argc>2?argv[2]:"cuda/gate_kernels.cu";
   printf("bip39rxcrack Phase-1 crypto gates (byte-exact vs reseed39 oracle / published BIP vectors)\n");

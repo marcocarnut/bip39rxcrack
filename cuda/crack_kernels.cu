@@ -12,6 +12,7 @@
  * the odometer digit; the password string is rebuilt from the chosen words.
  */
 #include "bip39_device.cuh"
+#include "secp256k1_device.cuh"
 
 #define MN_STRIDE 256   /* max reconstructed mnemonic bytes (24w * ~9 + slack) */
 #define HARD 0x80000000u
@@ -84,4 +85,23 @@ extern "C" __global__ void g_crack(const u8 *bw_data, const int *bw_off, const i
       }
     }
   }
+}
+
+/* EC gate: for each 32-byte scalar, emit compressed pub(33), hash160(20),
+ * p2pkh program(20), p2sh-p2wpkh program(20) -- diffed vs the oracle host-side. */
+extern "C" __global__ void g_ec(const u8 *sk, int n, u8 *pub, u8 *h160, u8 *p2pkh, u8 *p2sh){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+  u8 p[33]; scalar_mul_G(sk+(size_t)i*32, p);
+  for(int b=0;b<33;b++) pub[(size_t)i*33+b]=p[b];
+  u8 h[20]; hash160(p,33,h); for(int b=0;b<20;b++) h160[(size_t)i*20+b]=h[b];
+  u8 pr[20]; pub_to_program(p,44,pr); for(int b=0;b<20;b++) p2pkh[(size_t)i*20+b]=pr[b];
+  pub_to_program(p,49,pr); for(int b=0;b<20;b++) p2sh[(size_t)i*20+b]=pr[b];
+}
+
+/* seed->address gate: for each (seed, purpose, change, index) emit the 20-byte
+ * program -- diffed vs the oracle pubToTarget(addressNode(...)) host-side. */
+extern "C" __global__ void g_addr(const u8 *seed, const u32 *purpose, const u32 *change,
+                                  const u32 *index, int n, u8 *prog){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+  derive_address(seed+(size_t)i*64, purpose[i], change[i], index[i], prog+(size_t)i*20);
 }

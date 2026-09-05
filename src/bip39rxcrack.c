@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <unistd.h>
 #include <gmp.h>
 #include <cuda.h>
 #include <nvrtc.h>
@@ -39,6 +40,7 @@ static char *slurp(const char *p){ FILE*f=fopen(p,"rb"); if(!f){fprintf(stderr,"
   if(fread(b,1,n,f)!=(size_t)n){fprintf(stderr,"read %s\n",p);exit(2);} b[n]=0; fclose(f); return b; }
 static int hexnib(int c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1;}
 static int hex2bin(const char*s,uint8_t*o,int max){ int n=0; while(s[0]&&s[1]&&n<max){int hi=hexnib(s[0]),lo=hexnib(s[1]); if(hi<0||lo<0)break; o[n++]=(hi<<4)|lo; s+=2;} return n; }
+static void tohex_(const uint8_t*b,int n,char*o){ static const char*hx="0123456789abcdef"; for(int i=0;i<n;i++){o[i*2]=hx[b[i]>>4];o[i*2+1]=hx[b[i]&15];} o[n*2]=0; }
 
 /* ------------------------ NVRTC build (with include inliner) ------------ */
 static CUcontext g_ctx; static CUmodule g_mod;
@@ -53,9 +55,9 @@ static char *inline_includes(char *src,const char *cu){
 }
 static void build_module(const char *cu_path){
   char *src=inline_includes(slurp(cu_path),cu_path);
-  const char *opts[]={ "--gpu-architecture=compute_90", "--device-int128" };
+  const char *opts[]={ "--gpu-architecture=compute_120" };
   nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
-  nvrtcResult cr=nvrtcCompileProgram(prog,2,opts);
+  nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
   size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
   if(logn>1){ char*log=malloc(logn); nvrtcGetProgramLog(prog,log);
     if(cr!=NVRTC_SUCCESS||getenv("CRACK_VERBOSE")) fprintf(stderr,"NVRTC log:\n%s\n",log);
@@ -68,7 +70,7 @@ static void build_module(const char *cu_path){
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
   cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
   CU(cuCtxCreate(&g_ctx,0,dev)); CU(cuModuleLoadDataEx(&g_mod,ptx,0,0,0));
-  fprintf(stderr,"device: %s (sm_%d%d), NVRTC->compute_90 PTX->driver JIT\n",name,M,m);
+  fprintf(stderr,"device: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n",name,M,m);
   free(ptx);
 }
 static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
@@ -245,6 +247,71 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
   mpz_clear(j); rxe_free(r); return 0;
 }
 
+/* --------------------------- EC gate (vs oracle) ------------------------ */
+static int mode_ec_gate(const char*vecfile,const char*cu){
+  build_module(cu);
+  FILE*fp=fopen(vecfile,"rb"); if(!fp){fprintf(stderr,"open %s (run: node gate/gen_ec.js)\n",vecfile);return 2;}
+  int cap=0,n=0; uint8_t *sk=0,*epub=0,*eh=0,*e44=0,*e49=0;
+  char*line=0; size_t lc=0; ssize_t rd; char a[200],b[200],c[200],d[200],e[200];
+  while((rd=getline(&line,&lc,fp))>0){
+    if(sscanf(line,"%199s %199s %199s %199s %199s",a,b,c,d,e)!=5) continue;
+    if(n==cap){cap=cap?cap*2:64; sk=realloc(sk,cap*32);epub=realloc(epub,cap*33);eh=realloc(eh,cap*20);e44=realloc(e44,cap*20);e49=realloc(e49,cap*20);}
+    hex2bin(a,sk+(size_t)n*32,32); hex2bin(b,epub+(size_t)n*33,33); hex2bin(c,eh+(size_t)n*20,20);
+    hex2bin(d,e44+(size_t)n*20,20); hex2bin(e,e49+(size_t)n*20,20); n++;
+  }
+  free(line); fclose(fp);
+  CUdeviceptr dsk=up(sk,(size_t)n*32),dpub,dh,d44,d49;
+  CU(cuMemAlloc(&dpub,(size_t)n*33)); CU(cuMemAlloc(&dh,(size_t)n*20)); CU(cuMemAlloc(&d44,(size_t)n*20)); CU(cuMemAlloc(&d49,(size_t)n*20));
+  void*args[]={&dsk,&n,&dpub,&dh,&d44,&d49};
+  int tpb=64,grid=(n+tpb-1)/tpb; CU(cuLaunchKernel(kern("g_ec"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+  uint8_t*gpub=malloc((size_t)n*33),*gh=malloc((size_t)n*20),*g44=malloc((size_t)n*20),*g49=malloc((size_t)n*20);
+  CU(cuMemcpyDtoH(gpub,dpub,(size_t)n*33)); CU(cuMemcpyDtoH(gh,dh,(size_t)n*20));
+  CU(cuMemcpyDtoH(g44,d44,(size_t)n*20)); CU(cuMemcpyDtoH(g49,d49,(size_t)n*20));
+  int bpub=0,bh=0,b44=0,b49=0;
+  for(int i=0;i<n;i++){
+    if(memcmp(gpub+(size_t)i*33,epub+(size_t)i*33,33)){ if(bpub<3){char x[70],y[70];tohex_(gpub+(size_t)i*33,33,x);tohex_(epub+(size_t)i*33,33,y);fprintf(stderr,"  pub #%d\n    gpu %s\n    ora %s\n",i,x,y);} bpub++; }
+    if(memcmp(gh+(size_t)i*20,eh+(size_t)i*20,20)) bh++;
+    if(memcmp(g44+(size_t)i*20,e44+(size_t)i*20,20)) b44++;
+    if(memcmp(g49+(size_t)i*20,e49+(size_t)i*20,20)) b49++;
+  }
+  printf("  [%s] secp256k1 privToPub : %d/%d\n", bpub?"FAIL":"PASS", n-bpub,n);
+  printf("  [%s] hash160(pub33)      : %d/%d\n", bh?"FAIL":"PASS", n-bh,n);
+  printf("  [%s] p2pkh program (44)  : %d/%d\n", b44?"FAIL":"PASS", n-b44,n);
+  printf("  [%s] p2sh-p2wpkh (49)    : %d/%d\n", b49?"FAIL":"PASS", n-b49,n);
+  int bad=bpub+bh+b44+b49;
+  printf("  ==== EC gate %s (%d vectors) ====\n", bad?"FAILED":"PASSED", n);
+  return bad?1:0;
+}
+
+/* ----------------------- seed->address gate (vs oracle) ----------------- */
+static int mode_addr_gate(const char*vecfile,const char*cu){
+  build_module(cu);
+  FILE*fp=fopen(vecfile,"rb"); if(!fp){fprintf(stderr,"open %s (run: node gate/gen_addr.js)\n",vecfile);return 2;}
+  int cap=0,n=0; uint8_t *seed=0,*eprog=0; uint32_t *pur=0,*chg=0,*idx=0;
+  char*line=0; size_t lc=0; ssize_t rd; char sh[300],ph[64]; unsigned int P,CH,IX;
+  while((rd=getline(&line,&lc,fp))>0){
+    if(sscanf(line,"%299s %u %u %u %63s",sh,&P,&CH,&IX,ph)!=5) continue;
+    if(n==cap){cap=cap?cap*2:64; seed=realloc(seed,(size_t)cap*64);eprog=realloc(eprog,(size_t)cap*20);pur=realloc(pur,cap*4);chg=realloc(chg,cap*4);idx=realloc(idx,cap*4);}
+    hex2bin(sh,seed+(size_t)n*64,64); pur[n]=P; chg[n]=CH; idx[n]=IX; hex2bin(ph,eprog+(size_t)n*20,20); n++;
+  }
+  free(line); fclose(fp);
+  CUdeviceptr dseed=up(seed,(size_t)n*64),dpur=up(pur,n*4),dchg=up(chg,n*4),didx=up(idx,n*4),dprog;
+  CU(cuMemAlloc(&dprog,(size_t)n*20));
+  void*args[]={&dseed,&dpur,&dchg,&didx,&n,&dprog};
+  int tpb=64,grid=(n+tpb-1)/tpb; CU(cuLaunchKernel(kern("g_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+  uint8_t*gp=malloc((size_t)n*20); CU(cuMemcpyDtoH(gp,dprog,(size_t)n*20));
+  int bad=0,b44=0,b49=0,b84=0,c44=0,c49=0,c84=0;
+  for(int i=0;i<n;i++){ int mm=memcmp(gp+(size_t)i*20,eprog+(size_t)i*20,20)!=0;
+    if(pur[i]==44){c44++; if(mm)b44++;} else if(pur[i]==49){c49++; if(mm)b49++;} else {c84++; if(mm)b84++;}
+    if(mm){ if(bad<3){char x[42],y[42];tohex_(gp+(size_t)i*20,20,x);tohex_(eprog+(size_t)i*20,20,y);fprintf(stderr,"  addr #%d p%u\n    gpu %s\n    ora %s\n",i,pur[i],x,y);} bad++; }
+  }
+  printf("  [%s] seed->p2pkh(44)     : %d/%d\n",b44?"FAIL":"PASS",c44-b44,c44);
+  printf("  [%s] seed->p2sh-p2wpkh(49): %d/%d\n",b49?"FAIL":"PASS",c49-b49,c49);
+  printf("  [%s] seed->p2wpkh(84)    : %d/%d\n",b84?"FAIL":"PASS",c84-b84,c84);
+  printf("  ==== seed->address gate %s (%d vectors, incl. non-hardened ckd) ====\n",bad?"FAILED":"PASSED",n);
+  return bad?1:0;
+}
+
 /* --------------------------------- CLI ---------------------------------- */
 static void usage(void){
   fprintf(stderr,
@@ -260,8 +327,13 @@ static void usage(void){
    "  --kernels PATH          crack_kernels.cu (default cuda/crack_kernels.cu)\n");
 }
 int main(int argc,char**argv){
+  /* NVRTC 13 dlopens libnvrtc-builtins.so.13.x via LD_LIBRARY_PATH; ensure it's
+     set (re-exec once so the loader picks it up at startup). */
+  { const char *nl="/usr/local/cuda-13.2/lib64"; const char *cur=getenv("LD_LIBRARY_PATH");
+    if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
+      setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
-  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1;
+  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1;
   for(int i=1;i<argc;i++){
@@ -275,11 +347,15 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--start")&&i+1<argc) cstart=strtoull(argv[++i],0,10);
     else if((!strcmp(argv[i],"--count")||!strcmp(argv[i],"--limit"))&&i+1<argc) ccount=strtoull(argv[++i],0,10);
+    else if(!strcmp(argv[i],"--ec-gate")){ ecgate="vectors/vec_ec.txt"; if(i+1<argc&&strncmp(argv[i+1],"-",1)!=0) ecgate=argv[++i]; }
+    else if(!strcmp(argv[i],"--addr-gate")){ addrgate="vectors/vec_addr.txt"; if(i+1<argc&&strncmp(argv[i+1],"-",1)!=0) addrgate=argv[++i]; }
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
   if(!words){ usage(); return 2; }
   Words W; parse_words(&W,words);
+  if(ecgate) return mode_ec_gate(ecgate,cu);
+  if(addrgate) return mode_addr_gate(addrgate,cu);
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
