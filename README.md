@@ -25,6 +25,15 @@ Vector "expected" values are produced by running that exact JS oracle.
   `k·G` → p2pkh (BIP44) / p2sh-p2wpkh (BIP49) / p2wpkh (BIP84) program compare.
 - **Regime A** (fixed mnemonic, passphrase `[0-9]{N}` varies; no sieve) and
   **Regime B** (words permutation `{{N!}}`, checksum sieve).
+- **Missing-word** (`--template "w0 w1 [:bip39-en:] … [:bip39-en:]"`): fixed known
+  words + `K` unknown positions (base-2048 odometer). With the last position
+  unknown, the **`[:Nth:]` last-word construction** builds only the checksum-valid
+  finals (SHA-256 the entropy → append the checksum bits) instead of sweeping 2048
+  — `2^cs`× fewer candidates (16× @12w / 256× @24w) *and* no warp divergence
+  (auto-detected; `--nth`/`--no-nth`).
+- **Stream compaction** (`--compact`, words+address checksum-ON): sieve into a
+  dense survivor array, then run a full-warp PBKDF2 kernel — de-diverges the
+  sieved permutation path (Example B **9.1×**: 411 s → 45 s).
 
 ### The two reseed39 preset examples (both recovered, oracle-verified)
 
