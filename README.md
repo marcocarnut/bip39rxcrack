@@ -86,6 +86,9 @@ Gate suite (RTX 5090, native sm_120), all byte-exact, zero mismatches:
   incl. the non-hardened ckd EC path and BIP86 TapTweak)
 - **`[:Nth:]` construction:** the constructed valid-last-word set == the brute +
   sieve survivor set, byte-identical
+- **missing-word order:** the `[:Nth:]` and baseline unrank index == librxe's
+  canonical rank (leftmost unknown = most-significant digit), 128/128 sample
+  indices byte-identical for both spaces (`--miss-gate`)
 
 ## Requirements & build
 
@@ -104,6 +107,7 @@ make ec-gate    # secp256k1 / hash160 / address programs vs the oracle
 make addr-gate  # full seed → address vs the oracle
 make decode-gate  # address target decode vs the oracle
 make nth-gate   # [:Nth:] construction == brute + sieve
+make miss-gate  # missing-word/[:Nth:] unrank index == librxe canonical rank
 node gate/e2e.js  # xpub end-to-end: plant → crack → assert index / mnemonic / path
 ```
 

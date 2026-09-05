@@ -401,6 +401,76 @@ static int mode_recon_gate(const Words*W,int nsamp,const char*cu){
   return bad?1:0;
 }
 
+/* forward decls (defined below) */
+static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,int*U,int*last_unknown);
+static const char* WLNAME(int idx);
+/* ---- missing-word ORDER gate: kernel unrank index == librxe canonical rank --- */
+static int mnemonic_to_idx(const char*mn,uint32_t*out,int max){
+  static char names[2048][16]; static int ld=0; if(!ld){load_wordlist(names);ld=1;}
+  char buf[512]; snprintf(buf,sizeof buf,"%s",mn); int n=0; char*s=strtok(buf," \t\r\n");
+  while(s&&n<max){ int bi=bip39_index(names,s); if(bi<0) return -1; out[n++]=(uint32_t)bi; s=strtok(0," \t\r\n"); }
+  return n;
+}
+static struct rxe* rxe_from_template(const uint32_t*tmpl,const int*upos,int W,int U){
+  static int reg=0; static char names[2048][16]; static const char*wp[2048];
+  if(!reg){ load_wordlist(names); for(int i=0;i<2048;i++) wp[i]=names[i]; rxe_register_dict("bip39gate",wp,2048); reg=1; }
+  char pat[4096]; int L=0,ui=0;
+  for(int p=0;p<W;p++){ int unk=(ui<U && upos[ui]==p);
+    L+=snprintf(pat+L,sizeof pat-L,"%s%s", p?" ":"", unk?"[:bip39gate:]":WLNAME((int)tmpl[p]));
+    if(unk) ui++; }
+  struct rxe*r=rxe_parse(pat,0);
+  if(!r||rxe_error(r)){ fprintf(stderr,"rxe parse (gate): %s\n", r?rxe_error_message(r):"null"); return 0; }
+  return r;
+}
+static int miss_gate_run(const char*label,int nth,const uint32_t*tmpl,const int*upos,int U,int W,
+                         struct rxe*r,int nsamp,const char*cu){ (void)cu;
+  int CS=W/3, freebits=11-CS;
+  mpz_t total; mpz_init(total);
+  if(nth){ mpz_ui_pow_ui(total,2048,U-1); mpz_mul_2exp(total,total,freebits); }
+  else     mpz_ui_pow_ui(total,2048,U);
+  unsigned long long *idx=malloc((size_t)nsamp*8);
+  mpz_t acc,step,jz; mpz_init(acc); mpz_init(step); mpz_init(jz);
+  mpz_fdiv_q_ui(step,total,nsamp>0?nsamp:1); if(mpz_sgn(step)==0) mpz_set_ui(step,1);
+  mpz_set_ui(acc,0);
+  for(int i=0;i<nsamp;i++){ idx[i]=mpz_get_ui(acc); mpz_add(acc,acc,step); if(mpz_cmp(acc,total)>=0) mpz_mod(acc,acc,total); }
+  CUdeviceptr dtmpl=up(tmpl,W*sizeof(uint32_t)), dupos=up(upos,(U?U:1)*sizeof(int)), didx=up(idx,(size_t)nsamp*8);
+  CUdeviceptr dout; CU(cuMemAlloc(&dout,(size_t)nsamp*W*sizeof(uint32_t)));
+  int passU=U; void*args[]={&dtmpl,&W,&dupos,&passU,&didx,&nsamp,&dout};
+  int tpb=64,grid=(nsamp+tpb-1)/tpb;
+  CU(cuLaunchKernel(kern(nth?"g_unrank_nth":"g_unrank_missing"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+  uint32_t *out=malloc((size_t)nsamp*W*sizeof(uint32_t));
+  CU(cuMemcpyDtoH(out,dout,(size_t)nsamp*W*sizeof(uint32_t)));
+  int bad=0;
+  for(int i=0;i<nsamp;i++){ uint32_t*g=out+(size_t)i*W;
+    if(nth){ unsigned long long j=idx[i], f=j&((1ULL<<freebits)-1), mid=j>>freebits; uint32_t last=g[W-1];
+      if((last>>CS)!=f){ if(bad<3) fprintf(stderr,"  nth f-bit mismatch #%d: last>>CS=%u f=%llu\n",i,last>>CS,(unsigned long long)f); bad++; continue; }
+      mpz_set_ui(jz,mid); mpz_mul_ui(jz,jz,2048); mpz_add_ui(jz,jz,last); }
+    else mpz_set_ui(jz,idx[i]);
+    rxe_seek(r,jz); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r); char*t=buf; while(*t==' ')t++;
+    uint32_t lib[32]; int ln=mnemonic_to_idx(t,lib,32);
+    int eq=(ln==W); for(int p=0;p<W&&eq;p++){ if(lib[p]!=g[p]) eq=0; }
+    if(!eq){ if(bad<3){ fprintf(stderr,"  MISMATCH %s #%d idx=%llu\n    gpu:   ",label,i,idx[i]);
+        for(int p=0;p<W;p++){ fprintf(stderr," %s",WLNAME((int)g[p])); } fprintf(stderr,"\n    librxe: %s\n",t);} bad++; } }
+  gmp_printf("  [%s] %-9s vs librxe : %d/%d indices byte-identical (space = %Zd)\n", bad?"FAIL":"PASS", label, nsamp-bad, nsamp, total);
+  free(idx); free(out); mpz_clear(total); mpz_clear(acc); mpz_clear(step); mpz_clear(jz);
+  return bad?1:0;
+}
+static int mode_miss_gate(const char*tpl,int nsamp,const char*cu){
+  uint32_t tmpl[32]; int upos[32],W,U,last_unknown;
+  if(parse_template(tpl,tmpl,upos,&W,&U,&last_unknown)) return 2;
+  build_module(cu);
+  struct rxe*r=rxe_from_template(tmpl,upos,W,U); if(!r) return 2;
+  printf("missing-word ORDER gate  (kernel unrank index == librxe canonical rank):\n");
+  printf("  template: %s\n", tpl);
+  int bad=0;
+  bad |= miss_gate_run("baseline",0,tmpl,upos,U,W,r,nsamp,cu);
+  if(last_unknown) bad |= miss_gate_run("[:Nth:]",1,tmpl,upos,U,W,r,nsamp,cu);
+  else printf("  ([:Nth:] gate skipped: last position is a known word)\n");
+  rxe_free(r);
+  printf("  ==== missing-word order gate %s (%d samples/mode) ====\n", bad?"FAILED":"PASSED", nsamp);
+  return bad?1:0;
+}
+
 static int mode_dump_valid(const Words*W,int nsamp,const char*cu){
   char pat[2048]; wordset_pattern(W,pat,sizeof pat);
   struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
@@ -625,12 +695,14 @@ static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,in
 }
 static const char* WLNAME(int idx){ static char names[2048][16]; static int loaded=0; if(!loaded){load_wordlist(names);loaded=1;} return names[idx]; }
 static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
-                        int use_nth,unsigned long long ustart,unsigned long long ucount,const char*cu){
+                        int nthmode,unsigned long long ustart,unsigned long long ucount,const char*cu){
   uint32_t tmpl[32]; int upos[32],W,U,last_unknown;
   if(parse_template(tpl,tmpl,upos,&W,&U,&last_unknown)) return 2;
   int CS=W/3, freebits=11-CS;
-  int nth = use_nth && last_unknown;
-  if(use_nth && !last_unknown){ fprintf(stderr,"[:Nth:] construction needs the LAST position to be [:bip39-en:]\n"); return 2; }
+  int nth;   /* -1 auto (nth iff last unknown), 1 force, 0 off */
+  if(nthmode==1){ if(!last_unknown){ fprintf(stderr,"--nth needs the LAST position to be [:bip39-en:]\n"); return 2; } nth=1; }
+  else if(nthmode==0) nth=0;
+  else nth = last_unknown;
   build_module(cu);
   CUdeviceptr dwl,dwoff,dwlen; gpu_upload_wordlist(&dwl,&dwoff,&dwlen);
   CUdeviceptr dtmpl=up(tmpl,W*sizeof(uint32_t)), dtp=up(tprog,32);
@@ -673,7 +745,12 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   unsigned long long hidx=0; CU(cuMemcpyDtoH(&hidx,dhi,8));
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   uint32_t hg[32]; CU(cuMemcpyDtoH(hg,dhg,W*sizeof(uint32_t)));
-  printf("FOUND\n  index    : %llu\n  found words:",hidx);
+  /* nth uses a constructed subspace; also report the librxe full-space rank so it
+     cross-checks against --rank / (re)seed39 (baseline hidx already equals it). */
+  unsigned long long librxe_rank = nth ? ((hidx>>freebits)*2048ULL + hg[W-1]) : hidx;
+  printf("FOUND\n  index    : %llu%s\n",hidx, nth?" (nth-space)":" (== librxe rank)");
+  if(nth) printf("  librxe rank: %llu\n",librxe_rank);
+  printf("  found words:");
   for(int i=0;i<U;i++) printf(" [pos %d]=%s",upos[i],WLNAME((int)hg[upos[i]]));
   printf("\n  mnemonic :");
   for(int p=0;p<W;p++) printf(" %s",WLNAME((int)hg[p]));
@@ -845,7 +922,8 @@ static void usage(void){
    "                          swept row, appending to the same LOG\n"
    "\n"
    "GATES/UTIL:\n"
-   "  --ec-gate [F] --addr-gate [F] --recon-gate [N] --dump-valid N --rank \"..\" --decode ADDR\n");
+   "  --ec-gate [F] --addr-gate [F] --recon-gate [N] --miss-gate [N] --dump-valid N --rank \"..\" --decode ADDR\n"
+   "  (--miss-gate: prove missing-word/[:Nth:] unrank index == librxe canonical rank)\n");
 }
 int main(int argc,char**argv){
   /* NVRTC 13 dlopens libnvrtc-builtins.so.13.x via LD_LIBRARY_PATH; ensure it's
@@ -855,6 +933,7 @@ int main(int argc,char**argv){
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
+  int missgate=0,missgate_n=64;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
@@ -872,6 +951,7 @@ int main(int argc,char**argv){
       if(colon){ *colon=0; g_loginterval_ms=atoi(a); g_csv=fopen(colon+1,"w"); g_csv_own=1; if(!g_csv){fprintf(stderr,"cannot open %s\n",colon+1);return 2;} }
       else { g_loginterval_ms=atoi(a); g_csv=stderr; } }
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
+    else if(!strcmp(argv[i],"--miss-gate")){ missgate=1; if(i+1<argc&&isdigit((unsigned char)argv[i+1][0])) missgate_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--start")&&i+1<argc) cstart=strtoull(argv[++i],0,10);
@@ -948,14 +1028,14 @@ int main(int argc,char**argv){
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(ecgate) return mode_ec_gate(ecgate,cu);
   if(addrgate) return mode_addr_gate(addrgate,cu);
+  if(missgate){ const char*t=templ?templ:"trial [:bip39:] gloom dragon try dirt rapid crawl soon fatal tool chronic rapid ladder salmon palace expect enrich helmet truth receive [:bip39:] [:bip39:] [:bip39:]"; return mode_miss_gate(t,missgate_n,cu); }
   /* Missing-word ([:bip39-en:]) template + address target */
   if(templ){
     if(!address){ fprintf(stderr,"--template needs --address\n"); return 2; }
     uint8_t prog[32]; int apl,apu; if(decode_address(address,prog,&apl,&apu)) return 2;
     int purpose = purpose_set?(int)purposes[0]:apu;
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
-    int use_nth = (nthmode==1) ? 1 : (nthmode==0 ? 0 : 1);
-    return mode_missing(templ,prog,purpose,a_changes,a_gap,use_nth,cstart,ccount,cu);
+    return mode_missing(templ,prog,purpose,a_changes,a_gap,nthmode,cstart,ccount,cu);
   }
   /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
   if(mnemonic && passphrase){

@@ -198,7 +198,7 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
     u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
-    for(int u=0;u<U;u++) g[upos[u]]=(u32)((j>>(11*u))&2047ULL);
+    for(int u=0;u<U;u++) g[upos[u]]=(u32)((j>>(11*(U-1-u)))&2047ULL);  /* leftmost unknown = MSB == librxe rank */
     if(!bip39_checksum_ok(g,W)) continue;
     if(hashed) atomicAdd(hashed,1ULL);
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
@@ -225,9 +225,10 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
     u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
-    unsigned long long lastfree=j & ((1ULL<<freebits)-1);
-    unsigned long long rest=j>>freebits;
-    for(int u=0;u<U-1;u++) g[upos[u]]=(u32)((rest>>(11*u))&2047ULL);  // other unknowns
+    unsigned long long lastfree=j & ((1ULL<<freebits)-1);   // last-word free entropy = LSB
+    unsigned long long rest=j>>freebits;                    // middle-word rank, leftmost = MSB (== librxe)
+    int nm=U-1;
+    for(int u=0;u<nm;u++) g[upos[u]]=(u32)((rest>>(11*(nm-1-u)))&2047ULL);
     g[W-1]=(u32)(lastfree<<CS);                       // top freebits set, checksum=0
     // entropy = top ENT bits of g[0..W-1]; SHA-256 -> top CS bits = checksum
     u8 ent[32]; for(int i=0;i<32;i++) ent[i]=0;
@@ -240,6 +241,33 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
     int oc,oi;
     if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+  }
+}
+
+/* ---- unrank gates: decode index -> word vector (order must match librxe) ---- */
+extern "C" __global__ void g_unrank_missing(const u32 *tmpl, int W, const int *upos, int U,
+                                            const unsigned long long *idx, int n, u32 *out_g){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long k=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; k<(unsigned long long)n; k+=stride){
+    unsigned long long j=idx[k]; u32 *g=out_g+k*W; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    for(int u=0;u<U;u++) g[upos[u]]=(u32)((j>>(11*(U-1-u)))&2047ULL);
+  }
+}
+extern "C" __global__ void g_unrank_nth(const u32 *tmpl, int W, const int *upos, int U,
+                                        const unsigned long long *idx, int n, u32 *out_g){
+  int total=W*11, ENT=total*32/33, CS=total-ENT; int freebits=11-CS;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long k=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; k<(unsigned long long)n; k+=stride){
+    unsigned long long j=idx[k]; u32 *g=out_g+k*W; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    unsigned long long lastfree=j & ((1ULL<<freebits)-1);
+    unsigned long long rest=j>>freebits; int nm=U-1;
+    for(int u=0;u<nm;u++) g[upos[u]]=(u32)((rest>>(11*(nm-1-u)))&2047ULL);
+    g[W-1]=(u32)(lastfree<<CS);
+    u8 ent[32]; for(int i=0;i<32;i++) ent[i]=0;
+    for(int i=0;i<W;i++){ u32 v=g[i]; for(int b=0;b<11;b++){ int pos=i*11+b; if(pos<ENT && ((v>>(10-b))&1)) ent[pos>>3]|=(0x80>>(pos&7)); } }
+    u8 dig[32]; sha256_1blk(ent,(u32)(ENT/8),dig);
+    u32 cs=(dig[0]>>(8-CS))&((1u<<CS)-1);
+    g[W-1]=(u32)((lastfree<<CS)|cs);
   }
 }
 

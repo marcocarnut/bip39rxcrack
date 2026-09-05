@@ -37,6 +37,9 @@ CRACK = bip39rxcrack
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
+miss-gate: $(CRACK)
+	./$(CRACK) --miss-gate 64
+
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
 
