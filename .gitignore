@@ -1,8 +1,8 @@
 # build artifacts
+bip39rxcrack
 phase1gate
 *.o
 *.ptx
-# generated vectors (regenerated from the reseed39 oracle via `make vectors`)
+
+# generated test vectors (regenerated from the reseed39 oracle via `make vectors`)
 vectors/*.txt
-bip39rxcrack
-phase1gate

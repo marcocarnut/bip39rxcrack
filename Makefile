@@ -1,17 +1,17 @@
-# bip39rxcrack -- native CUDA BIP39 seed cracker (Phase 1: crypto gates).
+# bip39rxcrack -- native CUDA BIP39 seed cracker.
 #
 # Correctness authority: the byte-exact browser reference in reseed39
 # (estimator/bip39crypto.js, estimator/bip39.js) + published BIP vectors.
-# The gate harness NVRTC-compiles cuda/gate_kernels.cu to compute_90 PTX and
-# the sm_120 driver JIT-forwards it (bip38rxcrack's proven route on this box).
+# Kernels are NVRTC-compiled at runtime to native compute_120 (Blackwell/sm_120)
+# using the CUDA 12.8+/13 NVRTC toolkit; the driver JITs the PTX to the GPU.
 #
-#   make gate     # generate oracle vectors + build harness + run all 4 gates
-#   make vectors  # (re)generate vectors from the reseed39 oracle
-#   make build    # build the gate harness binary only
+#   make          # build the gate harness + the cracker
+#   make gate     # generate oracle vectors + run the crypto gates
+#   make ec-gate / addr-gate / decode-gate / nth-gate   # further gates
 #   make clean
 #
-# RESEED39_DIR points the generator at the reseed39 clone (default: sibling).
-# RXE_DIR is reserved for Phase 2 (librxe enumerator), matching bip38rxcrack.
+# RESEED39_DIR points the generators at the reseed39 clone (default: sibling).
+# RXE_DIR points at the sibling rxe repo; librxe.a is the candidate enumerator.
 
 CC        ?= cc
 CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter
