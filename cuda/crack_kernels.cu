@@ -105,3 +105,25 @@ extern "C" __global__ void g_addr(const u8 *seed, const u32 *purpose, const u32 
   int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
   derive_address(seed+(size_t)i*64, purpose[i], change[i], index[i], prog+(size_t)i*20);
 }
+
+/* Regime A: FIXED mnemonic, passphrase varies over [0-9]{width} (decimal
+ * odometer). No checksum sieve (fixed mnemonic already valid). Each thread:
+ * passphrase digits from its index -> salt="mnemonic"+digits -> PBKDF2 ->
+ * derive_address -> compare 20-byte program. */
+extern "C" __global__ void g_crack_pass(const u8 *mn, int mnlen, int pwidth,
+                                        unsigned long long start, unsigned long long count,
+                                        u32 purpose, u32 change, u32 index,
+                                        const u8 *target_prog,
+                                        unsigned long long *hit_index, int *hit_found){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u8 salt[8+16]; salt[0]='m';salt[1]='n';salt[2]='e';salt[3]='m';salt[4]='o';salt[5]='n';salt[6]='i';salt[7]='c';
+    unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
+    u32 slen=8+pwidth;
+    u8 seed[64]; pbkdf2_seed(mn,(u32)mnlen,salt,slen,2048,seed);
+    u8 prog[20]; derive_address(seed,purpose,change,index,prog);
+    int eq=1; for(int b=0;b<20;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+  }
+}

@@ -122,6 +122,16 @@ static int xpub_chaincode(const char*xp,uint8_t cc[32]){
   if(n!=82){ fprintf(stderr,"xpub base58 decode length %d (want 82)\n",n); return -1; }
   memcpy(cc,raw+13,32); return 0;
 }
+/* base58check P2PKH/P2SH address (25B = version||h160(20)||checksum(4)) ->
+ * 20-byte program + purpose class (44 for version 0x00, 49 for 0x05). */
+static int decode_address(const char*addr,uint8_t prog[20],int*purpose){
+  uint8_t raw[64]; int n=b58decode(addr,raw,sizeof raw);
+  if(n!=25){ fprintf(stderr,"address base58 decode length %d (want 25)\n",n); return -1; }
+  int ver=raw[0]; memcpy(prog,raw+1,20);
+  if(ver==0x00) *purpose=44; else if(ver==0x05) *purpose=49;
+  else { fprintf(stderr,"unsupported address version 0x%02x (v1: p2pkh/p2sh)\n",ver); return -1; }
+  return 0;
+}
 
 /* ------------------------------ GPU launch ------------------------------ */
 static void gpu_upload_words(const Words*W, CUdeviceptr*d_data,CUdeviceptr*d_off,CUdeviceptr*d_len,CUdeviceptr*d_idx){
@@ -312,6 +322,37 @@ static int mode_addr_gate(const char*vecfile,const char*cu){
   return bad?1:0;
 }
 
+/* ----------------------- Regime A: passphrase crack --------------------- */
+/* parse "[0-9]{N}" -> N (decimal width). Returns -1 on unsupported grammar. */
+static int passphrase_width(const char*pat){
+  int w=0; if(sscanf(pat,"[0-9]{%d}",&w)==1 && w>0 && w<=18) return w; return -1;
+}
+static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[20],
+                           int purpose,uint32_t change,uint32_t index,
+                           unsigned long long ustart,unsigned long long ucount,const char*cu){
+  build_module(cu);
+  int mnlen=(int)strlen(mnemonic);
+  CUdeviceptr dmn=up(mnemonic,mnlen), dtp=up(tprog,20);
+  unsigned long long total=1; for(int i=0;i<pwidth;i++) total*=10ULL;
+  unsigned long long start=ustart>total?total:ustart;
+  unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
+  unsigned long long init=~0ULL; int zero=0;
+  CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
+  uint32_t pu=(uint32_t)purpose;
+  void*args[]={&dmn,&mnlen,&pwidth,&start,&count,&pu,&change,&index,&dtp,&dhi,&dfound};
+  int tpb=128,grid=1024;
+  fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d)...\n",pwidth,count,start,purpose);
+  struct timeval t0,t1; gettimeofday(&t0,0);
+  CU(cuLaunchKernel(kern("g_crack_pass"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+  gettimeofday(&t1,0); double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (PBKDF2+EC every candidate)\n",count,secs,count/secs/1e6);
+  int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(!found){ printf("NOT FOUND\n"); return 1; }
+  char pass[24]; unsigned long long q=hidx; for(int p=pwidth-1;p>=0;p--){ pass[p]=(char)('0'+(int)(q%10)); q/=10; } pass[pwidth]=0;
+  printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : m/%d'/0'/0'/%u/%u\n",hidx,pass,purpose,change,index);
+  return 0;
+}
+
 /* --------------------------------- CLI ---------------------------------- */
 static void usage(void){
   fprintf(stderr,
@@ -335,12 +376,13 @@ int main(int argc,char**argv){
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
-  uint32_t purposes[8]={84}; int npurp=1;
+  uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
+  const char *mnemonic=0,*passphrase=0,*address=0; uint32_t achange=0,aindex=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
     else if(!strcmp(argv[i],"--target-chaincode")&&i+1<argc) tcc_hex=argv[++i];
-    else if(!strcmp(argv[i],"--purpose")&&i+1<argc){ npurp=0; char*s=strtok(argv[++i],","); while(s&&npurp<8){purposes[npurp++]=(uint32_t)atoi(s);s=strtok(0,",");} }
+    else if(!strcmp(argv[i],"--purpose")&&i+1<argc){ npurp=0; purpose_set=1; char*s=strtok(argv[++i],","); while(s&&npurp<8){purposes[npurp++]=(uint32_t)atoi(s);s=strtok(0,",");} }
     else if(!strcmp(argv[i],"--no-checksum")) require_ck=0;
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
@@ -349,13 +391,28 @@ int main(int argc,char**argv){
     else if((!strcmp(argv[i],"--count")||!strcmp(argv[i],"--limit"))&&i+1<argc) ccount=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--ec-gate")){ ecgate="vectors/vec_ec.txt"; if(i+1<argc&&strncmp(argv[i+1],"-",1)!=0) ecgate=argv[++i]; }
     else if(!strcmp(argv[i],"--addr-gate")){ addrgate="vectors/vec_addr.txt"; if(i+1<argc&&strncmp(argv[i+1],"-",1)!=0) addrgate=argv[++i]; }
+    else if(!strcmp(argv[i],"--mnemonic")&&i+1<argc) mnemonic=argv[++i];
+    else if(!strcmp(argv[i],"--passphrase")&&i+1<argc) passphrase=argv[++i];
+    else if(!strcmp(argv[i],"--address")&&i+1<argc) address=argv[++i];
+    else if(!strcmp(argv[i],"--change")&&i+1<argc) achange=(uint32_t)strtoul(argv[++i],0,10);
+    else if(!strcmp(argv[i],"--index")&&i+1<argc) aindex=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
-  if(!words){ usage(); return 2; }
-  Words W; parse_words(&W,words);
+  /* gate modes need no pattern */
   if(ecgate) return mode_ec_gate(ecgate,cu);
   if(addrgate) return mode_addr_gate(addrgate,cu);
+  /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
+  if(mnemonic && passphrase){
+    int w=passphrase_width(passphrase);
+    if(w<0){ fprintf(stderr,"v1 passphrase supports [0-9]{N} only, got '%s'\n",passphrase); return 2; }
+    if(!address){ fprintf(stderr,"regime A needs --address (p2pkh/p2sh target)\n"); return 2; }
+    uint8_t prog[20]; int apurpose; if(decode_address(address,prog,&apurpose)) return 2;
+    int purpose = purpose_set ? (int)purposes[0] : apurpose;
+    return mode_crack_pass(mnemonic,w,prog,purpose,achange,aindex,cstart,ccount,cu);
+  }
+  if(!words){ usage(); return 2; }
+  Words W; parse_words(&W,words);
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
