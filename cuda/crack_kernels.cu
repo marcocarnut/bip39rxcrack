@@ -1,0 +1,87 @@
+/* crack_kernels.cu -- Phase-2 self-enumerate xpub crack (single GPU).
+ *
+ * The GPU enumerates its OWN candidates from a global index (PLAN §3): each
+ * thread unranks its permutation index on-die (decode_perm, byte-identical to
+ * librxe), runs the pipeline, and reports hits. No candidate transfer over
+ * PCIe. All device crypto is the Phase-1-proven bip39_device.cuh.
+ *
+ *   digits -> checksum sieve -> PBKDF2 -> hardened EC-free derive -> chaincode compare
+ *
+ * Base words (their strings + 11-bit BIP39 indices) are the only per-run data
+ * the host uploads -- O(pattern), not O(candidates). The word's 11-bit index IS
+ * the odometer digit; the password string is rebuilt from the chosen words.
+ */
+#include "bip39_device.cuh"
+
+#define MN_STRIDE 256   /* max reconstructed mnemonic bytes (24w * ~9 + slack) */
+#define HARD 0x80000000u
+
+/* Build the BIP39 mnemonic bytes for permutation position digits dig[0..size-1]
+ * from the base-word string table; single-space separated, no trailing space
+ * (English wordlist is ASCII so NFKD is identity). Returns length. Also fills
+ * g[p] = 11-bit BIP39 index of the word at position p. */
+__device__ int build_mnemonic(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                              const u32 *bw_idx, const int *dig, int size,
+                              u8 *out_mn, u32 *g){
+  int L=0;
+  for(int p=0; p<size; p++){
+    int d=dig[p];
+    if(p) out_mn[L++]=' ';
+    const u8 *w=bw_data+bw_off[d]; int wl=bw_len[d];
+    for(int c=0;c<wl;c++) out_mn[L++]=w[c];
+    g[p]=bw_idx[d];
+  }
+  return L;
+}
+
+/* Reconstruction + checksum-validity gate: for each provided index, emit the
+ * mnemonic bytes and the checksum-valid flag (to diff vs the oracle host-side). */
+extern "C" __global__ void g_recon(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                   const u32 *bw_idx, int n, int size,
+                                   const unsigned long long *idx_lo, const unsigned long long *idx_hi,
+                                   int nidx, u8 *out_mn, int *out_len, u8 *out_valid){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nidx) return;
+  (void)idx_hi;                          /* <=20 words -> index fits u64 */
+  unsigned long long j=idx_lo[i];
+  int dig[32]; decode_perm(dig,n,size,j);
+  u32 g[32];
+  int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,out_mn+(size_t)i*MN_STRIDE,g);
+  out_len[i]=L;
+  out_valid[i]=(u8)bip39_checksum_ok(g,size);
+}
+
+/* The crack: grid-stride over [start, start+count). checksum-ON sieves before
+ * PBKDF2. On a chaincode match, record the (lowest) global index + purpose.
+ * hit_index is u64 (valid for <=20-word permutations, 20! < 2^64); the host
+ * refuses >20-word self-enumerate until the u128 hit path lands. */
+extern "C" __global__ void g_crack(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                   const u32 *bw_idx, int n, int size,
+                                   unsigned long long start_lo, unsigned long long start_hi,
+                                   unsigned long long count,
+                                   const u32 *purposes, int npurp,
+                                   const u8 *target_cc, int require_ck,
+                                   unsigned long long *hit_index, int *hit_found, int *hit_purpose){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  (void)start_hi;                        /* <=20 words -> start+count fit u64 */
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+      t<count; t+=stride){
+    unsigned long long j=start_lo+t;
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    if(require_ck && !bip39_checksum_ok(g,size)) continue;
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    for(int pp=0; pp<npurp; pp++){
+      u32 idx3[3]={ purposes[pp]|HARD, 0u|HARD, 0u|HARD };
+      u8 cc[32],kk[32]; derive_hardened(seed,64,idx3,3,cc,kk);
+      int eq=1; for(int b=0;b<32;b++) if(cc[b]!=target_cc[b]){ eq=0; break; }
+      if(eq){
+        unsigned long long ji=j;    // <=20w fits u64
+        atomicMin(hit_index, ji);
+        atomicExch(hit_found, 1);
+        atomicExch(hit_purpose, (int)purposes[pp]);
+      }
+    }
+  }
+}

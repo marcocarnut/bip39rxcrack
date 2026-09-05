@@ -34,6 +34,23 @@ if (WORDS.length !== 2048) { console.error(`wordlist not 2048 (${WORDS.length})`
 const OUT = path.join(__dirname, '..', 'vectors');
 fs.mkdirSync(OUT, { recursive: true });
 
+// Anchor the oracle to published ground truth: the generator itself asserts the
+// FIPS SHA-512 KAT and BIP32 test-vector-1 constants before emitting anything.
+// (Belt-and-suspenders on top of the browser-gated oracle.)
+(function anchor() {
+  const must = (got, want, m) => { if (got !== want) { console.error(`ANCHOR FAIL ${m}\n  got  ${got}\n  want ${want}`); process.exit(3); } };
+  must(hex(C.sha512(C.utf8('abc'))),
+    'ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f', 'SHA-512("abc") FIPS KAT');
+  must(hex(C.sha512(C.utf8(''))),
+    'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e', 'SHA-512("") FIPS KAT');
+  const bm = C.seedToMaster(C.fromHex('000102030405060708090a0b0c0d0e0f'));
+  must(hex(C.ser256(bm.k)), 'e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35', 'BIP32 vector-1 m priv');
+  must(hex(bm.c),           '873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508', 'BIP32 vector-1 m chaincode');
+  const bh = C.ckdHardened(bm, 0x80000000);
+  must(hex(C.ser256(bh.k)), 'edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea', "BIP32 vector-1 m/0' priv");
+  must(hex(bh.c),           '47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141', "BIP32 vector-1 m/0' chaincode");
+})();
+
 // ---- deterministic PRNG (xorshift128) --------------------------------------
 let s0 = 0x9e3779b9, s1 = 0x243f6a88, s2 = 0xb7e15162, s3 = 0xdeadbeef;
 function rnd() {

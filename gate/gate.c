@@ -41,12 +41,33 @@ static void tohex(const unsigned char *b,int n,char *out){ static const char*h="
   for(int i=0;i<n;i++){ out[i*2]=h[b[i]>>4]; out[i*2+1]=h[b[i]&15]; } out[n*2]=0; }
 
 /* ------- NVRTC compile + module load ------- */
+/* Resolve a single local `#include "header"` by textual substitution, so NVRTC
+ * never needs a filesystem include path (avoids quoted-include search quirks).
+ * Header is looked up relative to the .cu's directory. */
+static char *inline_includes(char *src, const char *cu_path){
+  const char *tag="#include \"";
+  char *p=strstr(src,tag);
+  if(!p) return src;
+  char dir[512]; snprintf(dir,sizeof dir,"%s",cu_path);
+  char *sl=strrchr(dir,'/'); if(sl) *sl=0; else strcpy(dir,".");
+  char *q=p+strlen(tag); char *e=strchr(q,'"'); if(!e) return src;
+  char hdr[512]; int hn=(int)(e-q); if(hn>500) hn=500; memcpy(hdr,q,hn); hdr[hn]=0;
+  char full[1100]; snprintf(full,sizeof full,"%s/%s",dir,hdr);
+  char *inc=slurp(full);
+  char *lineend=strchr(e,'\n'); if(!lineend) lineend=e+1; else lineend++;
+  size_t pre=p-src, post=strlen(lineend), ilen=strlen(inc);
+  char *out=malloc(pre+ilen+post+2);
+  memcpy(out,src,pre); memcpy(out+pre,inc,ilen); out[pre+ilen]='\n';
+  memcpy(out+pre+ilen+1,lineend,post+1);
+  free(inc); free(src);
+  return inline_includes(out,cu_path);   // resolve any further includes
+}
 static void build_module(const char *cu_path){
-  char *src=slurp(cu_path);
-  const char *opts[]={ "--gpu-architecture=compute_90" };
+  char *src=inline_includes(slurp(cu_path),cu_path);
+  const char *opts[]={ "--gpu-architecture=compute_90", "--device-int128" };
   nvrtcProgram prog;
   NVR(nvrtcCreateProgram(&prog,src,"gate_kernels.cu",0,0,0));
-  nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
+  nvrtcResult cr=nvrtcCompileProgram(prog,2,opts);
   size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
   if(logn>1){
     char*log=malloc(logn); nvrtcGetProgramLog(prog,log);

@@ -18,14 +18,21 @@ CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CUDA_HOME ?= /usr/local/cuda
 RESEED39_DIR ?= /root/bip39rxcrack
 RXE_DIR   ?= ../rxe
+LIBRXE     = $(RXE_DIR)/librxe.a
 
-INC  = -I$(CUDA_HOME)/include
+INC  = -I$(CUDA_HOME)/include -I$(RXE_DIR)
 LIBS = -L$(CUDA_HOME)/lib64 -lnvrtc -lcuda
+RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 
 BIN = phase1gate
+CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build clean
-all: build
+.PHONY: all gate vectors build cracker clean
+all: build cracker
+
+# librxe.a comes from the sibling rxe repo (built there on demand).
+$(LIBRXE):
+	$(MAKE) -C $(RXE_DIR) librxe.a
 
 # Full Phase-1 deliverable: regenerate vectors, build, run every gate.
 gate: vectors build
@@ -40,5 +47,10 @@ build: $(BIN)
 $(BIN): gate/gate.c cuda/gate_kernels.cu
 	$(CC) $(CFLAGS) $(INC) -o $(BIN) gate/gate.c $(LIBS)
 
+# Phase-2 self-enumerate cracker (links librxe as the canonical enumerator).
+cracker: $(CRACK)
+$(CRACK): src/bip39rxcrack.c cuda/crack_kernels.cu cuda/bip39_device.cuh $(LIBRXE)
+	$(CC) $(CFLAGS) $(INC) -o $(CRACK) src/bip39rxcrack.c $(RXELIBS) $(LIBS)
+
 clean:
-	rm -f $(BIN) vectors/*.txt
+	rm -f $(BIN) $(CRACK) vectors/*.txt
