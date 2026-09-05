@@ -504,6 +504,32 @@ static void gpu_upload_wordlist(CUdeviceptr *d_data,CUdeviceptr *d_off,CUdevicep
   for(int i=0;i<2048;i++){ off[i]=p; int l=(int)strlen(names[i]); len[i]=l; memcpy(data+p,names[i],l); p+=l; }
   *d_data=up(data,p); *d_off=up(off,2048*sizeof(int)); *d_len=up(len,2048*sizeof(int));
 }
+/* [:bip39:] and its aliases (all the same 2048-word English list, per reseed39
+ * crackworker: bip39-en / bip39en / bip39 / en / english / electrum-en /
+ * electrumen / electrum). Returns 1 if the token is a BIP39-English wildcard. */
+static int is_bip39_dict(const char*t){
+  static const char*al[]={"[:bip39-en:]","[:bip39en:]","[:bip39:]","[:en:]","[:english:]",
+                          "[:electrum-en:]","[:electrumen:]","[:electrum:]",
+                          "[:12th:]","[:15th:]","[:18th:]","[:21st:]","[:24th:]",0};
+  for(int i=0;al[i];i++) if(!strcmp(t,al[i])) return 1;
+  return 0;
+}
+/* Extract the alternatives from a permutation wordset pattern
+ * "((w0|w1|..) ){{N!..}}" or "( w0| w1|..){{N!}}" into a space-joined word list.
+ * Everything before "{{" is stripped of ()/spaces and split on '|'. */
+static void pattern_to_words(const char*pat,char*out,int max){
+  char buf[2048]; snprintf(buf,sizeof buf,"%s",pat);
+  char*bb=strstr(buf,"{{"); if(bb) *bb=0;              /* drop the {{..}} */
+  int L=0; char*p=buf;
+  while(*p){
+    if(*p=='('||*p==')'||*p==' '||*p=='\t'){ p++; continue; }
+    /* read a word token up to | ( ) space */
+    char w[32]; int n=0;
+    while(*p && *p!='|' && *p!='(' && *p!=')' && *p!=' ' && *p!='\t' && n<31) w[n++]=*p++;
+    w[n]=0; if(n) L+=snprintf(out+L,max-L,"%s%s",L?" ":"",w);
+    if(*p=='|') p++;
+  }
+}
 /* Parse "w0 w1 [:bip39-en:] .. [:bip39-en:]" -> tmpl[W] word indices (unknown=0),
  * upos[U] unknown positions, W, U, last_unknown. */
 static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,int*U,int*last_unknown){
@@ -511,7 +537,7 @@ static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,in
   char buf[2048]; snprintf(buf,sizeof buf,"%s",tpl); *W=0; *U=0;
   char*tok=strtok(buf," \t\r\n");
   while(tok){ if(*W>=32){fprintf(stderr,"max 32 positions\n");return -1;}
-    if(!strcmp(tok,"[:bip39-en:]")){ tmpl[*W]=0; upos[(*U)++]=*W; }
+    if(is_bip39_dict(tok)){ tmpl[*W]=0; upos[(*U)++]=*W; }
     else { int bi=bip39_index(names,tok); if(bi<0){fprintf(stderr,"'%s' is not a BIP39 word\n",tok);return -1;} tmpl[*W]=(uint32_t)bi; }
     (*W)++; tok=strtok(0," \t\r\n"); }
   int vc[6]={12,15,18,21,24,0}; int ok=0; for(int i=0;vc[i];i++) if(*W==vc[i]) ok=1;
@@ -705,6 +731,8 @@ static void usage(void){
    "usage: bip39rxcrack --words \"w1 w2 .. wN\" [target] [opts]\n"
    "  target: --xpub XPUB | --target-chaincode HEX(32B)\n"
    "  --purpose 44,49,84,86   BIP purposes to try (default 84)\n"
+   "  --pattern PAT           raw librxe mnemonic pattern (reseed39 wp): {{N!}} words\n"
+   "                          permutation, or known words + [:bip39:]/[:24th:] wildcards\n"
    "  --gap N                 scan receive indices 0..N-1 (default 1)\n"
    "  --change N              scan change chains 0..N-1 (default 1)\n"
    "  --no-checksum           disable the BIP39 checksum sieve\n"
@@ -725,7 +753,7 @@ int main(int argc,char**argv){
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
-  const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
+  const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -749,6 +777,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--passphrase")&&i+1<argc) passphrase=argv[++i];
     else if(!strcmp(argv[i],"--address")&&i+1<argc) address=argv[++i];
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
+    else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
     else if(!strcmp(argv[i],"--no-nth")) nthmode=0;
     else if(!strcmp(argv[i],"--decode")&&i+1<argc) decodearg=argv[++i];
@@ -757,7 +786,13 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
+  /* --pattern: a raw librxe mnemonic pattern (== reseed39 wp). {{..}} => words
+     permutation; else a missing-word template with [:dict:] wildcards. */
+  static char _wbuf[2048];
+  if(patt){ if(strstr(patt,"{{")){ pattern_to_words(patt,_wbuf,sizeof _wbuf); words=_wbuf; }
+            else templ=patt; }
   g_target_str = address?address:(xpub?xpub:tcc_hex);
+  if(patt) g_pattern_str = patt;
   g_pattern_str = words?words:(templ?templ:passphrase);
   /* gate/util modes need no pattern */
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
