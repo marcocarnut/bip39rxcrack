@@ -257,6 +257,39 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
   mpz_clear(j); rxe_free(r); return 0;
 }
 
+/* ------------------ Regime B: words permutation, ADDRESS target --------- */
+static int mode_crack_addr(const Words*W,const uint8_t tprog[20],int purpose,
+                           uint32_t change,uint32_t index,int require_ck,
+                           unsigned long long ustart,unsigned long long ucount,const char*cu){
+  char pat[2048]; wordset_pattern(W,pat,sizeof pat);
+  struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
+  mpz_t total; mpz_init(total); mpz_set(total,r->nitems);
+  if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
+  build_module(cu);
+  CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
+  CUdeviceptr dtp=up(tprog,20);
+  unsigned long long init=~0ULL; int zero=0;
+  CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
+  unsigned long long total_u=mpz_get_ui(total);
+  unsigned long long start=ustart>total_u?total_u:ustart;
+  unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
+  int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
+  void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound};
+  int tpb=128,grid=1024;
+  fprintf(stderr,"regime B: %llu permutations from %llu (checksum-%s) -> m/%d'/0'/0'/%u/%u ...\n",
+          count,start,require_ck?"ON":"OFF",purpose,change,index);
+  struct timeval t0,t1; gettimeofday(&t0,0);
+  CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+  gettimeofday(&t1,0); double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors)\n",count,secs,count/secs/1e6);
+  int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(!found){ printf("NOT FOUND\n"); return 1; }
+  mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
+  char*t=buf; while(*t==' ')t++;
+  printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : m/%d'/0'/0'/%u/%u\n",hidx,t,purpose,change,index);
+  mpz_clear(j); rxe_free(r); return 0;
+}
+
 /* --------------------------- EC gate (vs oracle) ------------------------ */
 static int mode_ec_gate(const char*vecfile,const char*cu){
   build_module(cu);
@@ -416,6 +449,9 @@ int main(int argc,char**argv){
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
+  if(address){ uint8_t prog[20]; int apurpose; if(decode_address(address,prog,&apurpose))return 2;
+    int purpose = purpose_set?(int)purposes[0]:apurpose;
+    return mode_crack_addr(&W,prog,purpose,achange,aindex,require_ck,cstart,ccount,cu); }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }

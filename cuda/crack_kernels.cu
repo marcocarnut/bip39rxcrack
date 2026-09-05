@@ -127,3 +127,26 @@ extern "C" __global__ void g_crack_pass(const u8 *mn, int mnlen, int pwidth,
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
   }
 }
+
+/* Regime B (address target): words permutation self-enumerate -> checksum sieve
+ * -> PBKDF2 -> derive_address(purpose,change,index) -> 20-byte program compare. */
+extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                        const u32 *bw_idx, int n, int size,
+                                        unsigned long long start_lo, unsigned long long count,
+                                        u32 purpose, u32 change, u32 index,
+                                        const u8 *target_prog, int require_ck,
+                                        unsigned long long *hit_index, int *hit_found){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start_lo+t;
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    if(require_ck && !bip39_checksum_ok(g,size)) continue;
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    u8 prog[20]; derive_address(seed,purpose,change,index,prog);
+    int eq=1; for(int b=0;b<20;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+  }
+}
