@@ -71,3 +71,6 @@ addrvectors: gate/gen_addr.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/gen_addr.js 300
 addr-gate: cracker addrvectors
 	@./$(CRACK) --words "abandon ability able" --addr-gate vectors/vec_addr.txt
+
+decode-gate: cracker
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/decode_gate.js

@@ -53,18 +53,33 @@ static char *inline_includes(char *src,const char *cu){
   char*out=malloc(pre+il+post+2); memcpy(out,src,pre); memcpy(out+pre,inc,il); out[pre+il]='\n'; memcpy(out+pre+il+1,le,post+1);
   free(inc); free(src); return inline_includes(out,cu);
 }
+/* FNV-1a of a string (PTX cache key). */
+static unsigned long long fnv1a(const char*s){ unsigned long long h=1469598103934665603ULL; for(;*s;s++){ h^=(unsigned char)*s; h*=1099511628211ULL; } return h; }
 static void build_module(const char *cu_path){
+  const char *arch="--gpu-architecture=compute_120";
   char *src=inline_includes(slurp(cu_path),cu_path);
-  const char *opts[]={ "--gpu-architecture=compute_120" };
-  nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
-  nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
-  size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
-  if(logn>1){ char*log=malloc(logn); nvrtcGetProgramLog(prog,log);
-    if(cr!=NVRTC_SUCCESS||getenv("CRACK_VERBOSE")) fprintf(stderr,"NVRTC log:\n%s\n",log);
-    free(log);
+  /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
+     cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
+  char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch));
+  char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_ptx_%s.ptx",key);
+  char *ptx=0; FILE*cf=fopen(cpath,"rb");
+  if(cf && !getenv("CRACK_NOCACHE")){
+    fseek(cf,0,SEEK_END); long pn=ftell(cf); fseek(cf,0,SEEK_SET); ptx=malloc(pn+1);
+    if(fread(ptx,1,pn,cf)==(size_t)pn){ ptx[pn]=0; } else { free(ptx); ptx=0; } fclose(cf);
+  } else if(cf) fclose(cf);
+  if(!ptx){
+    const char *opts[]={ arch };
+    nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
+    nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
+    size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
+    if(logn>1){ char*log=malloc(logn); nvrtcGetProgramLog(prog,log);
+      if(cr!=NVRTC_SUCCESS||getenv("CRACK_VERBOSE")) fprintf(stderr,"NVRTC log:\n%s\n",log);
+      free(log);
+    }
+    if(cr!=NVRTC_SUCCESS){ fprintf(stderr,"kernel compile failed\n"); exit(2); }
+    size_t ptxn=0; NVR(nvrtcGetPTXSize(prog,&ptxn)); ptx=malloc(ptxn); NVR(nvrtcGetPTX(prog,ptx)); nvrtcDestroyProgram(&prog);
+    FILE*wf=fopen(cpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); }
   }
-  if(cr!=NVRTC_SUCCESS){ fprintf(stderr,"kernel compile failed\n"); exit(2); }
-  size_t ptxn=0; NVR(nvrtcGetPTXSize(prog,&ptxn)); char*ptx=malloc(ptxn); NVR(nvrtcGetPTX(prog,ptx)); nvrtcDestroyProgram(&prog);
   CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,0));
   char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
@@ -122,19 +137,54 @@ static int xpub_chaincode(const char*xp,uint8_t cc[32]){
   if(n!=82){ fprintf(stderr,"xpub base58 decode length %d (want 82)\n",n); return -1; }
   memcpy(cc,raw+13,32); return 0;
 }
-/* base58check P2PKH/P2SH address (25B = version||h160(20)||checksum(4)) ->
- * 20-byte program + purpose class (44 for version 0x00, 49 for 0x05). */
-static int decode_address(const char*addr,uint8_t prog[20],int*purpose){
-  /* bech32/bech32m targets (bc1q p2wpkh / bc1p p2tr) not decodable yet -- the
-     derive side supports 84/86 (seed->address gate), only target-decode is
-     missing. Reject clearly rather than misinterpret (parity contract). */
+/* ------------------------------ bech32 --------------------------------- */
+static const char*BECH="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+static uint32_t bech_polymod(const uint8_t*v,int n){
+  static const uint32_t G[5]={0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3};
+  uint32_t chk=1;
+  for(int i=0;i<n;i++){ uint32_t b=chk>>25; chk=((chk&0x1ffffff)<<5)^v[i]; for(int k=0;k<5;k++) if((b>>k)&1) chk^=G[k]; }
+  return chk;
+}
+/* decode a bech32/bech32m segwit address -> witver, program bytes, spec. */
+static int bech32_decode(const char*addr,int*witver,uint8_t*prog,int*proglen,int*is_m){
+  char s[130]; int L=strlen(addr); if(L<8||L>120) return -1;
+  for(int i=0;i<L;i++){ char c=addr[i]; if(c>='A'&&c<='Z') c=c-'A'+'a'; s[i]=c; } s[L]=0;
+  int pos=-1; for(int i=L-1;i>=0;i--) if(s[i]=='1'){ pos=i; break; }
+  if(pos<1||pos+7>L) return -1;
+  int hlen=pos; uint8_t values[130]; int vn=0;
+  for(int i=0;i<hlen;i++) values[vn++]=s[i]>>5;      /* hrp expand high */
+  values[vn++]=0;
+  for(int i=0;i<hlen;i++) values[vn++]=s[i]&31;       /* hrp expand low */
+  int dstart=vn;
+  for(int i=pos+1;i<L;i++){ const char*p=strchr(BECH,s[i]); if(!p) return -1; values[vn++]=(uint8_t)(p-BECH); }
+  int dlen=vn-dstart;                                  /* data incl. 6-char checksum */
+  if(dlen<7) return -1;
+  uint32_t pm=bech_polymod(values,vn);
+  if(pm==1) *is_m=0; else if(pm==0x2bc830a3) *is_m=1; else return -1;
+  const uint8_t*data=values+dstart;
+  *witver=data[0];
+  /* convertBits 5->8 over data[1 .. dlen-6) */
+  int n5=dlen-6-1; const uint8_t*d5=data+1;
+  uint32_t acc=0; int bits=0; *proglen=0;
+  for(int i=0;i<n5;i++){ acc=(acc<<5)|d5[i]; bits+=5; while(bits>=8){ bits-=8; prog[(*proglen)++]=(uint8_t)((acc>>bits)&0xff); } }
+  if(bits>=5 || ((acc<<(8-bits))&0xff)) return -1;     /* leftover / padding must be zero */
+  return 0;
+}
+/* Any supported address target -> program (up to 32B) + proglen + purpose:
+ *   base58 p2pkh 0x00 -> 44 (20B) ; p2sh 0x05 -> 49 (20B)
+ *   bech32 v0 20B     -> 84 (p2wpkh) ; bech32m v1 32B -> 86 (p2tr) */
+static int decode_address(const char*addr,uint8_t prog[32],int*proglen,int*purpose){
   if(!strncmp(addr,"bc1",3)||!strncmp(addr,"tb1",3)||!strncmp(addr,"bcrt1",5)){
-    fprintf(stderr,"bech32 target decode not yet supported in v1 (p2wpkh bc1q / p2tr bc1p) -- use a p2pkh/p2sh (base58) target, or reseed39\n"); return -1; }
+    int wv,pl,ism; if(bech32_decode(addr,&wv,prog,&pl,&ism)){ fprintf(stderr,"bad bech32 address\n"); return -1; }
+    if(wv==0&&pl==20&&ism==0){ *purpose=84; *proglen=20; return 0; }
+    if(wv==1&&pl==32&&ism==1){ *purpose=86; *proglen=32; return 0; }
+    fprintf(stderr,"unsupported witness v%d len %d (v1: p2wpkh bc1q / p2tr bc1p)\n",wv,pl); return -1;
+  }
   uint8_t raw[64]; int n=b58decode(addr,raw,sizeof raw);
   if(n!=25){ fprintf(stderr,"address base58 decode length %d (want 25)\n",n); return -1; }
-  int ver=raw[0]; memcpy(prog,raw+1,20);
+  int ver=raw[0]; memcpy(prog,raw+1,20); *proglen=20;
   if(ver==0x00) *purpose=44; else if(ver==0x05) *purpose=49;
-  else { fprintf(stderr,"unsupported address version 0x%02x (v1: p2pkh/p2sh)\n",ver); return -1; }
+  else { fprintf(stderr,"unsupported address version 0x%02x\n",ver); return -1; }
   return 0;
 }
 
@@ -263,7 +313,7 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
 }
 
 /* ------------------ Regime B: words permutation, ADDRESS target --------- */
-static int mode_crack_addr(const Words*W,const uint8_t tprog[20],int purpose,
+static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
                            uint32_t change,uint32_t index,int require_ck,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
   char pat[2048]; wordset_pattern(W,pat,sizeof pat);
@@ -272,7 +322,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[20],int purpose,
   if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
   build_module(cu);
   CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
-  CUdeviceptr dtp=up(tprog,20);
+  CUdeviceptr dtp=up(tprog,32);
   unsigned long long init=~0ULL; int zero=0;
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
   unsigned long long total_u=mpz_get_ui(total);
@@ -336,28 +386,29 @@ static int mode_addr_gate(const char*vecfile,const char*cu){
   build_module(cu);
   FILE*fp=fopen(vecfile,"rb"); if(!fp){fprintf(stderr,"open %s (run: node gate/gen_addr.js)\n",vecfile);return 2;}
   int cap=0,n=0; uint8_t *seed=0,*eprog=0; uint32_t *pur=0,*chg=0,*idx=0;
-  char*line=0; size_t lc=0; ssize_t rd; char sh[300],ph[64]; unsigned int P,CH,IX;
+  char*line=0; size_t lc=0; ssize_t rd; char sh[300],ph[80]; unsigned int P,CH,IX;
   while((rd=getline(&line,&lc,fp))>0){
-    if(sscanf(line,"%299s %u %u %u %63s",sh,&P,&CH,&IX,ph)!=5) continue;
-    if(n==cap){cap=cap?cap*2:64; seed=realloc(seed,(size_t)cap*64);eprog=realloc(eprog,(size_t)cap*20);pur=realloc(pur,cap*4);chg=realloc(chg,cap*4);idx=realloc(idx,cap*4);}
-    hex2bin(sh,seed+(size_t)n*64,64); pur[n]=P; chg[n]=CH; idx[n]=IX; hex2bin(ph,eprog+(size_t)n*20,20); n++;
+    if(sscanf(line,"%299s %u %u %u %79s",sh,&P,&CH,&IX,ph)!=5) continue;
+    if(n==cap){cap=cap?cap*2:64; seed=realloc(seed,(size_t)cap*64);eprog=realloc(eprog,(size_t)cap*32);pur=realloc(pur,cap*4);chg=realloc(chg,cap*4);idx=realloc(idx,cap*4);}
+    hex2bin(sh,seed+(size_t)n*64,64); pur[n]=P; chg[n]=CH; idx[n]=IX; hex2bin(ph,eprog+(size_t)n*32,32); n++;
   }
   free(line); fclose(fp);
   CUdeviceptr dseed=up(seed,(size_t)n*64),dpur=up(pur,n*4),dchg=up(chg,n*4),didx=up(idx,n*4),dprog;
-  CU(cuMemAlloc(&dprog,(size_t)n*20));
+  CU(cuMemAlloc(&dprog,(size_t)n*32));
   void*args[]={&dseed,&dpur,&dchg,&didx,&n,&dprog};
   int tpb=64,grid=(n+tpb-1)/tpb; CU(cuLaunchKernel(kern("g_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-  uint8_t*gp=malloc((size_t)n*20); CU(cuMemcpyDtoH(gp,dprog,(size_t)n*20));
-  int bad=0,b44=0,b49=0,b84=0,c44=0,c49=0,c84=0;
-  for(int i=0;i<n;i++){ int mm=memcmp(gp+(size_t)i*20,eprog+(size_t)i*20,20)!=0;
-    if(pur[i]==44){c44++; if(mm)b44++;} else if(pur[i]==49){c49++; if(mm)b49++;} else {c84++; if(mm)b84++;}
-    if(mm){ if(bad<3){char x[42],y[42];tohex_(gp+(size_t)i*20,20,x);tohex_(eprog+(size_t)i*20,20,y);fprintf(stderr,"  addr #%d p%u\n    gpu %s\n    ora %s\n",i,pur[i],x,y);} bad++; }
+  uint8_t*gp=malloc((size_t)n*32); CU(cuMemcpyDtoH(gp,dprog,(size_t)n*32));
+  int bad=0,b[4]={0},c[4]={0}; const int PI[4]={44,49,84,86};
+  for(int i=0;i<n;i++){ int pl=(pur[i]==86)?32:20; int mm=memcmp(gp+(size_t)i*32,eprog+(size_t)i*32,pl)!=0;
+    int k=pur[i]==44?0:pur[i]==49?1:pur[i]==84?2:3; c[k]++; if(mm)b[k]++;
+    if(mm){ if(bad<3){char x[66],y[66];tohex_(gp+(size_t)i*32,pl,x);tohex_(eprog+(size_t)i*32,pl,y);fprintf(stderr,"  addr #%d p%u\n    gpu %s\n    ora %s\n",i,pur[i],x,y);} bad++; }
   }
-  printf("  [%s] seed->p2pkh(44)     : %d/%d\n",b44?"FAIL":"PASS",c44-b44,c44);
-  printf("  [%s] seed->p2sh-p2wpkh(49): %d/%d\n",b49?"FAIL":"PASS",c49-b49,c49);
-  printf("  [%s] seed->p2wpkh(84)    : %d/%d\n",b84?"FAIL":"PASS",c84-b84,c84);
-  printf("  ==== seed->address gate %s (%d vectors, incl. non-hardened ckd) ====\n",bad?"FAILED":"PASSED",n);
-  return bad?1:0;
+  printf("  [%s] seed->p2pkh(44)      : %d/%d\n",b[0]?"FAIL":"PASS",c[0]-b[0],c[0]);
+  printf("  [%s] seed->p2sh-p2wpkh(49): %d/%d\n",b[1]?"FAIL":"PASS",c[1]-b[1],c[1]);
+  printf("  [%s] seed->p2wpkh(84)     : %d/%d\n",b[2]?"FAIL":"PASS",c[2]-b[2],c[2]);
+  printf("  [%s] seed->p2tr(86)       : %d/%d\n",b[3]?"FAIL":"PASS",c[3]-b[3],c[3]);
+  printf("  ==== seed->address gate %s (%d vectors, incl. non-hardened ckd + BIP86 TapTweak) ====\n",bad?"FAILED":"PASSED",n);
+  (void)PI; return bad?1:0;
 }
 
 /* ----------------------- Regime A: passphrase crack --------------------- */
@@ -365,12 +416,12 @@ static int mode_addr_gate(const char*vecfile,const char*cu){
 static int passphrase_width(const char*pat){
   int w=0; if(sscanf(pat,"[0-9]{%d}",&w)==1 && w>0 && w<=18) return w; return -1;
 }
-static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[20],
+static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32],
                            int purpose,uint32_t change,uint32_t index,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
   build_module(cu);
   int mnlen=(int)strlen(mnemonic);
-  CUdeviceptr dmn=up(mnemonic,mnlen), dtp=up(tprog,20);
+  CUdeviceptr dmn=up(mnemonic,mnlen), dtp=up(tprog,32);
   unsigned long long total=1; for(int i=0;i<pwidth;i++) total*=10ULL;
   unsigned long long start=ustart>total?total:ustart;
   unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
@@ -415,7 +466,7 @@ int main(int argc,char**argv){
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
-  const char *mnemonic=0,*passphrase=0,*address=0; uint32_t achange=0,aindex=0;
+  const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0; uint32_t achange=0,aindex=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -432,12 +483,15 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--mnemonic")&&i+1<argc) mnemonic=argv[++i];
     else if(!strcmp(argv[i],"--passphrase")&&i+1<argc) passphrase=argv[++i];
     else if(!strcmp(argv[i],"--address")&&i+1<argc) address=argv[++i];
+    else if(!strcmp(argv[i],"--decode")&&i+1<argc) decodearg=argv[++i];
     else if(!strcmp(argv[i],"--change")&&i+1<argc) achange=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--index")&&i+1<argc) aindex=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
-  /* gate modes need no pattern */
+  /* gate/util modes need no pattern */
+  if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
+    char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(ecgate) return mode_ec_gate(ecgate,cu);
   if(addrgate) return mode_addr_gate(addrgate,cu);
   /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
@@ -445,7 +499,7 @@ int main(int argc,char**argv){
     int w=passphrase_width(passphrase);
     if(w<0){ fprintf(stderr,"v1 passphrase supports [0-9]{N} only, got '%s'\n",passphrase); return 2; }
     if(!address){ fprintf(stderr,"regime A needs --address (p2pkh/p2sh target)\n"); return 2; }
-    uint8_t prog[20]; int apurpose; if(decode_address(address,prog,&apurpose)) return 2;
+    uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose)) return 2;
     int purpose = purpose_set ? (int)purposes[0] : apurpose;
     return mode_crack_pass(mnemonic,w,prog,purpose,achange,aindex,cstart,ccount,cu);
   }
@@ -454,7 +508,7 @@ int main(int argc,char**argv){
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
-  if(address){ uint8_t prog[20]; int apurpose; if(decode_address(address,prog,&apurpose))return 2;
+  if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
     return mode_crack_addr(&W,prog,purpose,achange,aindex,require_ck,cstart,ccount,cu); }
   uint8_t tcc[32];

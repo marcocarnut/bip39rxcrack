@@ -94,8 +94,8 @@ extern "C" __global__ void g_ec(const u8 *sk, int n, u8 *pub, u8 *h160, u8 *p2pk
   u8 p[33]; scalar_mul_G(sk+(size_t)i*32, p);
   for(int b=0;b<33;b++) pub[(size_t)i*33+b]=p[b];
   u8 h[20]; hash160(p,33,h); for(int b=0;b<20;b++) h160[(size_t)i*20+b]=h[b];
-  u8 pr[20]; pub_to_program(p,44,pr); for(int b=0;b<20;b++) p2pkh[(size_t)i*20+b]=pr[b];
-  pub_to_program(p,49,pr); for(int b=0;b<20;b++) p2sh[(size_t)i*20+b]=pr[b];
+  u8 pr[32]; int pl; pub_to_program(p,44,pr,&pl); for(int b=0;b<20;b++) p2pkh[(size_t)i*20+b]=pr[b];
+  pub_to_program(p,49,pr,&pl); for(int b=0;b<20;b++) p2sh[(size_t)i*20+b]=pr[b];
 }
 
 /* seed->address gate: for each (seed, purpose, change, index) emit the 20-byte
@@ -103,7 +103,7 @@ extern "C" __global__ void g_ec(const u8 *sk, int n, u8 *pub, u8 *h160, u8 *p2pk
 extern "C" __global__ void g_addr(const u8 *seed, const u32 *purpose, const u32 *change,
                                   const u32 *index, int n, u8 *prog){
   int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
-  derive_address(seed+(size_t)i*64, purpose[i], change[i], index[i], prog+(size_t)i*20);
+  int pl; derive_address(seed+(size_t)i*64, purpose[i], change[i], index[i], prog+(size_t)i*32, &pl);
 }
 
 /* Regime A: FIXED mnemonic, passphrase varies over [0-9]{width} (decimal
@@ -122,8 +122,8 @@ extern "C" __global__ void g_crack_pass(const u8 *mn, int mnlen, int pwidth,
     unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
     u32 slen=8+pwidth;
     u8 seed[64]; pbkdf2_seed(mn,(u32)mnlen,salt,slen,2048,seed);
-    u8 prog[20]; derive_address(seed,purpose,change,index,prog);
-    int eq=1; for(int b=0;b<20;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
+    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
   }
 }
@@ -145,8 +145,8 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     if(require_ck && !bip39_checksum_ok(g,size)) continue;
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    u8 prog[20]; derive_address(seed,purpose,change,index,prog);
-    int eq=1; for(int b=0;b<20;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
+    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
   }
 }

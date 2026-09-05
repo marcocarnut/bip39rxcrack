@@ -20,7 +20,7 @@ const lines=[];
 const NR=parseInt(process.argv[2]||'300',10);
 for(let i=0;i<NR;i++){
   const seed=C.mnemonicToSeed(entToMn(rbytes(i&1?32:16)), i%3?'':'pass'+i);
-  const purpose=[44,49,84][i%3];
+  const purpose=[44,49,84,86][i%4];
   const change=i%2, index=i%5;
   const prog=C.pubToTarget(C.privToPub(C.addressNode(seed,purpose,0,0,change,index).k),purpose).program;
   lines.push(`${hex(seed)} ${purpose} ${change} ${index} ${hex(prog)}`);

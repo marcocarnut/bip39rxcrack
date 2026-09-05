@@ -102,22 +102,25 @@ src/bip39rxcrack.c         librxe-linked host (enumerate, decode, launch, report
 gate/gen_*.js, gate.c, e2e.js   oracle-driven vector generators + harnesses
 ```
 
-## Known follow-ups (none block the two real examples — both are base58)
+All four script types are supported end to end, base58 **and** bech32 targets:
+p2pkh (BIP44, `1…`), p2sh-p2wpkh (BIP49, `3…`), p2wpkh (BIP84, `bc1q…`), p2tr
+(BIP86, `bc1p…`, TapTweak). `make decode-gate` checks target decode vs the
+oracle. (NVRTC compile of the full EC+taproot module is slow, ~2–3 min, so the
+harness caches the PTX under `/tmp` keyed by source hash — repeat runs are
+instant; `CRACK_NOCACHE=1` forces a recompile.)
 
-1. **bech32 target decode.** `decode_address` handles base58 only (p2pkh 0x00 →
-   BIP44, p2sh 0x05 → BIP49). p2wpkh (`bc1q`) and p2tr (`bc1p`) address *targets*
-   aren't decodable yet, so they're rejected with a clear message. The *derive*
-   side already produces p2wpkh(84)/p2tr(86) programs (seed→address gate covers
-   84; 86/TapTweak is next) — only target decode is missing. Needed for BIP84/86
-   address examples and full reseed39 parity.
-2. **EC / occupancy perf.** secp256k1 is correctness-only (double-and-add `k·G` +
+## Known follow-ups
+
+1. **EC / occupancy perf.** secp256k1 is correctness-only (double-and-add `k·G` +
    Fermat inverse). Fixed-base comb `k·G`, batch/Montgomery inversion, regime-A
    fixed-key HMAC-midstate precompute, and occupancy tuning are the levers toward
    the PLAN's 1–2 M seeds/s.
-3. **Feistel keyed-shuffle** (`{{N!?}}`, librxe `permute.c`). Reported-index
-   parity already holds (canonical rank 8952072 == reseed39's found_index); the
-   shuffle only changes partial-search (`--limit`/`--range`/shard) *sampling
-   order*, not any recovered seed. Full sweeps are unaffected.
+2. **Feistel keyed-shuffle** (`{{N!?}}`, librxe `permute.c`) — **dropped**: no
+   real use case (a recovery sweeps the full space; a contiguous shard samples an
+   unknown permutation as uniformly as a shuffle would), reported-index parity
+   already holds (canonical rank 8952072 == reseed39's found_index), and it would
+   force a per-candidate factorial decode that conflicts with cheap incremental
+   odometer sharding.
 
 Further out: `[:Nth:]` last-word checksum construction; Electrum; multi-GPU
 fork/exec (range-shard machinery is in place via `--start/--count`); full

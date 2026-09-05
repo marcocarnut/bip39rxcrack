@@ -60,7 +60,7 @@ __device__ void fe_sub(fe *r, const fe *a, const fe *b){
 }
 
 /* full 256x256 -> 512 (t[8]) schoolbook via mulhi */
-__device__ void mul_256(const u64 a[4], const u64 b[4], u64 t[8]){
+__device__ __noinline__ void mul_256(const u64 a[4], const u64 b[4], u64 t[8]){
   for(int i=0;i<8;i++) t[i]=0;
   for(int i=0;i<4;i++){
     u64 carry=0;
@@ -81,7 +81,7 @@ __device__ void mul_scalar(const u64 a[4], u64 c, u64 out[5]){
   out[4]=carry;
 }
 /* reduce 512-bit t[8] mod p into r (fe) */
-__device__ void fe_reduce(fe *r, u64 t[8]){
+__device__ __noinline__ void fe_reduce(fe *r, u64 t[8]){
   /* r0 = lo + hi*C  (hi = t[4..7]) */
   u64 hi[4]={t[4],t[5],t[6],t[7]};
   u64 m[5]; mul_scalar(hi,SECP_C,m);          /* hi*C : 5 limbs */
@@ -99,11 +99,11 @@ __device__ void fe_reduce(fe *r, u64 t[8]){
   fe_cond_sub_p(out);
   r->v[0]=out[0];r->v[1]=out[1];r->v[2]=out[2];r->v[3]=out[3];
 }
-__device__ void fe_mul(fe *r, const fe *a, const fe *b){ u64 t[8]; mul_256(a->v,b->v,t); fe_reduce(r,t); }
+__device__ __noinline__ void fe_mul(fe *r, const fe *a, const fe *b){ u64 t[8]; mul_256(a->v,b->v,t); fe_reduce(r,t); }
 __device__ void fe_sqr(fe *r, const fe *a){ fe_mul(r,a,a); }
 
 /* inverse via Fermat: a^(p-2). p-2 = 0xFFFFFFFE...FC2D */
-__device__ void fe_inv(fe *r, const fe *a){
+__device__ __noinline__ void fe_inv(fe *r, const fe *a){
   /* exponent p-2 limbs (little-endian) */
   const u64 e[4]={0xFFFFFFFEFFFFFC2DULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL};
   fe res; fe_set_u64(&res,1); fe base; fe_set(&base,a);
@@ -120,7 +120,7 @@ __device__ void fe_inv(fe *r, const fe *a){
 /* Jacobian point */
 typedef struct { fe X,Y,Z; int inf; } jpt;
 __device__ void j_set_inf(jpt *p){ p->inf=1; fe_set_u64(&p->X,1); fe_set_u64(&p->Y,1); fe_set_u64(&p->Z,0); }
-__device__ void j_double(jpt *r, const jpt *p){
+__device__ __noinline__ void j_double(jpt *r, const jpt *p){
   if(p->inf||fe_iszero(&p->Y)){ j_set_inf(r); return; }
   fe Y2,S,M,X3,Y3,Z3,t,t2;
   fe_sqr(&Y2,&p->Y);
@@ -132,7 +132,7 @@ __device__ void j_double(jpt *r, const jpt *p){
   fe_mul(&Z3,&p->Y,&p->Z); fe_add(&Z3,&Z3,&Z3);                           // 2*Y*Z
   fe_set(&r->X,&X3); fe_set(&r->Y,&Y3); fe_set(&r->Z,&Z3); r->inf=0;
 }
-__device__ void j_add(jpt *r, const jpt *p, const jpt *q){
+__device__ __noinline__ void j_add(jpt *r, const jpt *p, const jpt *q){
   if(p->inf){ *r=*q; return; } if(q->inf){ *r=*p; return; }
   fe Z1Z1,Z2Z2,U1,U2,S1,S2,H,R,HH,HHH,V,X3,Y3,Z3,t,t2;
   fe_sqr(&Z1Z1,&p->Z); fe_sqr(&Z2Z2,&q->Z);
@@ -148,22 +148,38 @@ __device__ void j_add(jpt *r, const jpt *p, const jpt *q){
   fe_set(&r->X,&X3); fe_set(&r->Y,&Y3); fe_set(&r->Z,&Z3); r->inf=0;
 }
 
-/* k*G, k as 32 big-endian bytes; output compressed 33-byte pubkey */
-__device__ void scalar_mul_G(const u8 k[32], u8 pub[33]){
-  jpt R; j_set_inf(&R);
+/* k*G (k = 32 big-endian bytes) -> Jacobian point (double-and-add). */
+__device__ __noinline__ void scalar_mul_G_j(const u8 k[32], jpt *R){
+  j_set_inf(R);
   jpt G; fe_set(&G.X,(const fe*)FE_GX); fe_set(&G.Y,(const fe*)FE_GY); fe_set_u64(&G.Z,1); G.inf=0;
   for(int i=0;i<256;i++){
-    j_double(&R,&R);
+    j_double(R,R);
     int byte=k[i>>3]; int bit=(byte>>(7-(i&7)))&1;   // MSB-first
-    if(bit) j_add(&R,&R,&G);
+    if(bit) j_add(R,R,&G);
   }
+}
+/* Jacobian -> affine (x,y) with cond-normalized limbs. */
+__device__ void j_affine(const jpt *R, fe *x, fe *y){
+  fe zi,zi2,zi3; fe_inv(&zi,&R->Z); fe_sqr(&zi2,&zi); fe_mul(&zi3,&zi2,&zi);
+  fe_mul(x,&R->X,&zi2); fe_mul(y,&R->Y,&zi3);
+  fe_cond_sub_p(x->v); fe_cond_sub_p(y->v);
+}
+/* fe -> 32 big-endian bytes */
+__device__ void fe_to_be(const fe *x, u8 out[32]){
+  for(int i=0;i<32;i++){ int limb=(31-i)>>3, byteinlimb=(31-i)&7; out[i]=(u8)(x->v[limb]>>(8*byteinlimb)); }
+}
+/* fe <- 32 big-endian bytes */
+__device__ void fe_from_be(fe *x, const u8 in[32]){
+  x->v[0]=x->v[1]=x->v[2]=x->v[3]=0;
+  for(int i=0;i<32;i++){ int limb=(31-i)>>3, byteinlimb=(31-i)&7; x->v[limb]|=((u64)in[i])<<(8*byteinlimb); }
+}
+/* k*G, k as 32 big-endian bytes; output compressed 33-byte pubkey */
+__device__ void scalar_mul_G(const u8 k[32], u8 pub[33]){
+  jpt R; scalar_mul_G_j(k,&R);
   if(R.inf){ for(int i=0;i<33;i++) pub[i]=0; return; }
-  /* affine: x = X/Z^2, y = Y/Z^3 */
-  fe zi,zi2,zi3,x,y; fe_inv(&zi,&R.Z); fe_sqr(&zi2,&zi); fe_mul(&zi3,&zi2,&zi);
-  fe_mul(&x,&R.X,&zi2); fe_mul(&y,&R.Y,&zi3);
-  fe_cond_sub_p(x.v); fe_cond_sub_p(y.v);
+  fe x,y; j_affine(&R,&x,&y);
   pub[0]=(y.v[0]&1)?0x03:0x02;
-  for(int i=0;i<32;i++){ int limb=(31-i)>>3, byteinlimb=(31-i)&7; pub[1+i]=(u8)(x.v[limb]>>(8*byteinlimb)); }
+  fe_to_be(&x,pub+1);
 }
 
 /* ============================== RIPEMD-160 ============================== */
@@ -201,11 +217,75 @@ __device__ void ripemd160(const u8 *msg, u32 len, u8 out[20]){
 }
 __device__ void hash160(const u8 *msg, u32 len, u8 out[20]){ u8 sh[32]; sha256_1blk(msg,len,sh); ripemd160(sh,32,out); }
 
-/* pubkey(33) + purpose -> 20-byte program (p2pkh/p2wpkh: hash160; p2sh-p2wpkh: hash160(0x0014||h160)) */
-__device__ void pub_to_program(const u8 pub[33], int purpose, u8 prog[20]){
+/* ============================ Taproot (BIP86) =========================== */
+/* Multi-block SHA-256 (arbitrary length) -- tagged hash needs 96-byte input. */
+__device__ __noinline__ void sha256_compress(u32 H[8], const u8 blk[64]){
+  u32 w[64]; for(int i=0;i<16;i++) w[i]=(blk[4*i]<<24)|(blk[4*i+1]<<16)|(blk[4*i+2]<<8)|blk[4*i+3];
+  for(int i=16;i<64;i++){ u32 s0=ror32(w[i-15],7)^ror32(w[i-15],18)^(w[i-15]>>3),s1=ror32(w[i-2],17)^ror32(w[i-2],19)^(w[i-2]>>10); w[i]=w[i-16]+s0+w[i-7]+s1; }
+  u32 a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+  for(int i=0;i<64;i++){ u32 S1=ror32(e,6)^ror32(e,11)^ror32(e,25),ch=(e&f)^((~e)&g),t1=h+S1+ch+K256[i]+w[i],S0=ror32(a,2)^ror32(a,13)^ror32(a,22),maj=(a&b)^(a&c)^(b&c),t2=S0+maj; h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
+  H[0]+=a;H[1]+=b;H[2]+=c;H[3]+=d;H[4]+=e;H[5]+=f;H[6]+=g;H[7]+=h;
+}
+/* Multi-block SHA-256 (arbitrary length) -- tagged hash needs a 96-byte input. */
+__device__ void sha256_full(const u8 *msg, u32 len, u8 out[32]){
+  u32 H[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  u32 off=0; u8 blk[64];
+  while(len-off>=64){ for(int i=0;i<64;i++) blk[i]=msg[off+i]; sha256_compress(H,blk); off+=64; }
+  u32 rem=len-off; for(u32 i=0;i<rem;i++) blk[i]=msg[off+i];
+  blk[rem]=0x80; for(u32 i=rem+1;i<64;i++) blk[i]=0;
+  if(rem>=56){ sha256_compress(H,blk); for(int i=0;i<64;i++) blk[i]=0; }
+  u64 bits=(u64)len*8; for(int i=0;i<8;i++) blk[63-i]=(u8)(bits>>(8*i));
+  sha256_compress(H,blk);
+  for(int i=0;i<8;i++){ out[i*4]=(H[i]>>24)&255;out[i*4+1]=(H[i]>>16)&255;out[i*4+2]=(H[i]>>8)&255;out[i*4+3]=H[i]&255; }
+}
+/* modular exponent (r = a^e mod p), e little-endian u64[4] */
+__device__ __noinline__ void fe_pow(fe *r, const fe *a, const u64 e[4]){
+  fe res; fe_set_u64(&res,1); fe base; fe_set(&base,a);
+  for(int limb=0;limb<4;limb++){ u64 x=e[limb];
+    for(int b=0;b<64;b++){ if((x>>b)&1) fe_mul(&res,&res,&base); fe_sqr(&base,&base); } }
+  fe_set(r,&res);
+}
+__device__ __forceinline__ int fe_eq(const fe *a,const fe *b){ return a->v[0]==b->v[0]&&a->v[1]==b->v[1]&&a->v[2]==b->v[2]&&a->v[3]==b->v[3]; }
+/* lift_x: even-Y point on the curve with the given x (BIP340). Returns 0 if no
+ * square root (x not on curve). */
+__device__ __noinline__ int liftX(const u8 x_be[32], fe *Px, fe *Py){
+  const u64 EXP[4]={0xFFFFFFFFBFFFFF0CULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0x3FFFFFFFFFFFFFFFULL}; // (p+1)/4
+  fe x; fe_from_be(&x,x_be);
+  fe x2,x3,c,seven; fe_sqr(&x2,&x); fe_mul(&x3,&x2,&x); fe_set_u64(&seven,7); fe_add(&c,&x3,&seven);
+  fe y; fe_pow(&y,&c,EXP);
+  fe y2; fe_sqr(&y2,&y); if(!fe_eq(&y2,&c)) return 0;
+  if(y.v[0]&1){ fe zero; fe_set_u64(&zero,0); fe ny; fe_sub(&ny,&zero,&y); fe_set(&y,&ny); } // even Y
+  fe_set(Px,&x); fe_set(Py,&y); return 1;
+}
+/* TapTweak tagged hash of x (32B) reduced mod n -> 32 big-endian bytes. */
+__device__ void taptweak(const u8 x_be[32], u8 out_t[32]){
+  const u8 tag[8]={'T','a','p','T','w','e','a','k'};
+  u8 th[32]; sha256_full(tag,8,th);
+  u8 buf[96]; for(int i=0;i<32;i++){ buf[i]=th[i]; buf[32+i]=th[i]; buf[64+i]=x_be[i]; }
+  u8 ht[32]; sha256_full(buf,96,ht);
+  u8 zero[32]; for(int i=0;i<32;i++) zero[i]=0;
+  modn_add(ht,zero,out_t);   // ht mod n
+}
+/* BIP86 p2tr program: Q = liftX(x) + taptweak(x)*G ; program = Q.x (32B). */
+__device__ void p2tr_program(const u8 pub[33], u8 prog[32]){
+  const u8 *xb=pub+1;
+  fe Px,Py; if(!liftX(xb,&Px,&Py)){ for(int i=0;i<32;i++) prog[i]=0; return; }
+  u8 t[32]; taptweak(xb,t);
+  jpt tG; scalar_mul_G_j(t,&tG);
+  jpt P; fe_set(&P.X,&Px); fe_set(&P.Y,&Py); fe_set_u64(&P.Z,1); P.inf=0;
+  jpt Q; j_add(&Q,&P,&tG);
+  fe qx,qy; j_affine(&Q,&qx,&qy); fe_to_be(&qx,prog);
+}
+
+/* pubkey(33) + purpose -> address program; *proglen = 20 (p2pkh/p2sh/p2wpkh)
+ * or 32 (p2tr). p2pkh/p2wpkh: hash160; p2sh-p2wpkh: hash160(0x0014||h160);
+ * p2tr(86): x-only tweaked output key. */
+__device__ void pub_to_program(const u8 pub[33], int purpose, u8 prog[32], int *proglen){
+  if(purpose==86){ p2tr_program(pub,prog); *proglen=32; return; }
   u8 h[20]; hash160(pub,33,h);
   if(purpose==49){ u8 redeem[22]; redeem[0]=0x00; redeem[1]=0x14; for(int i=0;i<20;i++) redeem[2+i]=h[i]; hash160(redeem,22,prog); }
   else { for(int i=0;i<20;i++) prog[i]=h[i]; }   /* 44 p2pkh, 84 p2wpkh */
+  *proglen=20;
 }
 
 /* Non-hardened CKDpriv (needs EC): k'=(IL+k) mod n, c'=IR, where
@@ -222,11 +302,11 @@ __device__ void ckd_normal(u8 *k, u8 *c, u32 index){
 }
 /* seed -> m/purpose'/0'/0'/change/index pubkey -> 20-byte address program.
  * program type follows the purpose (44 p2pkh, 49 p2sh-p2wpkh, 84 p2wpkh). */
-__device__ void derive_address(const u8 seed[64], u32 purpose, u32 change, u32 index, u8 prog[20]){
+__device__ void derive_address(const u8 seed[64], u32 purpose, u32 change, u32 index, u8 prog[32], int *proglen){
   u32 hidx[3]={ purpose|0x80000000u, 0x80000000u, 0x80000000u };
   u8 c[32],k[32]; derive_hardened(seed,64,hidx,3,c,k);   // account node m/purpose'/0'/0'
   ckd_normal(k,c,change);
   ckd_normal(k,c,index);
   u8 pub[33]; scalar_mul_G(k,pub);
-  pub_to_program(pub,(int)purpose,prog);
+  pub_to_program(pub,(int)purpose,prog,proglen);
 }
