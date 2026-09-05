@@ -112,6 +112,20 @@ Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` 
 `--no-nth`; `--no-compact` (compaction is on by default); sharding
 `--start --count --limit`; `--rank` (librxe index of an arrangement).
 
+**Progress & logging.** `-p` prints a live status line (~1/s: elapsed, swept/total,
+rate, ETA — the ETA uses a recent-window rate so it tracks the real throughput):
+
+```
+[    6.2s] 4.2/10.0M (41.9%) 0.68 Mc/s  hashed 4.19M  ETA 9s
+```
+
+`--loginterval MS[:FILE]` writes a CSV
+(`t_ms,swept,swept_total,pct,rate,hashed,eta_s`, with a `#`-comment header/footer)
+— `hashed` is the number of candidates that reached PBKDF2 (the real work: it
+equals `swept` for a passphrase search, ≈`swept`/16 for a 12-word checksum-sieved
+search). Every mode is windowed, so a run also **early-exits** as soon as it finds
+a hit instead of sweeping the whole space.
+
 ## Performance
 
 Measured on 1× RTX 5090 (native sm_120), correctness-only kernels:
