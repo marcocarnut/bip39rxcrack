@@ -85,7 +85,7 @@ static int resume_load(const char*path,Resume*R){
 }
 
 /* ------------------------ NVRTC build (with include inliner) ------------ */
-static CUcontext g_ctx; static CUmodule g_mod;
+static CUcontext g_ctx; static CUmodule g_mod; static CUdevice g_dev;
 static int g_pflag=0, g_loginterval_ms=0, g_csv_own=0; static double g_p_secs=0; static FILE *g_csv=0;
 static const char *g_target_str=0, *g_pattern_str=0;
 /* resume/header params (recorded in the CSV header, reconstructed by --resume) */
@@ -107,10 +107,12 @@ static char *inline_includes(char *src,const char *cu){
 static unsigned long long fnv1a(const char*s){ unsigned long long h=1469598103934665603ULL; for(;*s;s++){ h^=(unsigned char)*s; h*=1099511628211ULL; } return h; }
 static void build_module(const char *cu_path){
   const char *arch="--gpu-architecture=compute_120";
+  const char*mr=getenv("CRACK_MAXREG");
+  const char*def=getenv("CRACK_DEF");   /* e.g. -DSHA512_UNROLL16 for A/B experiments */
   char *src=inline_includes(slurp(cu_path),cu_path);
   /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
      cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
-  char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch));
+  char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0));
   char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_ptx_%s.ptx",key);
   char *ptx=0; FILE*cf=fopen(cpath,"rb");
   if(cf && !getenv("CRACK_NOCACHE")){
@@ -118,9 +120,9 @@ static void build_module(const char *cu_path){
     if(fread(ptx,1,pn,cf)==(size_t)pn){ ptx[pn]=0; } else { free(ptx); ptx=0; } fclose(cf);
   } else if(cf) fclose(cf);
   if(!ptx){
-    const char *opts[]={ arch };
+    const char *opts[]={ arch, def?def:"" }; int nopt = def?2:1;
     nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
-    nvrtcResult cr=nvrtcCompileProgram(prog,1,opts);
+    nvrtcResult cr=nvrtcCompileProgram(prog,nopt,opts);
     size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
     if(logn>1){ char*log=malloc(logn); nvrtcGetProgramLog(prog,log);
       if(cr!=NVRTC_SUCCESS||getenv("CRACK_VERBOSE")) fprintf(stderr,"NVRTC log:\n%s\n",log);
@@ -130,11 +132,15 @@ static void build_module(const char *cu_path){
     size_t ptxn=0; NVR(nvrtcGetPTXSize(prog,&ptxn)); ptx=malloc(ptxn); NVR(nvrtcGetPTX(prog,ptx)); nvrtcDestroyProgram(&prog);
     FILE*wf=fopen(cpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); }
   }
-  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,0));
+  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,0)); g_dev=dev;
   char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
   cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
-  CU(cuCtxCreate(&g_ctx,0,dev)); CU(cuModuleLoadDataEx(&g_mod,ptx,0,0,0));
+  CU(cuCtxCreate(&g_ctx,0,dev));
+  { CUjit_option jopt[1]; void*jval[1]; int njit=0;
+    if(mr){ jopt[njit]=CU_JIT_MAX_REGISTERS; jval[njit]=(void*)(size_t)atoi(mr); njit++;
+      fprintf(stderr,"(JIT max registers = %s)\n",mr); }
+    CU(cuModuleLoadDataEx(&g_mod,ptx,njit,jopt,jval)); }
   /* Build the fixed-base comb table once, then point the device global d_comb
      at it so k*G uses the comb (64 adds) instead of double-and-add (~384 ops). */
   { CUdeviceptr tbl; CU(cuMemAlloc(&tbl,(size_t)64*16*8*sizeof(unsigned long long)));
@@ -880,6 +886,42 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
 }
 
 /* --------------------------------- CLI ---------------------------------- */
+/* ---- --profile: static occupancy/register/spill audit of the hot kernels ---- */
+static int mode_profile(const char*cu){
+  build_module(cu);
+  int sm=0,warp=0,maxtpm=0,maxwpsm=0,regsm=0,shsm=0,clk=0,mem=0;
+  cuDeviceGetAttribute(&sm,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,g_dev);
+  cuDeviceGetAttribute(&warp,CU_DEVICE_ATTRIBUTE_WARP_SIZE,g_dev);
+  cuDeviceGetAttribute(&maxtpm,CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,g_dev);
+  cuDeviceGetAttribute(&regsm,CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,g_dev);
+  cuDeviceGetAttribute(&shsm,CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,g_dev);
+  cuDeviceGetAttribute(&clk,CU_DEVICE_ATTRIBUTE_CLOCK_RATE,g_dev);
+  cuDeviceGetAttribute(&mem,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,g_dev);
+  maxwpsm=maxtpm/warp;
+  printf("device: SMs=%d  warp=%d  maxThreads/SM=%d (=%d warps)  regs/SM=%d  smem/SM=%dB  clock=%.0fMHz\n",
+    sm,warp,maxtpm,maxwpsm,regsm,shsm,clk/1000.0);
+  const char*ks[]={"g_pbkdf2","g_pbkdf2_perm","g_crack_pass","g_crack_nth","g_crack_missing","g_addr",0};
+  printf("\n%-16s %5s %6s %7s %8s   occupancy @ block size (active warps/SM, %% of max)\n",
+    "kernel","regs","smem","local","maxtpb");
+  printf("%-16s %5s %6s %7s %8s   %-11s %-11s %-11s %-11s\n","","","","(spill)","", "64","128","256","512");
+  for(int i=0;ks[i];i++){ CUfunction fn;
+    if(cuModuleGetFunction(&fn,g_mod,ks[i])!=CUDA_SUCCESS){ printf("%-16s (not present)\n",ks[i]); continue; }
+    int regs=0,sh=0,loc=0,maxtpb=0;
+    cuFuncGetAttribute(&regs,CU_FUNC_ATTRIBUTE_NUM_REGS,fn);
+    cuFuncGetAttribute(&sh,CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,fn);
+    cuFuncGetAttribute(&loc,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,fn);
+    cuFuncGetAttribute(&maxtpb,CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,fn);
+    printf("%-16s %5d %6d %7d %8d  ",ks[i],regs,sh,loc,maxtpb);
+    int bs[4]={64,128,256,512};
+    for(int b=0;b<4;b++){ int nb=0; cuOccupancyMaxActiveBlocksPerMultiprocessor(&nb,fn,bs[b],0);
+      int aw=nb*bs[b]/warp; double pct=maxwpsm?100.0*aw/maxwpsm:0;
+      printf(" %2dw %3.0f%%   ",aw,pct); }
+    printf("\n");
+  }
+  printf("\n(local>0 = register spill to local memory -> a real optimization target.\n"
+         " low occupancy on a latency-bound serial hash = headroom via fewer regs / more ILP.)\n");
+  return 0;
+}
 static void usage(void){
   fprintf(stderr,
    "bip39rxcrack -- CUDA BIP39 seed cracker (GPU self-enumerate)\n"
@@ -933,7 +975,7 @@ int main(int argc,char**argv){
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
-  int missgate=0,missgate_n=64;
+  int missgate=0,missgate_n=64,profile=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
@@ -952,6 +994,7 @@ int main(int argc,char**argv){
       else { g_loginterval_ms=atoi(a); g_csv=stderr; } }
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--miss-gate")){ missgate=1; if(i+1<argc&&isdigit((unsigned char)argv[i+1][0])) missgate_n=atoi(argv[++i]); }
+    else if(!strcmp(argv[i],"--profile")) profile=1;
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--start")&&i+1<argc) cstart=strtoull(argv[++i],0,10);
@@ -1026,6 +1069,7 @@ int main(int argc,char**argv){
   /* gate/util modes need no pattern */
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
+  if(profile) return mode_profile(cu);
   if(ecgate) return mode_ec_gate(ecgate,cu);
   if(addrgate) return mode_addr_gate(addrgate,cu);
   if(missgate){ const char*t=templ?templ:"trial [:bip39:] gloom dragon try dirt rapid crawl soon fatal tool chronic rapid ladder salmon palace expect enrich helmet truth receive [:bip39:] [:bip39:] [:bip39:]"; return mode_miss_gate(t,missgate_n,cu); }

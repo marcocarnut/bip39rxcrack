@@ -44,6 +44,41 @@ __device__ void s512_init(S512 *s){
   s->H[6]=0x1f83d9abfb41bd6bULL; s->H[7]=0x5be0cd19137e2179ULL;
   s->blen=0; s->total=0;
 }
+#if !defined(SHA512_BASELINE)   /* default: 16-word schedule (unrolled unless -DSHA512_ROLL16) */
+/* 16-word rolling message schedule (vs the full w[80]): 128B vs 640B of state.
+ * UNROLL16 also fully unrolls the round loop so w[i&15] indices are compile-time
+ * constants (can live in registers, no local spill); ROLL16 leaves it rolled
+ * (dynamic index -> 128B local, but low register pressure -> more occupancy). */
+__device__ void s512_block(S512 *s, const u8 *p){
+  u64 w[16];
+  #pragma unroll
+  for(int i=0;i<16;i++){
+    w[i]=((u64)p[i*8]<<56)|((u64)p[i*8+1]<<48)|((u64)p[i*8+2]<<40)|((u64)p[i*8+3]<<32)
+        |((u64)p[i*8+4]<<24)|((u64)p[i*8+5]<<16)|((u64)p[i*8+6]<<8)|((u64)p[i*8+7]);
+  }
+  u64 a=s->H[0],b=s->H[1],c=s->H[2],d=s->H[3],e=s->H[4],f=s->H[5],g=s->H[6],h=s->H[7];
+  #if !defined(SHA512_ROLL16)
+  #pragma unroll                 /* compile-time i&15 -> schedule in registers, ILP hides latency */
+  #endif
+  for(int i=0;i<80;i++){
+    u64 wi;
+    if(i<16) wi=w[i&15];
+    else{
+      u64 s0=ror64(w[(i-15)&15],1)^ror64(w[(i-15)&15],8)^(w[(i-15)&15]>>7);
+      u64 s1=ror64(w[(i-2)&15],19)^ror64(w[(i-2)&15],61)^(w[(i-2)&15]>>6);
+      wi=w[(i-16)&15]+s0+w[(i-7)&15]+s1; w[i&15]=wi;      /* (i-16)&15 == i&15 */
+    }
+    u64 S1=ror64(e,14)^ror64(e,18)^ror64(e,41);
+    u64 ch=(e&f)^((~e)&g);
+    u64 t1=h+S1+ch+K512[i]+wi;
+    u64 S0=ror64(a,28)^ror64(a,34)^ror64(a,39);
+    u64 maj=(a&b)^(a&c)^(b&c);
+    u64 t2=S0+maj;
+    h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+  }
+  s->H[0]+=a;s->H[1]+=b;s->H[2]+=c;s->H[3]+=d;s->H[4]+=e;s->H[5]+=f;s->H[6]+=g;s->H[7]+=h;
+}
+#else
 __device__ void s512_block(S512 *s, const u8 *p){
   u64 w[80];
   #pragma unroll
@@ -68,6 +103,7 @@ __device__ void s512_block(S512 *s, const u8 *p){
   }
   s->H[0]+=a;s->H[1]+=b;s->H[2]+=c;s->H[3]+=d;s->H[4]+=e;s->H[5]+=f;s->H[6]+=g;s->H[7]+=h;
 }
+#endif
 __device__ void s512_update(S512 *s, const u8 *data, u32 len){
   s->total += len;
   while(len){
