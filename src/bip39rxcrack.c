@@ -403,7 +403,7 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
 
 /* ------------------ Regime B: words permutation, ADDRESS target --------- */
 static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
-                           uint32_t change,uint32_t index,int require_ck,int compact,
+                           uint32_t changes,uint32_t gap,int require_ck,int compact,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
   char pat[2048]; wordset_pattern(W,pat,sizeof pat);
   struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
@@ -420,10 +420,11 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
   int tpb=128,grid=1024; struct timeval t0,t1; double secs=0; (void)t0;(void)t1;
   int reporting=(g_pflag||g_loginterval_ms);
-  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
   Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
   double intv=P.interval>0?P.interval:1.0;
   unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
+  uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
   int used_compact=0;
   if(compact && require_ck){
     /* CHUNKED compaction: size the survivor buffer for a chunk's FULL size
@@ -452,7 +453,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
         CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
         unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8)); tot_surv+=nsurv;
         if(nsurv>C){ fprintf(stderr,"ERROR: chunk survivors %llu > chunk size %llu -- impossible (bug)\n",nsurv,C); return 2; }
-        if(nsurv){ void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
+        if(nsurv){ void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhit_ci};
           CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
         double csecs=now_s()-c0; swept+=cc; cs+=cc; prog_tick(&P,swept,tot_surv);
         CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
@@ -467,7 +468,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   int found=0;
   if(!used_compact){
     unsigned long long cstart=start,ccount=0;
-    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&ccount,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound,&dhashed};
+    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&ccount,&pu,&changes,&gap,&dtp,&require_ck,&dhi,&dfound,&dhashed,&dhit_ci};
     prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
     fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path);
     double tt0=now_s(); unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
@@ -488,8 +489,10 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
   char*t=buf; while(*t==' ')t++;
-  prog_finish(&P,"FOUND",t,path);
-  printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : m/%d'/0'/0'/%u/%u\n",hidx,t,purpose,change,index);
+  uint32_t hci[2]; CU(cuMemcpyDtoH(hci,dhit_ci,8));
+  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
+  prog_finish(&P,"FOUND",t,fpath);
+  printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : %s\n",hidx,t,fpath);
   mpz_clear(j); rxe_free(r); return 0;
 }
 
@@ -518,7 +521,7 @@ static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,in
   return 0;
 }
 static const char* WLNAME(int idx){ static char names[2048][16]; static int loaded=0; if(!loaded){load_wordlist(names);loaded=1;} return names[idx]; }
-static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t change,uint32_t index,
+static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
                         int use_nth,unsigned long long ustart,unsigned long long ucount,const char*cu){
   uint32_t tmpl[32]; int upos[32],W,U,last_unknown;
   if(parse_template(tpl,tmpl,upos,&W,&U,&last_unknown)) return 2;
@@ -541,10 +544,11 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4),dhg=up(0,W*sizeof(uint32_t));
   uint32_t pu=(uint32_t)purpose; int passU=U;
   unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
+  uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
   unsigned long long cstart=start,ccount=0;
-  void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&cstart,&ccount,&pu,&change,&index,&dtp,&dhi,&dfound,&dhg,&dhashed};
+  void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&cstart,&ccount,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhg,&dhashed,&dhit_ci};
   int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
-  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
   Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&P, nth?"missing-word [:Nth:]":"missing-word baseline", g_target_str,g_pattern_str,path,0,0);
   double intv=P.interval>0?P.interval:1.0;
@@ -570,8 +574,10 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   for(int i=0;i<U;i++) printf(" [pos %d]=%s",upos[i],WLNAME((int)hg[upos[i]]));
   printf("\n  mnemonic :");
   for(int p=0;p<W;p++) printf(" %s",WLNAME((int)hg[p]));
-  printf("\n  path     : m/%d'/0'/0'/%u/%u\n",purpose,change,index);
-  { char fw[256]; int L=0; for(int i=0;i<U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[upos[i]])); prog_finish(&P,"FOUND",fw,path); }
+  uint32_t hci[2]; CU(cuMemcpyDtoH(hci,dhit_ci,8));
+  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
+  printf("\n  path     : %s\n",fpath);
+  { char fw[256]; int L=0; for(int i=0;i<U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[upos[i]])); prog_finish(&P,"FOUND",fw,fpath); }
   (void)CS; return 0;
 }
 
@@ -647,7 +653,7 @@ static int passphrase_width(const char*pat){
   int w=0; if(sscanf(pat,"[0-9]{%d}",&w)==1 && w>0 && w<=18) return w; return -1;
 }
 static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32],
-                           int purpose,uint32_t change,uint32_t index,
+                           int purpose,uint32_t changes,uint32_t gap,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
   build_module(cu);
   int mnlen=(int)strlen(mnemonic);
@@ -662,10 +668,11 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
   CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
   uint32_t pu=(uint32_t)purpose;
   unsigned long long cstart=start,ccount=0;
-  void*args[]={&dhctx,&pwidth,&cstart,&ccount,&pu,&change,&index,&dtp,&dhi,&dfound};
+  uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
+  void*args[]={&dhctx,&pwidth,&cstart,&ccount,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhit_ci};
   int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
   unsigned long long chunk=reporting?report_chunk(1):(64ULL<<20); if(chunk==0)chunk=1;
-  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/%u/%u",purpose,change,index);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
   Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&P,"regime A (passphrase)",g_target_str,g_pattern_str,path,chunk,0);
   fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d)...\n",pwidth,count,start,purpose);
@@ -685,8 +692,10 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
   unsigned long long hidx=0; CU(cuMemcpyDtoH(&hidx,dhi,8));
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   char pass[24]; unsigned long long q=hidx; for(int p=pwidth-1;p>=0;p--){ pass[p]=(char)('0'+(int)(q%10)); q/=10; } pass[pwidth]=0;
-  prog_finish(&P,"FOUND",pass,path);
-  printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : m/%d'/0'/0'/%u/%u\n",hidx,pass,purpose,change,index);
+  uint32_t hci[2]; CU(cuMemcpyDtoH(hci,dhit_ci,8));
+  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
+  prog_finish(&P,"FOUND",pass,fpath);
+  printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : %s\n",hidx,pass,fpath);
   return 0;
 }
 
@@ -696,6 +705,8 @@ static void usage(void){
    "usage: bip39rxcrack --words \"w1 w2 .. wN\" [target] [opts]\n"
    "  target: --xpub XPUB | --target-chaincode HEX(32B)\n"
    "  --purpose 44,49,84,86   BIP purposes to try (default 84)\n"
+   "  --gap N                 scan receive indices 0..N-1 (default 1)\n"
+   "  --change N              scan change chains 0..N-1 (default 1)\n"
    "  --no-checksum           disable the BIP39 checksum sieve\n"
    "  --recon-gate [N]        gate GPU unrank+reconstruction vs librxe (default 512)\n"
    "  --rank \"w1 .. wN\"       print the librxe index of one arrangement\n"
@@ -714,7 +725,7 @@ int main(int argc,char**argv){
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
-  const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0; uint32_t achange=0,aindex=0; int nthmode=-1; /* -1 auto, 1 force, 0 off */
+  const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -741,8 +752,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
     else if(!strcmp(argv[i],"--no-nth")) nthmode=0;
     else if(!strcmp(argv[i],"--decode")&&i+1<argc) decodearg=argv[++i];
-    else if(!strcmp(argv[i],"--change")&&i+1<argc) achange=(uint32_t)strtoul(argv[++i],0,10);
-    else if(!strcmp(argv[i],"--index")&&i+1<argc) aindex=(uint32_t)strtoul(argv[++i],0,10);
+    else if(!strcmp(argv[i],"--change")&&i+1<argc) a_changes=(uint32_t)strtoul(argv[++i],0,10);
+    else if(!strcmp(argv[i],"--gap")&&i+1<argc) a_gap=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
@@ -760,7 +771,7 @@ int main(int argc,char**argv){
     int purpose = purpose_set?(int)purposes[0]:apu;
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
     int use_nth = (nthmode==1) ? 1 : (nthmode==0 ? 0 : 1);
-    return mode_missing(templ,prog,purpose,achange,aindex,use_nth,cstart,ccount,cu);
+    return mode_missing(templ,prog,purpose,a_changes,a_gap,use_nth,cstart,ccount,cu);
   }
   /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
   if(mnemonic && passphrase){
@@ -769,7 +780,7 @@ int main(int argc,char**argv){
     if(!address){ fprintf(stderr,"regime A needs --address (p2pkh/p2sh target)\n"); return 2; }
     uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose)) return 2;
     int purpose = purpose_set ? (int)purposes[0] : apurpose;
-    return mode_crack_pass(mnemonic,w,prog,purpose,achange,aindex,cstart,ccount,cu);
+    return mode_crack_pass(mnemonic,w,prog,purpose,a_changes,a_gap,cstart,ccount,cu);
   }
   if(!words){ usage(); return 2; }
   Words W; parse_words(&W,words);
@@ -778,7 +789,7 @@ int main(int argc,char**argv){
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
-    return mode_crack_addr(&W,prog,purpose,achange,aindex,require_ck,compact,cstart,ccount,cu); }
+    return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu); }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }

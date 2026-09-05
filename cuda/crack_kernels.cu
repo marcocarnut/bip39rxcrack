@@ -119,9 +119,9 @@ extern "C" __global__ void g_hctx_init(const u8 *mn, int mnlen, HCTX *out){
 }
 extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
                                         unsigned long long start, unsigned long long count,
-                                        u32 purpose, u32 change, u32 index,
+                                        u32 purpose, u32 changes, u32 gap,
                                         const u8 *target_prog,
-                                        unsigned long long *hit_index, int *hit_found){
+                                        unsigned long long *hit_index, int *hit_found, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
@@ -129,9 +129,8 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
     unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
     u32 slen=8+pwidth;
     u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
-    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
-    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+    int oc,oi;
+    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
 
@@ -140,10 +139,10 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
 extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                         const u32 *bw_idx, int n, int size,
                                         unsigned long long start_lo, unsigned long long count,
-                                        u32 purpose, u32 change, u32 index,
+                                        u32 purpose, u32 changes, u32 gap,
                                         const u8 *target_prog, int require_ck,
                                         unsigned long long *hit_index, int *hit_found,
-                                        unsigned long long *hashed){
+                                        unsigned long long *hashed, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start_lo+t;
@@ -154,9 +153,8 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     if(hashed) atomicAdd(hashed,1ULL);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
-    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+    int oc,oi;
+    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
 
@@ -193,9 +191,9 @@ __device__ int build_mnemonic_wl(const u8 *wl, const int *wloff, const int *wlle
 extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const int *wllen,
                                            const u32 *tmpl, int W, const int *upos, int U,
                                            unsigned long long start, unsigned long long count,
-                                           u32 purpose, u32 change, u32 index, const u8 *target_prog,
+                                           u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
                                            unsigned long long *hit_index, int *hit_found, u32 *hit_g,
-                                           unsigned long long *hashed){
+                                           unsigned long long *hashed, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
@@ -206,9 +204,8 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
-    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; }
+    int oc,oi;
+    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
 /* [:Nth:] CONSTRUCTION: the LAST position (W-1) is the unknown checksum word.
@@ -219,11 +216,12 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
 extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int *wllen,
                                        const u32 *tmpl, int W, const int *upos, int U,
                                        unsigned long long start, unsigned long long count,
-                                       u32 purpose, u32 change, u32 index, const u8 *target_prog,
-                                       unsigned long long *hit_index, int *hit_found, u32 *hit_g){
+                                       u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
+                                       unsigned long long *hit_index, int *hit_found, u32 *hit_g,
+                                       unsigned long long *hashed, u32 *hit_ci){
   int total=W*11, ENT=total*32/33, CS=total-ENT;   // CS = W/3
   int freebits=11-CS;
-  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x; (void)hashed;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
     u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
@@ -240,9 +238,8 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
-    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; }
+    int oc,oi;
+    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
 
@@ -267,8 +264,8 @@ extern "C" __global__ void g_sieve_perm(const u8 *bw_data, const int *bw_off, co
 extern "C" __global__ void g_pbkdf2_perm(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                          const u32 *bw_idx, int n, int size,
                                          const unsigned long long *surv, unsigned long long nsurv,
-                                         u32 purpose, u32 change, u32 index, const u8 *target_prog,
-                                         unsigned long long *hit_index, int *hit_found){
+                                         u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
+                                         unsigned long long *hit_index, int *hit_found, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long s=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; s<nsurv; s+=stride){
     unsigned long long j=surv[s];
@@ -277,8 +274,7 @@ extern "C" __global__ void g_pbkdf2_perm(const u8 *bw_data, const int *bw_off, c
     int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
-    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+    int oc,oi;
+    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
