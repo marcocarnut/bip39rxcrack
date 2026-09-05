@@ -329,7 +329,7 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
 
 /* ------------------ Regime B: words permutation, ADDRESS target --------- */
 static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
-                           uint32_t change,uint32_t index,int require_ck,
+                           uint32_t change,uint32_t index,int require_ck,int compact,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
   char pat[2048]; wordset_pattern(W,pat,sizeof pat);
   struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
@@ -344,14 +344,30 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   unsigned long long start=ustart>total_u?total_u:ustart;
   unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
   int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
-  void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound};
-  int tpb=128,grid=1024;
-  fprintf(stderr,"regime B: %llu permutations from %llu (checksum-%s) -> m/%d'/0'/0'/%u/%u ...\n",
-          count,start,require_ck?"ON":"OFF",purpose,change,index);
-  struct timeval t0,t1; gettimeofday(&t0,0);
-  CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-  gettimeofday(&t1,0); double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors)\n",count,secs,count/secs/1e6);
+  int tpb=128,grid=1024; struct timeval t0,t1; double secs=0;
+  if(compact && require_ck){
+    unsigned long long survcap=count/4+1000000ULL; /* 12w pass ~1/16; 4x margin */
+    unsigned long long z64=0; CUdeviceptr dsurv,dctr; CU(cuMemAlloc(&dsurv,survcap*8)); dctr=up(&z64,8);
+    fprintf(stderr,"regime B (COMPACTED): sieve %llu -> dense survivors -> full-warp PBKDF2 -> m/%d'/0'/0'/%u/%u ...\n",count,purpose,change,index);
+    gettimeofday(&t0,0);
+    void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&dsurv,&survcap,&dctr};
+    CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
+    unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8));
+    if(nsurv>survcap){ fprintf(stderr,"  WARN: survivors %llu > cap %llu (dropped; perf-only)\n",nsurv,survcap); nsurv=survcap; }
+    void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
+    CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize());
+    gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
+    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s  (%llu survivors -> dense PBKDF2)\n",count,secs,count/secs/1e6,nsurv);
+  } else {
+    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound};
+    fprintf(stderr,"regime B: %llu permutations from %llu (checksum-%s) -> m/%d'/0'/0'/%u/%u ...\n",
+            count,start,require_ck?"ON":"OFF",purpose,change,index);
+    gettimeofday(&t0,0);
+    CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
+    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors)\n",count,secs,count/secs/1e6);
+  }
+  (void)secs;
   int found=0; unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
   if(!found){ printf("NOT FOUND\n"); return 1; }
   mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
@@ -549,7 +565,7 @@ int main(int argc,char**argv){
     if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
-  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1; const char*ecgate=0,*addrgate=0;
+  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=0; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0; uint32_t achange=0,aindex=0; int nthmode=-1; /* -1 auto, 1 force, 0 off */
@@ -559,6 +575,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--target-chaincode")&&i+1<argc) tcc_hex=argv[++i];
     else if(!strcmp(argv[i],"--purpose")&&i+1<argc){ npurp=0; purpose_set=1; char*s=strtok(argv[++i],","); while(s&&npurp<8){purposes[npurp++]=(uint32_t)atoi(s);s=strtok(0,",");} }
     else if(!strcmp(argv[i],"--no-checksum")) require_ck=0;
+    else if(!strcmp(argv[i],"--compact")) compact=1;
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
@@ -608,7 +625,7 @@ int main(int argc,char**argv){
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
-    return mode_crack_addr(&W,prog,purpose,achange,aindex,require_ck,cstart,ccount,cu); }
+    return mode_crack_addr(&W,prog,purpose,achange,aindex,require_ck,compact,cstart,ccount,cu); }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }

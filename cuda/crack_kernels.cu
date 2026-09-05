@@ -239,3 +239,40 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
     if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; }
   }
 }
+
+/* ===================== Stream compaction (permutation) =================== */
+/* Phase 1: sieve -- decode_perm + checksum only (coherent, no PBKDF2). Write
+ * the global index of each survivor into a dense array via an atomic counter. */
+extern "C" __global__ void g_sieve_perm(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                        const u32 *bw_idx, int n, int size,
+                                        unsigned long long start_lo, unsigned long long count,
+                                        unsigned long long *surv, unsigned long long survcap,
+                                        unsigned long long *counter){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start_lo+t;
+    int dig[32]; decode_perm(dig,n,size,j);
+    u32 g[32]; for(int p=0;p<size;p++) g[p]=bw_idx[dig[p]];
+    if(bip39_checksum_ok(g,size)){ unsigned long long idx=atomicAdd(counter,1ULL); if(idx<survcap) surv[idx]=j; }
+  }
+}
+/* Phase 2: dense PBKDF2 over the survivor array -- every lane is a survivor
+ * (no warp divergence). */
+extern "C" __global__ void g_pbkdf2_perm(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                         const u32 *bw_idx, int n, int size,
+                                         const unsigned long long *surv, unsigned long long nsurv,
+                                         u32 purpose, u32 change, u32 index, const u8 *target_prog,
+                                         unsigned long long *hit_index, int *hit_found){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long s=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; s<nsurv; s+=stride){
+    unsigned long long j=surv[s];
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
+    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); }
+  }
+}
