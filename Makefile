@@ -74,3 +74,6 @@ addr-gate: cracker addrvectors
 
 decode-gate: cracker
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/decode_gate.js
+
+nth-gate: cracker
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/nth_gate.js

@@ -173,3 +173,69 @@ extern "C" __global__ void g_comb_init(u64 *table){
     for(int d=0;d<4;d++) j_double(&base,&base);   // base *= 16
   }
 }
+
+/* ===================== Missing-word (odometer) crack ===================== */
+/* Build a mnemonic from full word indices g[0..W-1] using the 2048-word list. */
+__device__ int build_mnemonic_wl(const u8 *wl, const int *wloff, const int *wllen,
+                                 const u32 *g, int W, u8 *out){
+  int L=0;
+  for(int p=0;p<W;p++){ if(p) out[L++]=' '; int wi=(int)g[p]; const u8 *w=wl+wloff[wi]; int wn=wllen[wi];
+    for(int c=0;c<wn;c++) out[L++]=w[c]; }
+  return L;
+}
+/* BASELINE: fixed known words + U unknown [:bip39-en:] positions (base-2048
+ * odometer, 11 bits each -- no division since 2048=2^11) -> checksum sieve ->
+ * PBKDF2 -> derive_address -> program compare. */
+extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const int *wllen,
+                                           const u32 *tmpl, int W, const int *upos, int U,
+                                           unsigned long long start, unsigned long long count,
+                                           u32 purpose, u32 change, u32 index, const u8 *target_prog,
+                                           unsigned long long *hit_index, int *hit_found, u32 *hit_g){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    for(int u=0;u<U;u++) g[upos[u]]=(u32)((j>>(11*u))&2047ULL);
+    if(!bip39_checksum_ok(g,W)) continue;
+    u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
+    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; }
+  }
+}
+/* [:Nth:] CONSTRUCTION: the LAST position (W-1) is the unknown checksum word.
+ * upos[0..U-2] are the OTHER unknowns (base-2048); the last word's free
+ * (11-CS) entropy bits are enumerated and the CS checksum bits CONSTRUCTED from
+ * SHA-256(entropy) -> every candidate is checksum-valid (no sieve, no divergence).
+ * Index space = 2048^(U-1) * 2^(11-CS). */
+extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int *wllen,
+                                       const u32 *tmpl, int W, const int *upos, int U,
+                                       unsigned long long start, unsigned long long count,
+                                       u32 purpose, u32 change, u32 index, const u8 *target_prog,
+                                       unsigned long long *hit_index, int *hit_found, u32 *hit_g){
+  int total=W*11, ENT=total*32/33, CS=total-ENT;   // CS = W/3
+  int freebits=11-CS;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    unsigned long long lastfree=j & ((1ULL<<freebits)-1);
+    unsigned long long rest=j>>freebits;
+    for(int u=0;u<U-1;u++) g[upos[u]]=(u32)((rest>>(11*u))&2047ULL);  // other unknowns
+    g[W-1]=(u32)(lastfree<<CS);                       // top freebits set, checksum=0
+    // entropy = top ENT bits of g[0..W-1]; SHA-256 -> top CS bits = checksum
+    u8 ent[32]; for(int i=0;i<32;i++) ent[i]=0;
+    for(int i=0;i<W;i++){ u32 idx=g[i]; for(int b=0;b<11;b++){ int pos=i*11+b; if(pos<ENT && ((idx>>(10-b))&1)) ent[pos>>3]|=(0x80>>(pos&7)); } }
+    u8 dig[32]; sha256_1blk(ent,(u32)(ENT/8),dig);
+    u32 cs=(dig[0]>>(8-CS))&((1u<<CS)-1);
+    g[W-1]=(u32)((lastfree<<CS)|cs);                  // the constructed valid last word
+    u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    u8 prog[32]; int pl; derive_address(seed,purpose,change,index,prog,&pl);
+    int eq=1; for(int b=0;b<pl;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+    if(eq){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; }
+  }
+}
