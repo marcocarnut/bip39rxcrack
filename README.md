@@ -5,9 +5,18 @@ pattern describing what you know (and don't know) about your seed phrase, plus a
 public target you control — an address or an account xpub — and it searches the
 keyspace on the GPU.
 
-Sibling of [`bip38rxcrack`](https://github.com/marcocarnut/bip38rxcrack). It links
-`librxe` (`RXE_DIR=../rxe`) as the enumerator and uses the **reseed39** browser
-crypto as its byte-exact correctness oracle.
+It's the **sibling of [(re)seed39](https://github.com/marcocarnut/reseed39)** and a
+**cousin of [bip38rxcrack](https://github.com/marcocarnut/bip38rxcrack)**. (re)seed39
+does everything this tool does, but **in your browser** — try it on your own seed
+with nothing to install (with GPU acceleration too, if your browser supports
+WebGPU). It's the friendliest place to build your pattern and get a feel for the
+problem. Reach for `bip39rxcrack` when the run gets big: talking straight to the
+hardware, it's far faster, which is what matters for long, difficult recoveries.
+In fact `bip39rxcrack` is gated **byte-exact against (re)seed39's crypto** (below),
+so the two agree candidate-for-candidate — the browser is the reference, the CLI
+is the speed.
+
+It links `librxe` (`RXE_DIR=../rxe`) as the candidate enumerator.
 
 > **Intended use — recovering your *own* wallets.** This is a recovery tool for a
 > seed you own where you've lost a word, the word order, or the passphrase. Point
