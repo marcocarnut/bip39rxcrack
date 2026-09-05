@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <gmp.h>
 #include <cuda.h>
 #include <nvrtc.h>
@@ -44,7 +45,7 @@ static void tohex_(const uint8_t*b,int n,char*o){ static const char*hx="01234567
 
 /* ------------------------ NVRTC build (with include inliner) ------------ */
 static CUcontext g_ctx; static CUmodule g_mod;
-static int g_pflag=0, g_loginterval_ms=0, g_csv_own=0; static FILE *g_csv=0;
+static int g_pflag=0, g_loginterval_ms=0, g_csv_own=0; static double g_p_secs=0; static FILE *g_csv=0;
 static const char *g_target_str=0, *g_pattern_str=0;
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
@@ -109,17 +110,27 @@ static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_
 static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?n:1)); if(n&&h) CU(cuMemcpyHtoD(d,h,n)); return d; }
 
 /* ------------------------- progress reporting -------------------------- */
-/* -p : ~1/sec human line to stderr (ETA from a TRAILING-window rate, which
- *      settles faster than the cumulative rate). --loginterval MS[:FILE] : CSV
- *      matching the (re)seed39 browser log shape (# header, rows, # footer).
- *      hashed = cumulative survivors that reached PBKDF2 (the real work). */
-typedef struct { unsigned long long total,swept,hashed; double t0,t_last,win_t; unsigned long long win_swept;
-                 int p; double interval; FILE*csv; int csv_own; } Prog;
+/* -p [SECS] : human line to stderr every SECS (default 1.0); ETA from a
+ *      TRAILING-window rate (settles faster than cumulative). --loginterval
+ *      MS[:FILE] : CSV every MS ms (reseed39 browser log shape: # header, rows,
+ *      # footer). The two cadences are INDEPENDENT. hashed = cumulative
+ *      survivors that reached PBKDF2 (the real work). */
+typedef struct { unsigned long long total,swept,hashed; double t0;
+  int p; double p_interval,p_last,p_win_t; unsigned long long p_win_swept;   /* -p cadence */
+  FILE*csv; int csv_own; double csv_interval,csv_last; } Prog;               /* CSV cadence */
 static double now_s(void){ struct timeval tv; gettimeofday(&tv,0); return tv.tv_sec+tv.tv_usec/1e6; }
-static void prog_init(Prog*P, unsigned long long total, int p, int loginterval_ms, FILE*csv, int csv_own){
+static void prog_init(Prog*P, unsigned long long total, int p, double p_secs, int loginterval_ms, FILE*csv, int csv_own){
   memset(P,0,sizeof *P); P->total=total; P->p=p; P->csv=csv; P->csv_own=csv_own;
-  P->interval = loginterval_ms>0 ? loginterval_ms/1000.0 : (p?1.0:0.0);
-  P->t0=P->t_last=P->win_t=now_s();
+  P->p_interval = p_secs>0?p_secs:1.0;
+  P->csv_interval = loginterval_ms>0?loginterval_ms/1000.0:0.0;
+  P->t0=P->p_last=P->csv_last=P->p_win_t=now_s();
+}
+/* finest active cadence, for chunk sizing (so both cadences get fresh data). */
+static double prog_intv(const Prog*P){
+  double m=1e9;
+  if(P->p && P->p_interval<m) m=P->p_interval;
+  if(P->csv && P->csv_interval>0 && P->csv_interval<m) m=P->csv_interval;
+  return m>=1e9?1.0:m;
 }
 static void prog_hdr(Prog*P,const char*mode,const char*target,const char*pattern,const char*path,
                      unsigned long long chunk,unsigned long long budget_mb){
@@ -129,38 +140,44 @@ static void prog_hdr(Prog*P,const char*mode,const char*target,const char*pattern
   fprintf(P->csv,"# total: %llu  chunk: %llu  budget_mb: %llu\n# start_ts_ms: %.0f\n",P->total,chunk,budget_mb,now_s()*1000.0);
   fprintf(P->csv,"t_ms,swept,swept_total,pct,rate,hashed,eta_s\n"); fflush(P->csv);
 }
-static void prog_emit(Prog*P){
-  double now=now_s(), el=now-P->t0;
-  double cum=el>0?P->swept/el/1e6:0.0;
-  double dwt=now-P->win_t; unsigned long long dsw=P->swept-P->win_swept;
-  double inst=dwt>0.01?dsw/dwt/1e6:cum;
-  double pct=P->total?100.0*P->swept/P->total:0.0;
+/* -p human line: ETA from a TRAILING-window rate (settles faster than cumulative). */
+static void prog_emit_p(Prog*P){
+  double now=now_s(), el=now-P->t0, cum=el>0?P->swept/el/1e6:0.0;
+  double dwt=now-P->p_win_t; unsigned long long dsw=P->swept-P->p_win_swept;
+  double inst=dwt>0.01?dsw/dwt/1e6:cum, pct=P->total?100.0*P->swept/P->total:0.0;
   double eta=(inst>0&&P->total>P->swept)?(P->total-P->swept)/(inst*1e6):0.0;
-  if(P->p) fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
+  fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
       el,P->swept/1e6,P->total/1e6,pct,inst,P->hashed/1e6,eta);
-  if(P->csv) fprintf(P->csv,"%.0f,%llu,%llu,%.3f,%.3f,%llu,%.1f\n",el*1000.0,P->swept,P->total,pct,cum,P->hashed,eta);
-  if(P->csv) fflush(P->csv);
-  P->t_last=now; P->win_t=now; P->win_swept=P->swept;
+  P->p_last=now; P->p_win_t=now; P->p_win_swept=P->swept;
+}
+/* CSV row: cumulative rate (t_ms+swept let you derive instantaneous by deltas). */
+static void prog_emit_csv(Prog*P){
+  double now=now_s(), el=now-P->t0, cum=el>0?P->swept/el/1e6:0.0;
+  double pct=P->total?100.0*P->swept/P->total:0.0;
+  double eta=(cum>0&&P->total>P->swept)?(P->total-P->swept)/(cum*1e6):0.0;
+  fprintf(P->csv,"%.0f,%llu,%llu,%.3f,%.3f,%llu,%.1f\n",el*1000.0,P->swept,P->total,pct,cum,P->hashed,eta);
+  fflush(P->csv); P->csv_last=now;
 }
 static void prog_tick(Prog*P, unsigned long long swept, unsigned long long hashed){
-  P->swept=swept; P->hashed=hashed;
-  if(P->interval>0 && now_s()-P->t_last>=P->interval) prog_emit(P);
+  P->swept=swept; P->hashed=hashed; double now=now_s();
+  if(P->p && now-P->p_last>=P->p_interval) prog_emit_p(P);
+  if(P->csv && P->csv_interval>0 && now-P->csv_last>=P->csv_interval) prog_emit_csv(P);
 }
 static void prog_finish(Prog*P, const char*outcome, const char*found, const char*path){
-  if(P->interval>0) prog_emit(P);
-  if(P->p) fprintf(stderr,"\n");
-  if(P->csv){ fprintf(P->csv,"# outcome: %s\n# found: %s  path: %s\n# elapsed_ms: %.0f\n",
+  if(P->p){ prog_emit_p(P); fprintf(stderr,"\n"); }
+  if(P->csv){ prog_emit_csv(P);
+    fprintf(P->csv,"# outcome: %s\n# found: %s  path: %s\n# elapsed_ms: %.0f\n",
       outcome,found?found:"",path?path:"",(now_s()-P->t0)*1000.0); fflush(P->csv); if(P->csv_own) fclose(P->csv); }
 }
 /* choose a chunk so reports land ~every interval; smaller when reporting is on. */
-static unsigned long long report_chunk(int reporting){ return reporting ? (1ULL<<20) : (64ULL<<20); }
+static unsigned long long report_chunk(int reporting){ return reporting ? (1ULL<<18) : (64ULL<<20); }
 /* size the NEXT chunk so it takes ~interval seconds (report lands ~every tick). */
 static unsigned long long next_chunk(unsigned long long ccount,double csecs,double interval,int reporting){
   if(!reporting) return 64ULL<<20;
   if(csecs<=0||interval<=0) return ccount;
-  double c=(double)ccount/csecs*interval;               /* candidates in ~interval */
+  double c=(double)ccount/csecs*interval*0.5;           /* ~half-interval chunks -> tighter cadence */
   unsigned long long r=(unsigned long long)c;
-  if(r<(1ULL<<20)) r=1ULL<<20;                          /* min 1M: launch overhead */
+  if(r<(1ULL<<18)) r=1ULL<<18;                          /* min 256K: launch overhead floor */
   if(r>(64ULL<<20)) r=64ULL<<20;                        /* max 64M: bounded buffer */
   return r;
 }
@@ -370,9 +387,9 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
   void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&start_hi,&ccount,&dpu,&npurp,&dtc,&require_ck,&dhi,&dfound,&dpur,&dhashed};
   int reporting=(g_pflag||g_loginterval_ms);
   char path[64]; snprintf(path,sizeof path,"xpub account chaincode (%d purpose%s)",npurp,npurp>1?"s":"");
-  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&P,"xpub (words, EC-free)",g_target_str,g_pattern_str,path,0,0);
-  double intv=P.interval>0?P.interval:1.0;
+  double intv=prog_intv(&P);
   fprintf(stderr,"enumerating %llu candidates from %llu (checksum-%s, %d purpose%s)...\n",
           count,start_lo,require_ck?"ON":"OFF",npurp,npurp>1?"s":"");
   int found=0; unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
@@ -421,8 +438,8 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   int tpb=128,grid=1024; struct timeval t0,t1; double secs=0; (void)t0;(void)t1;
   int reporting=(g_pflag||g_loginterval_ms);
   char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
-  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
-  double intv=P.interval>0?P.interval:1.0;
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
+  double intv=prog_intv(&P);
   unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
   uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
   int used_compact=0;
@@ -575,9 +592,9 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&cstart,&ccount,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhg,&dhashed,&dhit_ci};
   int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
   char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
-  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&P, nth?"missing-word [:Nth:]":"missing-word baseline", g_target_str,g_pattern_str,path,0,0);
-  double intv=P.interval>0?P.interval:1.0;
+  double intv=prog_intv(&P);
   fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
           nth?"[:Nth:] CONSTRUCTION":"baseline sieve", W, U, nth?" (last=checksum-constructed)":"", count, path);
   int found=0; unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
@@ -699,11 +716,11 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
   int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
   unsigned long long chunk=reporting?report_chunk(1):(64ULL<<20); if(chunk==0)chunk=1;
   char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
-  Prog P; prog_init(&P,count,g_pflag,g_loginterval_ms,g_csv,g_csv_own);
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&P,"regime A (passphrase)",g_target_str,g_pattern_str,path,chunk,0);
   fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d)...\n",pwidth,count,start,purpose);
   int found=0; unsigned long long swept=0; double tt0=now_s();
-  double intv = P.interval>0?P.interval:1.0;
+  double intv=prog_intv(&P);
   for(cstart=start; cstart<start+count; ){
     ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk;
     double c0=now_s();
@@ -728,20 +745,44 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
 /* --------------------------------- CLI ---------------------------------- */
 static void usage(void){
   fprintf(stderr,
-   "usage: bip39rxcrack --words \"w1 w2 .. wN\" [target] [opts]\n"
-   "  target: --xpub XPUB | --target-chaincode HEX(32B)\n"
-   "  --purpose 44,49,84,86   BIP purposes to try (default 84)\n"
-   "  --pattern PAT           raw librxe mnemonic pattern (reseed39 wp): {{N!}} words\n"
-   "                          permutation, or known words + [:bip39:]/[:24th:] wildcards\n"
-   "  --gap N                 scan receive indices 0..N-1 (default 1)\n"
-   "  --change N              scan change chains 0..N-1 (default 1)\n"
+   "bip39rxcrack -- CUDA BIP39 seed cracker (GPU self-enumerate)\n"
+   "usage: bip39rxcrack <input> <target> [scan] [engine] [progress]\n"
+   "\n"
+   "INPUT (choose one):\n"
+   "  --pattern PAT           raw librxe mnemonic pattern (== reseed39 wp):\n"
+   "                            \"((w0|w1|..) ){{N!}}\"  -> known words, unknown order\n"
+   "                            \"w0 w1 [:bip39:] .. [:bip39:]\"  -> missing word(s)\n"
+   "  --words \"w1 .. wN\"      N known distinct words, unknown order ({{N!}})\n"
+   "  --template \"w .. [:bip39:] ..\"  known words + [:bip39:]/[:en:]/[:24th:] wildcards\n"
+   "  --mnemonic \"w .. w\" --passphrase [0-9]{N}   fixed mnemonic, unknown PIN\n"
+   "  ([:Nth:] last-word checksum construction auto-applies; --nth/--no-nth to force)\n"
+   "\n"
+   "TARGET (choose one):\n"
+   "  --address ADDR          base58 (1../3..) or bech32 (bc1q p2wpkh / bc1p p2tr)\n"
+   "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
+   "  --target-chaincode HEX  32-byte account chain code directly\n"
+   "  --purpose 44,49,84,86   BIP purpose(s) to try (default 84; auto from address)\n"
+   "\n"
+   "SCAN (address target):\n"
+   "  --gap N                 receive indices 0..N-1  (default 1 = first address)\n"
+   "  --change N              change chains  0..N-1    (default 1 = external only)\n"
    "  --no-checksum           disable the BIP39 checksum sieve\n"
-   "  --recon-gate [N]        gate GPU unrank+reconstruction vs librxe (default 512)\n"
-   "  --rank \"w1 .. wN\"       print the librxe index of one arrangement\n"
-   "  --dump-valid N          print 'gpuvalid<TAB>mnemonic' for N samples\n"
-   "  --start IDX --count N    shard the index space (multi-GPU / windowed proof)\n"
-   "  --limit N               alias of --count (raw-throughput sweep)\n"
-   "  --kernels PATH          crack_kernels.cu (default cuda/crack_kernels.cu)\n");
+   "\n"
+   "ENGINE:\n"
+   "  --compact / --no-compact   dense-survivor path (default on; words+address+sieve)\n"
+   "  --start IDX --count N    sweep a fixed index slice (windowed benchmark)\n"
+   "  --limit N               alias of --count\n"
+   "  --kernels PATH          crack_kernels.cu (default cuda/crack_kernels.cu)\n"
+   "  env: COMPACT_BUDGET_MB (survivor buffer, default 1024), CRACK_NOCACHE=1 (recompile)\n"
+   "\n"
+   "PROGRESS:\n"
+   "  -p [SECS]               live progress to stderr every SECS (default 1.0)\n"
+   "  --loginterval MS[:FILE] CSV log every MS ms (to stderr, or FILE); columns\n"
+   "                            t_ms,swept,swept_total,pct,rate,hashed,eta_s\n"
+   "                          (-p and --loginterval cadences are independent)\n"
+   "\n"
+   "GATES/UTIL:\n"
+   "  --ec-gate [F] --addr-gate [F] --recon-gate [N] --dump-valid N --rank \"..\" --decode ADDR\n");
 }
 int main(int argc,char**argv){
   /* NVRTC 13 dlopens libnvrtc-builtins.so.13.x via LD_LIBRARY_PATH; ensure it's
@@ -762,7 +803,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--no-checksum")) require_ck=0;
     else if(!strcmp(argv[i],"--compact")) compact=1;
     else if(!strcmp(argv[i],"--no-compact")) compact=0;
-    else if(!strcmp(argv[i],"-p")) g_pflag=1;
+    else if(!strcmp(argv[i],"-p")){ g_pflag=1; if(i+1<argc && (isdigit((unsigned char)argv[i+1][0])||argv[i+1][0]=='.')) g_p_secs=atof(argv[++i]); }
     else if(!strcmp(argv[i],"--loginterval")&&i+1<argc){ char*a=argv[++i]; char*colon=strchr(a,':');
       if(colon){ *colon=0; g_loginterval_ms=atoi(a); g_csv=fopen(colon+1,"w"); g_csv_own=1; if(!g_csv){fprintf(stderr,"cannot open %s\n",colon+1);return 2;} }
       else { g_loginterval_ms=atoi(a); g_csv=stderr; } }
