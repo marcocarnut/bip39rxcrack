@@ -345,20 +345,47 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
   int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
   int tpb=128,grid=1024; struct timeval t0,t1; double secs=0;
+  int used_compact=0;
   if(compact && require_ck){
-    unsigned long long survcap=count/4+1000000ULL; /* 12w pass ~1/16; 4x margin */
-    unsigned long long z64=0; CUdeviceptr dsurv,dctr; CU(cuMemAlloc(&dsurv,survcap*8)); dctr=up(&z64,8);
-    fprintf(stderr,"regime B (COMPACTED): sieve %llu -> dense survivors -> full-warp PBKDF2 -> m/%d'/0'/0'/%u/%u ...\n",count,purpose,change,index);
-    gettimeofday(&t0,0);
-    void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&dsurv,&survcap,&dctr};
-    CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
-    unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8));
-    if(nsurv>survcap){ fprintf(stderr,"ERROR: survivors %llu exceeded the compaction buffer (cap %llu) -- dropping any survivor risks a FALSE not-found (the winner could be dropped). Re-run without --compact, or with a smaller --count window.\n",nsurv,survcap); return 2; }
-    void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
-    CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize());
-    gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
-    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s  (%llu survivors -> dense PBKDF2)\n",count,secs,count/secs/1e6,nsurv);
-  } else {
+    /* CHUNKED compaction: size the survivor buffer for a chunk's FULL size
+     * (worst case: every candidate survives) -> overflow is STRUCTURALLY
+     * impossible. Chunk size C = budget/8 (default ~1 GiB; COMPACT_BUDGET_MB env
+     * override). One global hit_index (atomicMin across chunks) -> lowest-index
+     * wins across chunk boundaries; early-exit once a chunk finds a hit (later
+     * chunks only hold higher indices). Fall back to fused if no chunk fits. */
+    unsigned long long budget = 1024ULL*1024*1024;
+    const char*mb=getenv("COMPACT_BUDGET_MB"); if(mb){ long v=atol(mb); if(v>16) budget=(unsigned long long)v*1024*1024; }
+    unsigned long long C = budget/8;
+    CUdeviceptr dsurv=0;
+    while(C>=(1ULL<<20)){ if(cuMemAlloc(&dsurv,C*8)==CUDA_SUCCESS) break; C/=2; dsurv=0; }
+    if(dsurv){
+      used_compact=1;
+      unsigned long long z64=0; CUdeviceptr dctr=up(&z64,8);
+      unsigned long long nchunks=(count+C-1)/C;
+      fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates in %llu chunk(s) of <=%llu (buffer %llu MiB) -> m/%d'/0'/0'/%u/%u ...\n",
+              count, nchunks, C, C*8/1024/1024, purpose,change,index);
+      gettimeofday(&t0,0);
+      int found=0; unsigned long long tot_surv=0, swept=0;
+      for(unsigned long long cs=start; cs<start+count; cs+=C){
+        unsigned long long cc = (start+count-cs < C) ? (start+count-cs) : C; swept+=cc;
+        CU(cuMemcpyHtoD(dctr,&z64,8));
+        void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&cs,&cc,&dsurv,&C,&dctr};
+        CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
+        unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8)); tot_surv+=nsurv;
+        if(nsurv>C){ fprintf(stderr,"ERROR: chunk survivors %llu > chunk size %llu -- impossible (bug)\n",nsurv,C); return 2; }
+        if(nsurv){ void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&change,&index,&dtp,&dhi,&dfound};
+          CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
+        CU(cuMemcpyDtoH(&found,dfound,4));
+        if(found) break;   /* this chunk holds the global-lowest hit */
+      }
+      gettimeofday(&t1,0); secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_usec-t0.tv_usec)/1e6;
+      cuMemFree(dsurv);
+      fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s  (%llu survivors -> dense PBKDF2%s)\n",swept,secs,swept/secs/1e6,tot_surv,swept<count?", early-exit":"");
+    } else {
+      fprintf(stderr,"regime B: compaction buffer won't allocate on this GPU -- falling back to fused.\n");
+    }
+  }
+  if(!used_compact){
     void*args[]={&dd,&dof,&dln,&dix,&n,&size,&start,&count,&pu,&change,&index,&dtp,&require_ck,&dhi,&dfound};
     fprintf(stderr,"regime B: %llu permutations from %llu (checksum-%s) -> m/%d'/0'/0'/%u/%u ...\n",
             count,start,require_ck?"ON":"OFF",purpose,change,index);
@@ -565,7 +592,7 @@ int main(int argc,char**argv){
     if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
-  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=0; const char*ecgate=0,*addrgate=0;
+  int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0; uint32_t achange=0,aindex=0; int nthmode=-1; /* -1 auto, 1 force, 0 off */
@@ -576,6 +603,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--purpose")&&i+1<argc){ npurp=0; purpose_set=1; char*s=strtok(argv[++i],","); while(s&&npurp<8){purposes[npurp++]=(uint32_t)atoi(s);s=strtok(0,",");} }
     else if(!strcmp(argv[i],"--no-checksum")) require_ck=0;
     else if(!strcmp(argv[i],"--compact")) compact=1;
+    else if(!strcmp(argv[i],"--no-compact")) compact=0;
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--rank")&&i+1<argc) rankarg=argv[++i];
     else if(!strcmp(argv[i],"--dump-valid")&&i+1<argc){ dumpv=1; dumpv_n=atoi(argv[++i]); }
