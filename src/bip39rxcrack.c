@@ -623,8 +623,8 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
   X->require_ck=require_ck; X->purpose=purpose; X->grid=1024; X->tpb=128;
   /* survivor buffer (chunked compaction): sized for a chunk's FULL worst case so
      overflow is structurally impossible. Allocated ONCE here, reused per sweep.
-     (skipped in bloom mode -- the *_bloom kernel is fused.) */
-  if(compact && require_ck && !(aset && aset->n>0)){
+     Used by both single-target and bloom (g_pbkdf2_perm_bloom on the survivors). */
+  if(compact && require_ck){
     unsigned long long budget=1024ULL*1024*1024;
     const char*mb=getenv("COMPACT_BUDGET_MB"); if(mb){ long v=atol(mb); if(v>16) budget=(unsigned long long)v*1024*1024; }
     unsigned long long C=budget/8; CUdeviceptr dsurv=0;
@@ -658,18 +658,29 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
 static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned long long count,
                                   double intv,int reporting,prog_cb cb,void*ud,
                                   unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz){
-  int rck=X->require_ck, n=X->n, size=X->size;
+  int rck=X->require_ck, n=X->n, size=X->size, compact=(X->dsurv!=0);
   unsigned long long z0=0; CU(cuMemcpyHtoD(X->dhashed,&z0,8));
-  unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
+  unsigned long long cstart=start,ccount=0,swept=0,hashed=0;
+  unsigned long long chunk = compact ? (reporting?(1ULL<<20):X->C) : (reporting?report_chunk(1):(64ULL<<20));
   int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
   BloomHit *hb=malloc((size_t)X->hitcap*sizeof(BloomHit));
-  CUfunction kf=kern("g_crack_addr_bloom");
   for(cstart=start; cstart<start+count; ){
     ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
     unsigned int zc=0; CU(cuMemcpyHtoD(X->d_hitcnt,&zc,4));
-    void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->pu,&X->changes,&X->gap,
-                 &X->d_bloom,&X->bloom_mask,&rck,&X->d_hits,&X->d_hitcnt,&X->hitcap,&X->dhashed};
-    CU(cuLaunchKernel(kf,X->grid,1,1,X->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    if(compact){   /* sieve -> dense PBKDF2 on survivors -> probe (the ~20 Mc/s path) */
+      unsigned long long z64=0; CU(cuMemcpyHtoD(X->dctr,&z64,8));
+      void*sa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->dsurv,&X->C,&X->dctr};
+      CU(cuLaunchKernel(kern("g_sieve_perm"),X->grid,1,1,X->tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
+      unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,X->dctr,8)); hashed+=nsurv;
+      if(nsurv>X->C){ fprintf(stderr,"ERROR: chunk survivors %llu > %llu (bug)\n",nsurv,X->C); free(hb); return -1; }
+      if(nsurv){ void*pa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&X->dsurv,&nsurv,&X->pu,&X->changes,&X->gap,
+                            &X->d_bloom,&X->bloom_mask,&X->d_hits,&X->d_hitcnt,&X->hitcap};
+        CU(cuLaunchKernel(kern("g_pbkdf2_perm_bloom"),X->grid,1,1,X->tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
+    } else {       /* fused sieve+PBKDF2+EC -> probe */
+      void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->pu,&X->changes,&X->gap,
+                   &X->d_bloom,&X->bloom_mask,&rck,&X->d_hits,&X->d_hitcnt,&X->hitcap,&X->dhashed};
+      CU(cuLaunchKernel(kern("g_crack_addr_bloom"),X->grid,1,1,X->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    }
     double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
     unsigned int hc=0; CU(cuMemcpyDtoH(&hc,X->d_hitcnt,4));
     if(hc>0){
@@ -679,9 +690,10 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
         found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; memcpy(best_prog,hb[i].prog,32); } }
       if(hc>X->hitcap) fprintf(stderr,"  (bloom hit-buffer overflow %u>%u; raise it if this recurs)\n",hc,X->hitcap);
     }
-    CU(cuMemcpyDtoH(&hashed,X->dhashed,8)); if(cb) cb(ud,swept,rck?hashed:swept);
+    if(!compact) CU(cuMemcpyDtoH(&hashed,X->dhashed,8));
+    if(cb) cb(ud,swept,rck?hashed:swept);
     if(found) break;
-    chunk=next_chunk(ccount,csecs,intv,reporting);
+    chunk=next_chunk(ccount,csecs,intv,reporting); if(compact && chunk>X->C) chunk=X->C;
   }
   free(hb);
   if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];

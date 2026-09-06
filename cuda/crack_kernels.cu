@@ -190,6 +190,25 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
   }
 }
+/* Bloom variant of g_pbkdf2_perm (compacted survivors): PBKDF2 -> derive -> probe
+ * the filter -> append hits. Same ~20 Mc/s dense-survivor path, bloom target set. */
+extern "C" __global__ void g_pbkdf2_perm_bloom(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                         const u32 *bw_idx, int n, int size,
+                                         const unsigned long long *surv, unsigned long long nsurv,
+                                         u32 purpose, u32 changes, u32 gap,
+                                         const u32 *bloom, u32 bmask,
+                                         BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long s=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; s<nsurv; s+=stride){
+    unsigned long long j=surv[s];
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    derive_address_bloom(seed,purpose,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+  }
+}
 
 /* Regime B, BLOOM target set: same enumerate -> sieve -> PBKDF2 as g_crack_addr,
  * but probe each derived program against the blocked bloom and append hits for
