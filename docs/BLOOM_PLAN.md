@@ -162,7 +162,9 @@ more work than the naive one.
 3. **`--bloom-build` + `--bloom`** — **DONE** (the "any funded address" mode). `.blf` format:
    `[BlfHeader][filter nblocks*32B][cull n_addrs*32B sorted]`. `--bloom-build IN OUT` reads an
    address list (one per line), decodes each to its 32-byte program, records the distinct
-   script types, builds the filter, sorts the cull, writes OUT. `--bloom FILE` **mmaps** it
+   script types, builds the filter, sorts the cull, writes OUT. `IN='-'` reads **stdin**, so
+   the indexer/full-node output pipes straight in (no ~50 GB intermediate address file):
+   `bitcoin-cli … | bip39rxcrack --bloom-build - funded.blf`. `--bloom FILE` **mmaps** it
    (filter → GPU, cull → host bsearch — the cull is paged from disk, never fully loaded, so it
    scales toward ~1.5e9), works with `--words`/`--template` and fans out over GPUs like
    `--addresses`; a hit reports the matched hash160 (prebuilt files carry no address strings).

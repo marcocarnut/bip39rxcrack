@@ -30,9 +30,8 @@ const L=[winner];
 for(let i=0;i<40;i++) L.push(C.encodeAddress({type:'p2pkh', program:crypto.randomBytes(20)},'bc'));
 for(let i=0;i<40;i++) L.push(C.encodeAddress({type:'p2wpkh',program:crypto.randomBytes(20)},'bc'));
 for(let i=0;i<40;i++) L.push(C.encodeAddress({type:'p2tr',  program:crypto.randomBytes(32)},'bc'));
-const listf=path.join(os.tmpdir(),`bf_addrs_${process.pid}.txt`);
 const blf=path.join(os.tmpdir(),`bf_${process.pid}.blf`);
-fs.writeFileSync(listf, L.join('\n')+'\n');
+const listText=L.join('\n')+'\n';
 const J=BigInt(execFileSync(CLI,['--words',wordsArg,'--rank',M],{encoding:'utf8'}).trim());
 const start=(J>2000n?J-2000n:0n).toString();
 
@@ -41,9 +40,9 @@ console.log('planted :',M);
 console.log('winner  :',winner,'among',L.length-1,'mixed decoys; J =',J.toString());
 
 let fail=0; const check=(c,m)=>{ console.log((c?'  ok   ':'  FAIL ')+m); if(!c)fail++; };
-try{ execFileSync(CLI,['--bloom-build',listf,blf],{stdio:['ignore','ignore','inherit']}); }
-catch(e){ check(false,'--bloom-build failed'); }
-check(fs.existsSync(blf), 'built .blf exists');
+try{ execFileSync(CLI,['--bloom-build','-',blf],{input:listText,stdio:['pipe','ignore','inherit']}); }  // pipe list via stdin
+catch(e){ check(false,'--bloom-build (stdin) failed'); }
+check(fs.existsSync(blf), 'built .blf from stdin exists');
 
 let out='',code=0;
 try{ out=execFileSync(CLI,['--words',wordsArg,'--bloom',blf,'--start',start,'--count','4000','--device','0'],
@@ -64,6 +63,6 @@ try{ nout=execFileSync(CLI,['--words',wordsArg,'--bloom',blf,'--start','10000000
 catch(e){ nout=e.stdout?e.stdout.toString():''; ncode=e.status||1; }
 check(ncode===1 && /NOT FOUND/.test(nout), 'no-winner window -> NOT FOUND');
 
-try{ fs.unlinkSync(listf); fs.unlinkSync(blf); }catch(e){}
+try{ fs.unlinkSync(blf); }catch(e){}
 console.log(`\n==== e2e_bloom_file: ${fail?'FAILED ('+fail+')':'PASSED'} ====`);
 process.exit(fail?1:0);

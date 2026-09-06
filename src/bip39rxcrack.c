@@ -1543,7 +1543,8 @@ typedef struct { uint32_t magic,version,nblocks,k,npurp; uint32_t purposes[8]; u
 /* Read addresses (one per line) -> a .blf. Decodes each to its 32-byte (zero-padded)
    program, records the distinct script types, builds the filter, sorts the cull. */
 static int build_bloom_file(const char*infile,const char*outfile,double bpk){
-  FILE*f=fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
+  FILE*f = (!strcmp(infile,"-")) ? stdin : fopen(infile,"r");   /* "-" reads stdin (pipe the indexer/full node) */
+  if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
   uint8_t *progs=0; long n=0,cap=0; uint32_t purposes[8]; int npurp=0; long bad=0;
   char line[256];
   while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
@@ -1553,7 +1554,7 @@ static int build_bloom_file(const char*infile,const char*outfile,double bpk){
     memset(progs+(size_t)n*32,0,32); memcpy(progs+(size_t)n*32,pr,(size_t)pl); n++;
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu; }
-  fclose(f);
+  if(f!=stdin) fclose(f);
   if(n==0){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
   qsort(progs,(size_t)n,32,prog32_cmp);
   uint32_t nb=bloom_nblocks((uint64_t)n,bpk); size_t fbytes=(size_t)nb*32u;
@@ -1707,6 +1708,7 @@ static void usage(void){
    "  --bloom FILE.blf        load a PREBUILT address bloom (any funded address); like\n"
    "                          --addresses but from a file (reports the matched hash160)\n"
    "  --bloom-build IN OUT    build a .blf from an address list IN (one per line) -> OUT\n"
+   "                          IN='-' reads stdin, e.g.  node-dump | ... --bloom-build - f.blf\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --xpubs X,.. / --xpubs-file PATH  a SET of account xpubs (chaincode bloom,\n"
    "                          EC-free; tries purposes 44/49/84/86, --purpose overrides)\n"
