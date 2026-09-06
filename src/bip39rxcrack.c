@@ -104,6 +104,9 @@ static int g_warm=0;          /* --warm: build/JIT the module (populate PTX cach
 static int g_devtag=0;        /* prefix -p progress with the device index (multi-GPU children) */
 static char g_li_raw[320];    /* raw --loginterval value (survives in-place arg mutation) */
 static const char *g_csv_path=0;  /* CSV file to open (deferred: supervisors don't log) */
+static int g_worker=0;        /* --worker: persistent shard-servicing worker over stdin/stdout */
+static char g_ptx_key[128];   /* kernels/PTX hash, reported in the worker READY handshake */
+#define WQ_PROTO "wq1"        /* work-queue line-protocol version */
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
   char dir[512]; snprintf(dir,sizeof dir,"%s",cu); char*sl=strrchr(dir,'/'); if(sl)*sl=0; else strcpy(dir,".");
@@ -124,6 +127,7 @@ static void build_module(const char *cu_path){
   /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
      cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
   char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0));
+  snprintf(g_ptx_key,sizeof g_ptx_key,"%s",key);   /* kernels-hash for the worker handshake */
   char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_ptx_%s.ptx",key);
   char *ptx=0; FILE*cf=fopen(cpath,"rb");
   if(cf && !getenv("CRACK_NOCACHE")){
@@ -966,6 +970,41 @@ static int mode_profile(const char*cu){
          " low occupancy on a latency-bound serial hash = headroom via fewer regs / more ILP.)\n");
   return 0;
 }
+/* ------------------------------- worker -----------------------------------
+ * --worker: a persistent process that builds its CUDA context ONCE, announces
+ * READY, then services shard requests from stdin over the wq1 line protocol
+ * until STOP/EOF. The transport is a pipe today (local fork+exec) and `ssh host
+ * ... --worker` later -- the protocol is identical. All indices are GLOBAL
+ * canonical ranks. v1 handles the address-words path (mode_crack_addr). */
+typedef struct { unsigned long long id, base_swept, base_hashed, cur_swept, cur_hashed; double last; } WorkerProg;
+static void worker_prog_cb(void*ud,unsigned long long swept,unsigned long long hashed){
+  WorkerProg*w=ud; w->cur_swept=swept; w->cur_hashed=hashed; double now=now_s();
+  if(now-w->last<0.3) return;   /* rate-limit PROG to ~3/s */
+  w->last=now; printf("PROG %llu %llu %llu\n",w->id,w->base_swept+swept,w->base_hashed+hashed); fflush(stdout);
+}
+static int run_worker(const Words*W,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
+                      int require_ck,int compact,const char*cu){
+  CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu)) return 2;
+  printf("READY %s dev%d kern=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,X.total); fflush(stdout);
+  char line[512];
+  while(fgets(line,sizeof line,stdin)){
+    if(!strncmp(line,"STOP",4)) break;
+    unsigned long long id,s,c;
+    if(sscanf(line,"SHARD %llu %llu %llu",&id,&s,&c)!=3) continue;
+    if(s>X.total) s=X.total;
+    if(s+c>X.total) c=X.total-s;
+    WorkerProg wp={0}; wp.id=id;
+    unsigned long long hidx=0; uint32_t hci[2]={0,0};
+    int found=crack_addr_sweep(&X,s,c,0.3,1,worker_prog_cb,&wp,&hidx,hci);
+    if(found<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
+    if(found){ mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X.r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,X.r);
+      char*t=buf; while(*t==' ')t++;
+      printf("FOUND %llu %llu %u %u %s\n",id,hidx,hci[0],hci[1],t); fflush(stdout); mpz_clear(j); }
+    else { printf("DONE %llu\n",id); fflush(stdout); }
+  }
+  return 0;
+}
+
 /* ---------------------- multi-GPU fan-out supervisor ----------------------
  * --devices/--gpus turns this process into a supervisor: it computes the job
  * size once (a --print-total child, no GPU), warms the PTX cache once, then
@@ -1186,6 +1225,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--gpus")&&i+1<argc){ int N=atoi(argv[++i]); if(N>16)N=16; ndev=N; for(int d=0;d<N;d++)devs[d]=d; }
     else if(!strcmp(argv[i],"--print-total")) g_print_total=1;
     else if(!strcmp(argv[i],"--warm")) g_warm=1;
+    else if(!strcmp(argv[i],"--worker")) g_worker=1;
     else if(!strcmp(argv[i],"--devtag")) g_devtag=1;
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
@@ -1244,7 +1284,7 @@ int main(int argc,char**argv){
   if(g_warm){ build_module(cu); return 0; }
   /* Fan-out applies only to real crack jobs, not gate/util modes (which run once
      on a single device). */
-  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total);
+  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker);
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
      CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
@@ -1292,7 +1332,9 @@ int main(int argc,char**argv){
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
+    if(g_worker) return run_worker(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu);
     return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu); }
+  if(g_worker){ fprintf(stderr,"--worker v1 supports only the --words + --address path\n"); return 2; }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }
