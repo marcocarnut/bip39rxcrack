@@ -153,6 +153,22 @@ __device__ __noinline__ void j_add(jpt *r, const jpt *p, const jpt *q){
   fe_set(&r->X,&X3); fe_set(&r->Y,&Y3); fe_set(&r->Z,&Z3); r->inf=0;
 }
 
+/* Jacobian R += AFFINE Q (qx,qy) with implicit Z2=1 (comb table is affine).
+ * Skips the Z2Z2/U1/S1 and one Z-mul the general j_add wastes multiplying by 1. */
+__device__ __noinline__ void j_add_mixed(jpt *r, const jpt *p, const fe *qx, const fe *qy){
+  if(p->inf){ fe_set(&r->X,qx); fe_set(&r->Y,qy); fe_set_u64(&r->Z,1); r->inf=0; return; }
+  fe Z1Z1,U2,S2,H,R,HH,HHH,V,X3,Y3,Z3,t,t2;
+  fe_sqr(&Z1Z1,&p->Z);
+  fe_mul(&U2,qx,&Z1Z1);                    // U2 = qx*Z1^2   (U1 = X1)
+  fe_mul(&S2,qy,&p->Z); fe_mul(&S2,&S2,&Z1Z1); // S2 = qy*Z1^3 (S1 = Y1)
+  fe_sub(&H,&U2,&p->X); fe_sub(&R,&S2,&p->Y);
+  if(fe_iszero(&H)){ if(fe_iszero(&R)){ j_double(r,p); return; } j_set_inf(r); return; }
+  fe_sqr(&HH,&H); fe_mul(&HHH,&H,&HH); fe_mul(&V,&p->X,&HH);
+  fe_sqr(&X3,&R); fe_sub(&X3,&X3,&HHH); fe_add(&t,&V,&V); fe_sub(&X3,&X3,&t);
+  fe_sub(&t,&V,&X3); fe_mul(&Y3,&R,&t); fe_mul(&t2,&p->Y,&HHH); fe_sub(&Y3,&Y3,&t2);
+  fe_mul(&Z3,&p->Z,&H);                    // Z3 = Z1*H       (Z2=1)
+  fe_set(&r->X,&X3); fe_set(&r->Y,&Y3); fe_set(&r->Z,&Z3); r->inf=0;
+}
 /* k*G (k = 32 big-endian bytes) -> Jacobian point (double-and-add). Used to
  * BUILD the comb table; the hot path uses scalar_mul_G_j (comb) below. */
 __device__ __noinline__ void scalar_mul_G_dbl(const u8 k[32], jpt *R){
@@ -177,9 +193,9 @@ __device__ __noinline__ void scalar_mul_G_j(const u8 k[32], jpt *R){
     int byte=k[31-(i>>1)]; int nib=(byte>>((i&1)*4))&15;
     if(!nib) continue;
     const u64 *e=d_comb+((size_t)(i*16+nib))*8;
-    jpt Q; Q.X.v[0]=e[0];Q.X.v[1]=e[1];Q.X.v[2]=e[2];Q.X.v[3]=e[3];
-    Q.Y.v[0]=e[4];Q.Y.v[1]=e[5];Q.Y.v[2]=e[6];Q.Y.v[3]=e[7]; fe_set_u64(&Q.Z,1); Q.inf=0;
-    j_add(R,R,&Q);
+    fe qx,qy; qx.v[0]=e[0];qx.v[1]=e[1];qx.v[2]=e[2];qx.v[3]=e[3];
+    qy.v[0]=e[4];qy.v[1]=e[5];qy.v[2]=e[6];qy.v[3]=e[7];
+    j_add_mixed(R,R,&qx,&qy);
   }
 }
 /* Jacobian -> affine (x,y) with cond-normalized limbs. */
