@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -53,6 +53,10 @@ addr-e2e: $(CRACK)
 # at the global librxe rank (needs >=1 CUDA device; uses all visible GPUs).
 workqueue-gate: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_workqueue.js
+
+# missing-word ([:Nth:]) + address crack (mode_missing + its work-queue worker)
+missing-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_missing.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a

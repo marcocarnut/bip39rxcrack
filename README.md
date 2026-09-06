@@ -119,10 +119,10 @@ Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` 
 `--resume LOG` (continue a killed run from its progress log); multi-GPU
 `--device D`, `--devices 0,1` / `--gpus N`, `--print-total`.
 
-**Multi-GPU work-queue.** For the `--words`+`--address` path, the supervisor owns a
-queue of **fine shards** (~8M candidates each, or `--shards N`) handed to persistent
-per-GPU workers over a line protocol, and shows **one consolidated live line** summing
-all GPUs. `--order first|ends|center|random[:seed]` sets the sweep order so you can
+**Multi-GPU work-queue.** For the `--words`+`--address` and `--template`+`--address`
+(missing-word / `[:Nth:]`) paths, the supervisor owns a queue of **fine shards** (~8M
+candidates each, or `--shards N`) handed to persistent per-GPU workers over a line
+protocol, and shows **one consolidated live line** summing all GPUs. `--order first|ends|center|random[:seed]` sets the sweep order so you can
 exploit a prior on where the key is (a work queue with no prior has the same *expected*
 time as contiguous halves, but ordering wins when the key isn't uniform). A worker that
 dies has its in-flight shard **re-queued** to a survivor, so the run tolerates a GPU

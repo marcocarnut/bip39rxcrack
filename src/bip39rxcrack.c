@@ -746,73 +746,97 @@ static int parse_template(const char*tpl,uint32_t tmpl[32],int upos[32],int*W,in
   return 0;
 }
 static const char* WLNAME(int idx){ static char names[2048][16]; static int loaded=0; if(!loaded){load_wordlist(names);loaded=1;} return names[idx]; }
-static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
-                        int nthmode,unsigned long long ustart,unsigned long long ucount,const char*cu){
+/* setup-once / sweep split for the missing-word ([:Nth:]) + address path, mirroring
+   the crack_addr_* pair. The [:Nth:] subspace uses nth-space indices; the librxe
+   full-space rank is derived at report time. */
+typedef struct {
+  CUdeviceptr dwl,dwoff,dwlen,dtmpl,dupos,dtp,dhi,dfound,dhg,dhashed,dhit_ci;
+  int W,U,passU,nth,freebits, upos[32]; uint32_t pu,changes,gap; int grid,tpb;
+  unsigned long long total;
+} MissCtx;
+static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],int purpose,
+                               uint32_t changes,uint32_t gap,int nthmode,const char*cu){
+  memset(M,0,sizeof *M);
   uint32_t tmpl[32]; int upos[32],W,U,last_unknown;
   if(parse_template(tpl,tmpl,upos,&W,&U,&last_unknown)) return 2;
-  int CS=W/3, freebits=11-CS;
-  int nth;   /* -1 auto (nth iff last unknown), 1 force, 0 off */
+  int CS=W/3, freebits=11-CS; (void)CS;
+  int nth;
   if(nthmode==1){ if(!last_unknown){ fprintf(stderr,"--nth needs the LAST position to be [:bip39-en:]\n"); return 2; } nth=1; }
-  else if(nthmode==0) nth=0;
-  else nth = last_unknown;
-  /* unknown positions passed to the kernel: baseline=all U; nth=others (exclude last
-     W-1). Compute the job size here (host-only) so --print-total needs no GPU. */
+  else if(nthmode==0) nth=0; else nth=last_unknown;
   int kpos[32],kU; unsigned long long total=1;
-  if(nth){ kU=0; for(int i=0;i<U;i++) if(upos[i]!=W-1) kpos[kU++]=upos[i];
-    for(int i=0;i<kU;i++) total*=2048ULL;
-    total <<= freebits; }
+  if(nth){ kU=0; for(int i=0;i<U;i++) if(upos[i]!=W-1) kpos[kU++]=upos[i]; for(int i=0;i<kU;i++) total*=2048ULL; total<<=freebits; }
   else { kU=U; for(int i=0;i<U;i++) kpos[i]=upos[i]; for(int i=0;i<U;i++) total*=2048ULL; }
-  if(g_print_total){ printf("%llu\n",total); return 0; }
+  M->total=total; M->W=W; M->U=U; M->passU=U; M->nth=nth; M->freebits=freebits;
+  for(int i=0;i<U;i++) M->upos[i]=upos[i];
+  M->pu=(uint32_t)purpose; M->changes=changes; M->gap=gap; M->grid=1024; M->tpb=128;
   build_module(cu);
-  CUdeviceptr dwl,dwoff,dwlen; gpu_upload_wordlist(&dwl,&dwoff,&dwlen);
-  CUdeviceptr dtmpl=up(tmpl,W*sizeof(uint32_t)), dtp=up(tprog,32);
-  CUdeviceptr dupos=up(kpos, (kU?kU:1)*sizeof(int));
-  unsigned long long start=ustart>total?total:ustart;
-  unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
-  unsigned long long init=~0ULL; int zero=0;
-  CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4),dhg=up(0,W*sizeof(uint32_t));
-  uint32_t pu=(uint32_t)purpose; int passU=U;
-  unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
-  uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
-  unsigned long long cstart=start,ccount=0;
-  void*args[]={&dwl,&dwoff,&dwlen,&dtmpl,&W,&dupos,&passU,&cstart,&ccount,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhg,&dhashed,&dhit_ci};
-  int tpb=128,grid=1024, reporting=(g_pflag||g_loginterval_ms);
-  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
-  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
-  prog_hdr(&P, nth?"missing-word [:Nth:]":"missing-word baseline", g_target_str,g_pattern_str,path,0,0);
-  double intv=prog_intv(&P);
-  fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
-          nth?"[:Nth:] CONSTRUCTION":"baseline sieve", W, U, nth?" (last=checksum-constructed)":"", count, path);
-  int found=0; unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
+  gpu_upload_wordlist(&M->dwl,&M->dwoff,&M->dwlen);
+  M->dtmpl=up(tmpl,W*sizeof(uint32_t)); M->dtp=up(tprog,32); M->dupos=up(kpos,(kU?kU:1)*sizeof(int));
+  unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
+  M->dhi=up(&init,8); M->dfound=up(&zero,4); M->dhg=up(0,W*sizeof(uint32_t)); M->dhashed=up(&z0,8); M->dhit_ci=up(hci0,8);
+  return 0;
+}
+/* Sweep [start,count) in nth-space. On hit: *out_hidx (nth-space), out_ci, out_hg[W]. */
+static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
+                               prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32]){
+  unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
+  CU(cuMemcpyHtoD(M->dhi,&init,8)); CU(cuMemcpyHtoD(M->dfound,&zero,4));
+  CU(cuMemcpyHtoD(M->dhashed,&z0,8)); CU(cuMemcpyHtoD(M->dhit_ci,hci0,8));
+  int found=0; unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=rep?report_chunk(1):(64ULL<<20);
+  void*args[]={&M->dwl,&M->dwoff,&M->dwlen,&M->dtmpl,&M->W,&M->dupos,&M->passU,&cstart,&ccount,&M->pu,&M->changes,&M->gap,&M->dtp,&M->dhi,&M->dfound,&M->dhg,&M->dhashed,&M->dhit_ci};
   for(cstart=start; cstart<start+count; ){
     ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
-    CU(cuLaunchKernel(kern(nth?"g_crack_nth":"g_crack_missing"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    CU(cuLaunchKernel(kern(M->nth?"g_crack_nth":"g_crack_missing"),M->grid,1,1,M->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
-    if(nth) hashed=swept; else CU(cuMemcpyDtoH(&hashed,dhashed,8));
-    prog_tick(&P,swept,hashed);
-    CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
-    chunk=next_chunk(ccount,csecs,intv,reporting);
+    if(M->nth) hashed=swept; else CU(cuMemcpyDtoH(&hashed,M->dhashed,8));
+    if(cb) cb(ud,swept,hashed);
+    CU(cuMemcpyDtoH(&found,M->dfound,4)); if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,rep);
   }
+  CU(cuMemcpyDtoH(&found,M->dfound,4));
+  if(found){ CU(cuMemcpyDtoH(out_hidx,M->dhi,8)); CU(cuMemcpyDtoH(out_ci,M->dhit_ci,8)); CU(cuMemcpyDtoH(out_hg,M->dhg,M->W*sizeof(uint32_t))); }
+  return found;
+}
+static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
+                        int nthmode,unsigned long long ustart,unsigned long long ucount,const char*cu){
+  if(g_print_total){   /* host-only job size, no GPU */
+    uint32_t tmpl[32]; int upos[32],W,U,last_unknown;
+    if(parse_template(tpl,tmpl,upos,&W,&U,&last_unknown)) return 2;
+    int fb=11-W/3; int nth=(nthmode==1)?1:(nthmode==0)?0:last_unknown;
+    if(nthmode==1 && !last_unknown){ fprintf(stderr,"--nth needs the LAST position to be [:bip39-en:]\n"); return 2; }
+    unsigned long long total=1; int kU=0; for(int i=0;i<U;i++) if(!(nth&&upos[i]==W-1)) kU++;
+    for(int i=0;i<kU;i++) total*=2048ULL;
+    if(nth) total<<=fb;
+    printf("%llu\n",total); return 0;
+  }
+  MissCtx M; if(crack_missing_setup(&M,tpl,tprog,purpose,changes,gap,nthmode,cu)) return 2;
+  unsigned long long start=ustart>M.total?M.total:ustart;
+  unsigned long long count=ucount?ucount:(M.total-start); if(start+count>M.total) count=M.total-start;
+  int reporting=(g_pflag||g_loginterval_ms);
+  char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
+  prog_hdr(&P, M.nth?"missing-word [:Nth:]":"missing-word baseline", g_target_str,g_pattern_str,path,0,0);
+  double intv=prog_intv(&P);
+  fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
+          M.nth?"[:Nth:] CONSTRUCTION":"baseline sieve", M.W, M.U, M.nth?" (last=checksum-constructed)":"", count, path);
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0},hg[32];
+  int found=crack_missing_sweep(&M,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,hg);
+  if(found<0) return 2;
   double secs=now_s()-tt0;
-  fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s%s)\n",swept,secs,swept/secs/1e6,
-          nth?"all valid, no sieve":"sieve->PBKDF2+EC on survivors", swept<count?", early-exit":"");
-  unsigned long long hidx=0; CU(cuMemcpyDtoH(&hidx,dhi,8));
+  fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s%s)\n",P.swept,secs,secs>0?P.swept/secs/1e6:0.0,
+          M.nth?"all valid, no sieve":"sieve->PBKDF2+EC on survivors", (found&&P.swept<count)?", early-exit":"");
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
-  uint32_t hg[32]; CU(cuMemcpyDtoH(hg,dhg,W*sizeof(uint32_t)));
-  /* nth uses a constructed subspace; also report the librxe full-space rank so it
-     cross-checks against --rank / (re)seed39 (baseline hidx already equals it). */
-  unsigned long long librxe_rank = nth ? ((hidx>>freebits)*2048ULL + hg[W-1]) : hidx;
-  printf("FOUND\n  index    : %llu%s\n",hidx, nth?" (nth-space)":" (== librxe rank)");
-  if(nth) printf("  librxe rank: %llu\n",librxe_rank);
+  unsigned long long librxe_rank = M.nth ? ((hidx>>M.freebits)*2048ULL + hg[M.W-1]) : hidx;
+  printf("FOUND\n  index    : %llu%s\n",hidx, M.nth?" (nth-space)":" (== librxe rank)");
+  if(M.nth) printf("  librxe rank: %llu\n",librxe_rank);
   printf("  found words:");
-  for(int i=0;i<U;i++) printf(" [pos %d]=%s",upos[i],WLNAME((int)hg[upos[i]]));
+  for(int i=0;i<M.U;i++) printf(" [pos %d]=%s",M.upos[i],WLNAME((int)hg[M.upos[i]]));
   printf("\n  mnemonic :");
-  for(int p=0;p<W;p++) printf(" %s",WLNAME((int)hg[p]));
-  uint32_t hci[2]; CU(cuMemcpyDtoH(hci,dhit_ci,8));
+  for(int p=0;p<M.W;p++) printf(" %s",WLNAME((int)hg[p]));
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
   printf("\n  path     : %s\n",fpath);
-  { char fw[256]; int L=0; for(int i=0;i<U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[upos[i]])); prog_finish(&P,"FOUND",fw,fpath); }
-  (void)CS; return 0;
+  { char fw[256]; int L=0; for(int i=0;i<M.U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[M.upos[i]])); prog_finish(&P,"FOUND",fw,fpath); }
+  return 0;
 }
 
 /* --------------------------- EC gate (vs oracle) ------------------------ */
@@ -983,30 +1007,58 @@ static void worker_prog_cb(void*ud,unsigned long long swept,unsigned long long h
   if(now-w->last<0.3) return;   /* rate-limit PROG to ~3/s */
   w->last=now; printf("PROG %llu %llu %llu\n",w->id,w->base_swept+swept,w->base_hashed+hashed); fflush(stdout);
 }
-static int run_worker(const Words*W,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
-                      int require_ck,int compact,const char*cu){
-  CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu)) return 2;
-  printf("READY %s dev%d kern=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,X.total); fflush(stdout);
+/* A Sweeper adapts a mode's setup/sweep to the worker: sweep a shard and, on a
+   hit, hand back the GLOBAL canonical index, change/index, and the mnemonic. */
+typedef int (*sweep_fn)(void*ctx,unsigned long long start,unsigned long long count,double intv,int rep,
+                        prog_cb cb,void*ud,unsigned long long*out_idx,uint32_t out_ci[2],char*out_mn,int mnsz);
+typedef struct { sweep_fn sweep; void*ctx; unsigned long long total; } Sweeper;
+static int wq_sweep_addr(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
+                         unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz){
+  CrackCtx*X=c; uint32_t ci[2]; unsigned long long hidx=0;
+  int f=crack_addr_sweep(X,s,n,intv,rep,cb,ud,&hidx,ci);
+  if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1];
+    mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X->r,j); char b[MN_STRIDE]; rxe_current(b,sizeof b,X->r);
+    char*t=b; while(*t==' ')t++; snprintf(mn,mnsz,"%s",t); mpz_clear(j); }
+  return f;
+}
+static int wq_sweep_missing(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
+                            unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz){
+  MissCtx*M=c; uint32_t ci[2],hg[32]; unsigned long long hidx=0;
+  int f=crack_missing_sweep(M,s,n,intv,rep,cb,ud,&hidx,ci,hg);
+  if(f>0){ *oi = M->nth ? ((hidx>>M->freebits)*2048ULL + hg[M->W-1]) : hidx; oc[0]=ci[0]; oc[1]=ci[1];
+    int L=0; for(int p=0;p<M->W;p++) L+=snprintf(mn+L,mnsz-L,"%s%s",p?" ":"",WLNAME((int)hg[p])); }
+  return f;
+}
+static int run_worker(Sweeper*S){
+  printf("READY %s dev%d kern=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,S->total); fflush(stdout);
   char line[512];
   WorkerProg wp={0};   /* cumulative across ALL this worker's shards (base) + in-flight (cur) */
   while(fgets(line,sizeof line,stdin)){
     if(!strncmp(line,"STOP",4)) break;
     unsigned long long id,s,c;
     if(sscanf(line,"SHARD %llu %llu %llu",&id,&s,&c)!=3) continue;
-    if(s>X.total) s=X.total;
-    if(s+c>X.total) c=X.total-s;
+    if(s>S->total) s=S->total;
+    if(s+c>S->total) c=S->total-s;
     wp.id=id; wp.cur_swept=0; wp.cur_hashed=0;
-    unsigned long long hidx=0; uint32_t hci[2]={0,0};
-    int found=crack_addr_sweep(&X,s,c,0.3,1,worker_prog_cb,&wp,&hidx,hci);
-    if(found<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
-    if(found){ mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X.r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,X.r);
-      char*t=buf; while(*t==' ')t++;
-      printf("FOUND %llu %llu %u %u %s\n",id,hidx,hci[0],hci[1],t); fflush(stdout); mpz_clear(j); }
+    unsigned long long oi=0; uint32_t oc[2]={0,0}; char mn[512]="";
+    int f=S->sweep(S->ctx,s,c,0.3,1,worker_prog_cb,&wp,&oi,oc,mn,sizeof mn);
+    if(f<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
+    if(f){ printf("FOUND %llu %llu %u %u %s\n",id,oi,oc[0],oc[1],mn); fflush(stdout); }
     else { /* whole shard swept: bank its full candidate count, emit a final PROG, then DONE */
       wp.base_swept+=c; wp.base_hashed+=wp.cur_hashed;
       printf("PROG %llu %llu %llu\nDONE %llu\n",id,wp.base_swept,wp.base_hashed,id); fflush(stdout); }
   }
   return 0;
+}
+static int run_worker_addr(const Words*W,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
+                           int require_ck,int compact,const char*cu){
+  CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu)) return 2;
+  Sweeper S={wq_sweep_addr,&X,X.total}; return run_worker(&S);
+}
+static int run_worker_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
+                              int nthmode,const char*cu){
+  MissCtx M; if(crack_missing_setup(&M,tpl,tprog,purpose,changes,gap,nthmode,cu)) return 2;
+  Sweeper S={wq_sweep_missing,&M,M.total}; return run_worker(&S);
 }
 
 /* ---------------------- multi-GPU fan-out supervisor ----------------------
@@ -1304,7 +1356,7 @@ static void usage(void){
    "  --devices D0,D1,..      fan out one child process per GPU over disjoint index\n"
    "  --gpus N                slices; first to FOUND wins, siblings are killed\n"
    "                          (--devices 0,1  ==  --gpus 2). Honours an outer --start/--count.\n"
-   "  --order P[:seed]        (--words+--address) work-queue sweep order:\n"
+   "  --order P[:seed]        (--words/--template + --address) work-queue sweep order:\n"
    "                          first|ends|center|random -- exploit a prior on where\n"
    "                          the key is; the supervisor shows one consolidated line\n"
    "  --shards N              split the space into N fine shards (default ~8M each)\n"
@@ -1457,7 +1509,7 @@ int main(int argc,char**argv){
      persistent-worker WORK-QUEUE (fine shards + ordering + consolidated stats);
      other modes still use the contiguous supervisor until they get setup/sweep. */
   if(crackjob && (ndev>0 || order_given || nshards_arg>0)){
-    if(address && words && !templ){ int nd=ndev>0?ndev:1; if(ndev==0) devs[0]=g_device;
+    if((address && words && !templ) || (address && templ)){ int nd=ndev>0?ndev:1; if(ndev==0) devs[0]=g_device;
       return run_workqueue(argc,argv,devs,nd,cstart,ccount,order_policy,order_seed,nshards_arg); }
     if(ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
   }
@@ -1480,6 +1532,7 @@ int main(int argc,char**argv){
     uint8_t prog[32]; int apl,apu; if(decode_address(address,prog,&apl,&apu)) return 2;
     int purpose = purpose_set?(int)purposes[0]:apu;
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
+    if(g_worker) return run_worker_missing(templ,prog,purpose,a_changes,a_gap,nthmode,cu);
     return mode_missing(templ,prog,purpose,a_changes,a_gap,nthmode,cstart,ccount,cu);
   }
   /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
@@ -1498,9 +1551,9 @@ int main(int argc,char**argv){
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
-    if(g_worker) return run_worker(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu);
+    if(g_worker) return run_worker_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu);
     return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu); }
-  if(g_worker){ fprintf(stderr,"--worker v1 supports only the --words + --address path\n"); return 2; }
+  if(g_worker){ fprintf(stderr,"--worker supports the --words/--address and --template/--address paths\n"); return 2; }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }
