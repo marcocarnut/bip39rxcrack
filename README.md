@@ -119,9 +119,19 @@ Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` 
 `--resume LOG` (continue a killed run from its progress log); multi-GPU
 `--device D`, `--devices 0,1` / `--gpus N`, `--print-total`.
 
-**Multi-GPU.** Crack jobs **fan out over all visible GPUs by default** (pin a single
-card with `--device D`; `CUDA_VISIBLE_DEVICES` is honoured). `--devices 0,1` (or
-`--gpus 2`) selects an explicit set. Either way the process becomes a supervisor:
+**Multi-GPU work-queue.** For the `--words`+`--address` path, the supervisor owns a
+queue of **fine shards** (~8M candidates each, or `--shards N`) handed to persistent
+per-GPU workers over a line protocol, and shows **one consolidated live line** summing
+all GPUs. `--order first|ends|center|random[:seed]` sets the sweep order so you can
+exploit a prior on where the key is (a work queue with no prior has the same *expected*
+time as contiguous halves, but ordering wins when the key isn't uniform). A worker that
+dies has its in-flight shard **re-queued** to a survivor, so the run tolerates a GPU
+falling over — the groundwork for an SSH hive (same protocol over `ssh host --worker`).
+Design: `docs/WORKQUEUE_HIVE_PLAN.md`. Gate: `make workqueue-gate`.
+
+**Multi-GPU (other modes).** Crack jobs **fan out over all visible GPUs by default**
+(pin a single card with `--device D`; `CUDA_VISIBLE_DEVICES` is honoured). `--devices
+0,1` (or `--gpus 2`) selects an explicit set. Either way the process becomes a supervisor:
 it computes the job size once (`--print-total`, no GPU), warms the PTX cache, then
 forks one crack child per GPU over a **contiguous slice of the canonical index
 space** (reusing `--device`/`--start`/`--count`). The first child to find a hit exits
