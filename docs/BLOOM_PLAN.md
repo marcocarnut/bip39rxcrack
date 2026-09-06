@@ -129,6 +129,40 @@ more work than the naive one.
    an address source (full-node dump) and the on-disk formats.
 4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.
 
+## Multi-currency (forward-looking — design so we don't trap ourselves)
+
+The bloom/cull/work-queue/hive are **coin-agnostic**: they operate on uniform 20/32-byte
+fingerprints and don't care what produced them. That's the payoff of slice-don't-hash.
+What differs per coin is only the *derivation* and the *encoding*:
+
+- **UTXO family (LTC coin=2, BCH=145, DOGE=3, …)** are secp256k1 + hash160, so the program
+  bytes are the SAME construction. Only (1) the `coin'` level in `m/purpose'/coin'/…` (a
+  different key -> different program) and (2) the address encoding (version byte / bech32
+  HRP / BCH CashAddr, which touches only target decode and find-time re-encode, never the
+  hot path) differ. One **filter per coin** is the right unit — contents + derivation are
+  per-coin; merging coins works but loses which-coin identity and buys nothing.
+- **Ethereum (coin=60)** is a different *derive*: Keccak-256 of the *uncompressed* pubkey,
+  last 20 bytes — no hash160, no compression, no script types. It needs its own
+  derive-program function, but the fingerprint is still 20 uniform bytes, so the bloom,
+  cull, work-queue and hive apply unchanged. Size is NOT the blocker: ETH has ~10^8-10^9
+  addresses (same order as BTC or smaller) and fits the same ~4 GiB filter; the cost is the
+  algorithm, not capacity.
+
+**Two concrete traps to avoid (fix when we touch derivation, not necessarily now):**
+1. `derive_address_match` hardcodes `coin'=0` (`m/purpose'/0'/0'`). Thread a `coin` value
+   through the derive (default 0) so adding LTC/BCH is a flag + version table, not surgery.
+2. `decode_address` assumes Bitcoin version bytes / HRP. Make target decode + address
+   encode **table-driven per coin** (versions, HRP, CashAddr), isolated from the core.
+
+**The abstraction:** a *coin profile* `{coin_type, derive_program_fn, decode_target_fn,
+encode_address_fn}` — UTXO coins share one `derive_program_fn` (only `coin'` varies), ETH
+plugs its own. Everything downstream consumes the profile's uniform fingerprint and stays
+coin-blind (same shape as the `Sweeper` abstraction, one level lower).
+
+**Testing caveat:** the reseed39 oracle is Bitcoin-only. Each coin needs its own SLIP-0044
+reference vectors (path + known seed->address) before it can be gated — a validation cost,
+not a code trap.
+
 ## Open questions
 
 - Exact `bloom-build` input source & cadence (full-node `dumptxoutset` vs a maintained list).
