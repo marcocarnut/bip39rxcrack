@@ -65,6 +65,7 @@ bloom-selftest: $(CRACK)
 # bloom target SET crack: winner hidden among decoys -> FOUND at rank; decoys-only -> NOT FOUND
 bloom-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom.js
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_missing.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a

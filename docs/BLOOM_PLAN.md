@@ -145,8 +145,13 @@ more work than the naive one.
     culled-true hit holds the lowest rank → min + stop). Single-target path untouched
     (byte-exact). Gate `make bloom-e2e`: winner among decoys → FOUND at rank; decoys-only →
     NOT FOUND. v1 limits: one script type per set; in-process (no fan-out yet); fused only.
-1c. (next) compact bloom path (`g_sieve_perm` → `g_pbkdf2_perm_bloom`) for ~20 Mc/s; the
-    missing-word bloom (`g_crack_nth/_missing`); and fold `--addresses` into the work-queue.
+1c. **PARTLY DONE** — missing-word bloom (`g_crack_nth_bloom`/`g_crack_missing_bloom`; on a
+    culled-true hit we re-derive that one index single-target to recover the words for
+    rendering) AND `--addresses` folded into the **work-queue** (both `--words` and
+    `--template` fan out over all GPUs; workers build their own filter). Gate
+    `gate/e2e_bloom_missing.js`. STILL PENDING: the compact bloom path (`g_sieve_perm` →
+    `g_pbkdf2_perm_bloom`) for the ~20 Mc/s checksum-sieve speed on the `--words` path
+    (missing-word [:Nth:] is inherently fused, so unaffected).
 2. **`--xpubs`** (chaincode filter; trivial once the above exist — different key length + EC-free).
 3. **`bloom-build` + `--bloom` + the sorted `.cull`** (the "any funded address" mode). Needs
    an address source (full-node dump) and the on-disk formats.

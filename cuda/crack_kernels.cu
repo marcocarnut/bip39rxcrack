@@ -270,6 +270,27 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
  * (11-CS) entropy bits are enumerated and the CS checksum bits CONSTRUCTED from
  * SHA-256(entropy) -> every candidate is checksum-valid (no sieve, no divergence).
  * Index space = 2048^(U-1) * 2^(11-CS). */
+/* Bloom variant of g_crack_missing: probe each derived program -> append hits. */
+extern "C" __global__ void g_crack_missing_bloom(const u8 *wl, const int *wloff, const int *wllen,
+                                           const u32 *tmpl, int W, const int *upos, int U,
+                                           unsigned long long start, unsigned long long count,
+                                           u32 purpose, u32 changes, u32 gap,
+                                           const u32 *bloom, u32 bmask,
+                                           BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
+                                           unsigned long long *hashed){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    for(int u=0;u<U;u++) g[upos[u]]=(u32)((j>>(11*(U-1-u)))&2047ULL);
+    if(!bip39_checksum_ok(g,W)) continue;
+    if(hashed) atomicAdd(hashed,1ULL);
+    u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    derive_address_bloom(seed,purpose,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+  }
+}
 extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int *wllen,
                                        const u32 *tmpl, int W, const int *upos, int U,
                                        unsigned long long start, unsigned long long count,
@@ -301,6 +322,34 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
   }
 }
 
+/* Bloom variant of g_crack_nth ([:Nth:] construction): probe -> append hits. */
+extern "C" __global__ void g_crack_nth_bloom(const u8 *wl, const int *wloff, const int *wllen,
+                                       const u32 *tmpl, int W, const int *upos, int U,
+                                       unsigned long long start, unsigned long long count,
+                                       u32 purpose, u32 changes, u32 gap,
+                                       const u32 *bloom, u32 bmask,
+                                       BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
+                                       unsigned long long *hashed){
+  int total=W*11, ENT=total*32/33, CS=total-ENT; int freebits=11-CS;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x; (void)hashed;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u32 g[24]; for(int p=0;p<W;p++) g[p]=tmpl[p];
+    unsigned long long lastfree=j & ((1ULL<<freebits)-1);
+    unsigned long long rest=j>>freebits; int nm=U-1;
+    for(int u=0;u<nm;u++) g[upos[u]]=(u32)((rest>>(11*(nm-1-u)))&2047ULL);
+    g[W-1]=(u32)(lastfree<<CS);
+    u8 ent[32]; for(int i=0;i<32;i++) ent[i]=0;
+    for(int i=0;i<W;i++){ u32 idx=g[i]; for(int b=0;b<11;b++){ int pos=i*11+b; if(pos<ENT && ((idx>>(10-b))&1)) ent[pos>>3]|=(0x80>>(pos&7)); } }
+    u8 dig[32]; sha256_1blk(ent,(u32)(ENT/8),dig);
+    u32 cs=(dig[0]>>(8-CS))&((1u<<CS)-1);
+    g[W-1]=(u32)((lastfree<<CS)|cs);
+    u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    derive_address_bloom(seed,purpose,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+  }
+}
 /* ---- unrank gates: decode index -> word vector (order must match librxe) ---- */
 extern "C" __global__ void g_unrank_missing(const u32 *tmpl, int W, const int *upos, int U,
                                             const unsigned long long *idx, int n, u32 *out_g){
