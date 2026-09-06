@@ -119,7 +119,9 @@ Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` 
 `--resume LOG` (continue a killed run from its progress log); multi-GPU
 `--device D`, `--devices 0,1` / `--gpus N`, `--print-total`.
 
-**Multi-GPU.** `--devices 0,1` (or `--gpus 2`) turns the process into a supervisor:
+**Multi-GPU.** Crack jobs **fan out over all visible GPUs by default** (pin a single
+card with `--device D`; `CUDA_VISIBLE_DEVICES` is honoured). `--devices 0,1` (or
+`--gpus 2`) selects an explicit set. Either way the process becomes a supervisor:
 it computes the job size once (`--print-total`, no GPU), warms the PTX cache, then
 forks one crack child per GPU over a **contiguous slice of the canonical index
 space** (reusing `--device`/`--start`/`--count`). The first child to find a hit exits

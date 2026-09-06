@@ -1085,7 +1085,8 @@ static void usage(void){
    "  --compact / --no-compact   dense-survivor path (default on; words+address+sieve)\n"
    "  --start IDX --count N    sweep a fixed index slice (windowed benchmark)\n"
    "  --limit N               alias of --count\n"
-   "  --device D              run on CUDA ordinal D (default 0)\n"
+   "  (default: crack jobs fan out over ALL visible GPUs; pin one with --device)\n"
+   "  --device D              run on a single CUDA ordinal D (no fan-out)\n"
    "  --devices D0,D1,..      fan out one child process per GPU over disjoint index\n"
    "  --gpus N                slices; first to FOUND wins, siblings are killed\n"
    "                          (--devices 0,1  ==  --gpus 2). Honours an outer --start/--count.\n"
@@ -1119,7 +1120,7 @@ int main(int argc,char**argv){
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   const char *resumearg=0;
-  int devs[16], ndev=0;   /* --devices/--gpus: fan out one child per GPU */
+  int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -1156,7 +1157,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--gap")&&i+1<argc) a_gap=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else if(!strcmp(argv[i],"--resume")&&i+1<argc) resumearg=argv[++i];
-    else if(!strcmp(argv[i],"--device")&&i+1<argc) g_device=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--device")&&i+1<argc){ g_device=atoi(argv[++i]); device_set=1; }
     else if(!strcmp(argv[i],"--devices")&&i+1<argc){ ndev=0; char*s=strtok(argv[++i],","); while(s&&ndev<16){ devs[ndev++]=atoi(s); s=strtok(0,","); } }
     else if(!strcmp(argv[i],"--gpus")&&i+1<argc){ int N=atoi(argv[++i]); if(N>16)N=16; ndev=N; for(int d=0;d<N;d++)devs[d]=d; }
     else if(!strcmp(argv[i],"--print-total")) g_print_total=1;
@@ -1217,8 +1218,19 @@ int main(int argc,char**argv){
   }
   /* --warm: build/JIT the module (populate the PTX cache) and exit */
   if(g_warm){ build_module(cu); return 0; }
-  /* --devices/--gpus: become the fan-out supervisor over the local GPUs */
-  if(ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
+  /* Fan-out applies only to real crack jobs, not gate/util modes (which run once
+     on a single device). */
+  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total);
+  /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
+     enumerate the visible CUDA devices and fan out across them (honours
+     CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
+  if(crackjob && ndev==0 && !device_set){
+    CU(cuInit(0)); int nd=0; cuDeviceGetCount(&nd);
+    if(nd>1){ ndev = nd>16?16:nd; for(int d=0;d<ndev;d++) devs[d]=d;
+      fprintf(stderr,"(auto: %d GPUs detected -> fanning out; use --device N to pin one)\n",ndev); }
+  }
+  /* --devices/--gpus (or the auto-default above): become the fan-out supervisor */
+  if(crackjob && ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
   /* open the deferred CSV now that we know we're an actual cracker, not a supervisor
      (--resume already opened its own append handle, so only open when unset) */
   if(g_loginterval_ms && !g_csv){
