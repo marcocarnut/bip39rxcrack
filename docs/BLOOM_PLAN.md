@@ -159,9 +159,17 @@ more work than the naive one.
    culls and reports the matched xpub + its purpose (`BloomHit` now carries the derive purpose,
    which the address paths also use). Fans out via the contiguous supervisor like `--xpub`.
    Gate `gate/e2e_xpubs.js` (`make xpubs-e2e`).
-3. **`bloom-build` + `--bloom` + the sorted `.cull`** (the "any funded address" mode). Needs
-   an address source (full-node dump) and the on-disk formats.
-4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.
+3. **`--bloom-build` + `--bloom`** — **DONE** (the "any funded address" mode). `.blf` format:
+   `[BlfHeader][filter nblocks*32B][cull n_addrs*32B sorted]`. `--bloom-build IN OUT` reads an
+   address list (one per line), decodes each to its 32-byte program, records the distinct
+   script types, builds the filter, sorts the cull, writes OUT. `--bloom FILE` **mmaps** it
+   (filter → GPU, cull → host bsearch — the cull is paged from disk, never fully loaded, so it
+   scales toward ~1.5e9), works with `--words`/`--template` and fans out over GPUs like
+   `--addresses`; a hit reports the matched hash160 (prebuilt files carry no address strings).
+   `k` is stamped in the header and checked on load. Gate `gate/e2e_bloom_file.js`
+   (`make bloom-e2e`). OPEN: the *address data source* (full-node `dumptxoutset` vs an indexer)
+   and, for the true 1.5e9 build, an external sort (the builder currently sorts in RAM).
+4. (Later) fold the prebuilt `--bloom` into the hive so each box loads/ships its own `.blf`.
 
 ## Mixed script types = multi-PURPOSE derivation — **DONE** (main, multi-purpose derive)
 

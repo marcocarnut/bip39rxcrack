@@ -23,6 +23,9 @@
 #include <stdint.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
 #include <spawn.h>
@@ -590,12 +593,21 @@ typedef void (*prog_cb)(void*ud, unsigned long long swept, unsigned long long ha
  * + 32B taproot). `purposes` is the distinct set of script types to derive under
  * (multi-purpose). NULL/n==0 => single-target (the existing exact-compare path). */
 typedef struct { uint8_t prog[32]; char *str; int purpose; } AEnt;
-typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp; } AddrSet;
+/* Two culling backends: `ent` (in-RAM, keeps address strings; --addresses) OR
+ * `flat` (a sorted 32-byte-record array, e.g. mmap'd from a prebuilt .blf; --bloom).
+ * `prefilter` (when set) is a ready-made filter to upload instead of building one. */
+typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp;
+                 const uint8_t *flat; long flatn;
+                 const uint32_t *prefilter; uint32_t prefilter_nblocks; } AddrSet;
 static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,32); }
+static int prog32_cmp(const void*a,const void*b){ return memcmp(a,b,32); }
 static void aset_sort(AddrSet*A){ qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
-static const AEnt* aset_lookup(const AddrSet*A,const uint8_t*prog){
+static const AEnt* aset_lookup(const AddrSet*A,const uint8_t*prog){   /* only ent-backed carries strings */
+  if(A->flat||!A->ent) return 0;
   AEnt key; memcpy(key.prog,prog,32); return (const AEnt*)bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
-static int aset_member(const AddrSet*A,const uint8_t*prog){ return aset_lookup(A,prog)!=0; }
+static int aset_member(const AddrSet*A,const uint8_t*prog){
+  if(A->flat) return bsearch(prog,A->flat,(size_t)A->flatn,32,prog32_cmp)!=0;
+  return aset_lookup(A,prog)!=0; }
 static void aset_free(AddrSet*A){ if(!A->ent) return; for(long i=0;i<A->n;i++) free(A->ent[i].str); free(A->ent); A->ent=0; }
 
 typedef struct {
@@ -635,20 +647,20 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
   }
   /* bloom target set: build the blocked filter on the host, upload it, and alloc
      the GPU hit buffer. The fused *_bloom kernel probes + appends; the host culls. */
-  if(aset && aset->n>0){
-    X->aset=aset;
-    double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
-    uint32_t nb=bloom_nblocks((uint64_t)aset->n,bpk); X->bloom_mask=nb-1;
-    size_t fbytes=(size_t)nb*8u*4u;                  /* nb blocks * 8 u32 */
-    uint32_t *hf=calloc(fbytes,1);
-    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,X->bloom_mask);
-    X->d_bloom=up(hf,fbytes); free(hf);
+  if(aset && (aset->n>0 || aset->flatn>0)){
+    X->aset=aset; long ntgt=aset->flat?aset->flatn:aset->n; uint32_t nb; size_t fbytes;
+    if(aset->prefilter){ nb=aset->prefilter_nblocks; fbytes=(size_t)nb*8u*4u; X->d_bloom=up(aset->prefilter,fbytes); }
+    else { double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
+      nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
+      uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
+      X->d_bloom=up(hf,fbytes); free(hf); }
+    X->bloom_mask=nb-1;
     X->hitcap=1u<<18;                                /* 262144 hits/chunk */
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
     X->d_hitcnt=up(&z0,4);
     X->bnpurp=aset->npurp; X->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
-            aset->n, (double)fbytes/1048576.0, nb, (double)nb*256.0/(double)aset->n, aset->npurp);
+            ntgt, (double)fbytes/1048576.0, nb, ntgt?(double)nb*256.0/(double)ntgt:0.0, aset->npurp);
   }
   return 0;
 }
@@ -699,7 +711,9 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
   }
   free(hb);
   if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
-    const AEnt*me=aset_lookup(X->aset,best_prog); if(me && out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); }
+    const AEnt*me=aset_lookup(X->aset,best_prog);
+    if(out_addr&&addrsz){ if(me) snprintf(out_addr,(size_t)addrsz,"%s",me->str);
+      else { char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
   return found;
 }
 
@@ -867,17 +881,18 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
   M->dtmpl=up(tmpl,W*sizeof(uint32_t)); M->dtp=up(tprog,32); M->dupos=up(kpos,(kU?kU:1)*sizeof(int));
   unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
   M->dhi=up(&init,8); M->dfound=up(&zero,4); M->dhg=up(0,W*sizeof(uint32_t)); M->dhashed=up(&z0,8); M->dhit_ci=up(hci0,8);
-  if(aset && aset->n>0){    /* bloom target set (same build as crack_addr_setup) */
-    M->aset=aset;
-    double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
-    uint32_t nb=bloom_nblocks((uint64_t)aset->n,bpk); M->bloom_mask=nb-1;
-    size_t fbytes=(size_t)nb*8u*4u; uint32_t *hf=calloc(fbytes,1);
-    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,M->bloom_mask);
-    M->d_bloom=up(hf,fbytes); free(hf);
+  if(aset && (aset->n>0 || aset->flatn>0)){    /* bloom target set (same as crack_addr_setup) */
+    M->aset=aset; long ntgt=aset->flat?aset->flatn:aset->n; uint32_t nb; size_t fbytes;
+    if(aset->prefilter){ nb=aset->prefilter_nblocks; fbytes=(size_t)nb*8u*4u; M->d_bloom=up(aset->prefilter,fbytes); }
+    else { double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
+      nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
+      uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
+      M->d_bloom=up(hf,fbytes); free(hf); }
+    M->bloom_mask=nb-1;
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
     M->bnpurp=aset->npurp; M->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
-            aset->n,(double)fbytes/1048576.0,nb,(double)nb*256.0/(double)aset->n,aset->npurp);
+            ntgt,(double)fbytes/1048576.0,nb,ntgt?(double)nb*256.0/(double)ntgt:0.0,aset->npurp);
   }
   return 0;
 }
@@ -936,7 +951,9 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
   if(found){ CU(cuMemcpyHtoD(M->dtp,best_prog,32));   /* re-derive the winner to get its words */
     uint32_t ci2[2]; crack_missing_sweep_single(M,best,1,0,0,0,0,out_hidx,ci2,out_hg);
     *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
-    const AEnt*me=aset_lookup(M->aset,best_prog); if(me && out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); }
+    const AEnt*me=aset_lookup(M->aset,best_prog);
+    if(out_addr&&addrsz){ if(me) snprintf(out_addr,(size_t)addrsz,"%s",me->str);
+      else { char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
   return found;
 }
 static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
@@ -1515,6 +1532,63 @@ static int build_xpubset(const char*csv,const char*file,AddrSet*A){
   A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86;
   return 0;
 }
+
+/* ---------------- prebuilt bloom file (.blf): build + load ----------------
+ * Layout: [BlfHeader][filter: nblocks*32 B][cull: n_addrs*32 B sorted]. The main
+ * program mmaps it: filter -> GPU, cull -> host bsearch. Scales to ~1.5e9 (the
+ * cull is paged from disk, never fully loaded). */
+#define BLF_MAGIC 0x31464C42u   /* 'B','L','F','1' */
+typedef struct { uint32_t magic,version,nblocks,k,npurp; uint32_t purposes[8]; uint64_t n_addrs,reserved; } BlfHeader;
+
+/* Read addresses (one per line) -> a .blf. Decodes each to its 32-byte (zero-padded)
+   program, records the distinct script types, builds the filter, sorts the cull. */
+static int build_bloom_file(const char*infile,const char*outfile,double bpk){
+  FILE*f=fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
+  uint8_t *progs=0; long n=0,cap=0; uint32_t purposes[8]; int npurp=0; long bad=0;
+  char line[256];
+  while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
+    char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
+    uint8_t pr[32]; int pl,pu; if(decode_address(s,pr,&pl,&pu)){ if(bad<5) fprintf(stderr,"  skip bad address: %s\n",s); bad++; continue; }
+    if(n==cap){ cap=cap?cap*2:(1L<<20); progs=realloc(progs,(size_t)cap*32); if(!progs){ fprintf(stderr,"oom\n"); return 2; } }
+    memset(progs+(size_t)n*32,0,32); memcpy(progs+(size_t)n*32,pr,(size_t)pl); n++;
+    int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
+    if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu; }
+  fclose(f);
+  if(n==0){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
+  qsort(progs,(size_t)n,32,prog32_cmp);
+  uint32_t nb=bloom_nblocks((uint64_t)n,bpk); size_t fbytes=(size_t)nb*32u;
+  uint32_t *filt=calloc(fbytes,1); if(!filt){ fprintf(stderr,"oom (filter %.1f GiB)\n",(double)fbytes/1073741824.0); return 2; }
+  for(long i=0;i<n;i++) bloom_insert(filt,progs+(size_t)i*32,nb-1);
+  FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
+  BlfHeader h; memset(&h,0,sizeof h); h.magic=BLF_MAGIC; h.version=1; h.nblocks=nb; h.k=BLOOM_K; h.npurp=(uint32_t)npurp;
+  for(int i=0;i<npurp;i++) h.purposes[i]=purposes[i];
+  h.n_addrs=(uint64_t)n;
+  fwrite(&h,sizeof h,1,o); fwrite(filt,fbytes,1,o); fwrite(progs,(size_t)n*32,1,o);
+  if(fclose(o)){ fprintf(stderr,"write error %s\n",outfile); return 2; }
+  free(filt); free(progs);
+  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), %u blocks = %.1f MiB filter, %d purpose(s) -> %s (%.1f MiB total)\n",
+          n,bad,nb,(double)fbytes/1048576.0,npurp,outfile,(double)(sizeof h+fbytes+(size_t)n*32)/1048576.0);
+  return 0;
+}
+/* mmap a .blf into an AddrSet (prefilter + flat cull; no strings). */
+static int load_bloom_file(const char*path,AddrSet*A){
+  int fd=open(path,O_RDONLY); if(fd<0){ fprintf(stderr,"cannot open %s\n",path); return 2; }
+  struct stat st; if(fstat(fd,&st)){ close(fd); return 2; } size_t sz=(size_t)st.st_size;
+  void*base=mmap(0,sz,PROT_READ,MAP_SHARED,fd,0); close(fd);
+  if(base==MAP_FAILED){ fprintf(stderr,"mmap %s failed\n",path); return 2; }
+  BlfHeader*h=(BlfHeader*)base;
+  if(h->magic!=BLF_MAGIC){ fprintf(stderr,"%s: not a .blf file\n",path); return 2; }
+  if(h->k!=BLOOM_K){ fprintf(stderr,"%s: k=%u != build k=%d (rebuild)\n",path,h->k,BLOOM_K); return 2; }
+  size_t fbytes=(size_t)h->nblocks*32u;
+  memset(A,0,sizeof *A);
+  A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)); A->prefilter_nblocks=h->nblocks;
+  A->flat=(const uint8_t*)base+sizeof(BlfHeader)+fbytes; A->flatn=(long)h->n_addrs;
+  A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
+  if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
+  fprintf(stderr,"bloom: loaded %s -- %ld addresses, %u blocks (%.1f MiB), %d purpose(s)\n",
+          path,A->flatn,h->nblocks,(double)fbytes/1048576.0,A->npurp);
+  return 0;
+}
 /* xpub SET (words, EC-free): a blocked bloom of account chaincodes; multi-purpose
    derive; host cull; reports the matched xpub + its purpose. Fans out over GPUs via
    the contiguous supervisor (like --xpub). */
@@ -1630,6 +1704,9 @@ static void usage(void){
    "  --addresses-file PATH   ... or one per line. MIXED script types ok (derives each\n"
    "                          candidate under every type present; --purpose overrides the\n"
    "                          set). Works with --words and --template; fans out over GPUs.\n"
+   "  --bloom FILE.blf        load a PREBUILT address bloom (any funded address); like\n"
+   "                          --addresses but from a file (reports the matched hash160)\n"
+   "  --bloom-build IN OUT    build a .blf from an address list IN (one per line) -> OUT\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --xpubs X,.. / --xpubs-file PATH  a SET of account xpubs (chaincode bloom,\n"
    "                          EC-free; tries purposes 44/49/84/86, --purpose overrides)\n"
@@ -1685,6 +1762,7 @@ int main(int argc,char**argv){
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   const char *addresses=0,*addresses_file=0;   /* bloom target set */
   const char *xpubs=0,*xpubs_file=0;            /* xpub (chaincode) bloom set */
+  const char *bloom_file=0,*bbuild_in=0,*bbuild_out=0;  /* prebuilt address bloom */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
@@ -1720,6 +1798,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--addresses-file")&&i+1<argc) addresses_file=argv[++i];
     else if(!strcmp(argv[i],"--xpubs")&&i+1<argc) xpubs=argv[++i];
     else if(!strcmp(argv[i],"--xpubs-file")&&i+1<argc) xpubs_file=argv[++i];
+    else if(!strcmp(argv[i],"--bloom")&&i+1<argc) bloom_file=argv[++i];
+    else if(!strcmp(argv[i],"--bloom-build")&&i+2<argc){ bbuild_in=argv[++i]; bbuild_out=argv[++i]; }
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -1798,8 +1878,8 @@ int main(int argc,char**argv){
   if(g_warm){ build_module(cu); return 0; }
   /* Fan-out applies only to real crack jobs, not gate/util modes (which run once
      on a single device). */
-  int addr_set = (addresses||addresses_file);   /* a bloom target SET */
-  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest);
+  int addr_set = (addresses||addresses_file||bloom_file);   /* a bloom target SET */
+  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest||bbuild_out);
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
      CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
@@ -1825,6 +1905,8 @@ int main(int argc,char**argv){
   }
   /* gate/util modes need no pattern */
   if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
+  if(bbuild_out){ double bbpk=24.0; const char*be=getenv("BLOOM_BPK"); if(be){ double v=atof(be); if(v>=4) bbpk=v; }
+    return build_bloom_file(bbuild_in,bbuild_out,bbpk); }
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);
@@ -1834,9 +1916,11 @@ int main(int argc,char**argv){
   /* Missing-word ([:bip39-en:]) template + address (single) or --addresses (set) */
   if(templ){
     uint8_t prog[32]={0}; int purpose; AddrSet A; const AddrSet*aset=0;
-    if(addresses||addresses_file){ int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
+    if(addresses||addresses_file||bloom_file){ int apu=84;
+      if(bloom_file){ if(load_bloom_file(bloom_file,&A)) return 2; if(A.npurp) apu=(int)A.purposes[0]; }
+      else { if(build_addrset(addresses,addresses_file,&A,&apu)) return 2; }
       if(purpose_set){ A.npurp=npurp>8?8:npurp; for(int k=0;k<A.npurp;k++) A.purposes[k]=purposes[k]; }
-      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; memcpy(prog,A.ent[0].prog,32); }
+      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; if(A.ent) memcpy(prog,A.ent[0].prog,32); }
     else if(address){ int apl,apu; if(decode_address(address,prog,&apl,&apu)) return 2; purpose=purpose_set?(int)purposes[0]:apu; }
     else { fprintf(stderr,"--template needs --address or --addresses\n"); return 2; }
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
@@ -1860,11 +1944,14 @@ int main(int argc,char**argv){
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
-  if(addresses||addresses_file){ AddrSet A; int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
+  if(addresses||addresses_file||bloom_file){ AddrSet A; int apu=84; uint8_t dummy[32]={0};
+    if(bloom_file){ if(load_bloom_file(bloom_file,&A)) return 2; if(A.npurp) apu=(int)A.purposes[0]; }
+    else { if(build_addrset(addresses,addresses_file,&A,&apu)) return 2; }
     if(purpose_set){ A.npurp=npurp>8?8:npurp; for(int k=0;k<A.npurp;k++) A.purposes[k]=purposes[k]; }  /* --purpose overrides the derive set */
+    uint8_t*tp = A.ent?A.ent[0].prog:dummy;
     int purpose = purpose_set?(int)purposes[0]:apu; int rc;
-    if(g_worker) rc=run_worker_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cu,&A);
-    else rc=mode_crack_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);
+    if(g_worker) rc=run_worker_addr(&W,tp,purpose,a_changes,a_gap,require_ck,compact,cu,&A);
+    else rc=mode_crack_addr(&W,tp,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);
     aset_free(&A); return rc; }
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;

@@ -67,6 +67,7 @@ bloom-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_missing.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_mixed.js
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_file.js
 
 # multi-xpub via a chaincode bloom (EC-free): winner xpub among a decoy -> FOUND at rank
 xpubs-e2e: $(CRACK)
