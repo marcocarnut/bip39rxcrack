@@ -584,13 +584,18 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
  * SAME context. mode_crack_addr is just setup + one whole-window sweep + render,
  * so single-GPU behaviour stays byte-identical (gated). */
 typedef void (*prog_cb)(void*ud, unsigned long long swept, unsigned long long hashed);
-/* A set of target programs (bloom mode). progs = n*proglen bytes, SORTED for the
- * exact cull. NULL/n==0 => single-target (the existing exact-compare path). */
-typedef struct { uint8_t *progs; long n; int proglen; } AddrSet;
+/* A set of target programs (bloom mode), SORTED for the exact cull. Each entry
+ * keeps the original address string so a hit can report WHICH address matched.
+ * NULL/n==0 => single-target (the existing exact-compare path). */
+typedef struct { uint8_t prog[32]; char *str; } AEnt;
+typedef struct { AEnt *ent; long n; int proglen; } AddrSet;
 static int g_aset_len=20;
-static int aset_cmp(const void*a,const void*b){ return memcmp(a,b,(size_t)g_aset_len); }
-static void aset_sort(AddrSet*A){ g_aset_len=A->proglen; qsort(A->progs,(size_t)A->n,(size_t)A->proglen,aset_cmp); }
-static int aset_member(const AddrSet*A,const uint8_t*prog){ g_aset_len=A->proglen; return bsearch(prog,A->progs,(size_t)A->n,(size_t)A->proglen,aset_cmp)!=0; }
+static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,(size_t)g_aset_len); }
+static void aset_sort(AddrSet*A){ g_aset_len=A->proglen; qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
+static const char* aset_lookup(const AddrSet*A,const uint8_t*prog){ g_aset_len=A->proglen;
+  AEnt key; memcpy(key.prog,prog,(size_t)A->proglen); AEnt*e=bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); return e?e->str:0; }
+static int aset_member(const AddrSet*A,const uint8_t*prog){ return aset_lookup(A,prog)!=0; }
+static void aset_free(AddrSet*A){ if(!A->ent) return; for(long i=0;i<A->n;i++) free(A->ent[i].str); free(A->ent); A->ent=0; }
 
 typedef struct {
   struct rxe*r; unsigned long long total;
@@ -635,7 +640,7 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
     uint32_t nb=bloom_nblocks((uint64_t)aset->n,bpk); X->bloom_mask=nb-1;
     size_t fbytes=(size_t)nb*8u*4u;                  /* nb blocks * 8 u32 */
     uint32_t *hf=calloc(fbytes,1);
-    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->progs+(size_t)i*aset->proglen,X->bloom_mask);
+    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,X->bloom_mask);
     X->d_bloom=up(hf,fbytes); free(hf);
     X->hitcap=1u<<18;                                /* 262144 hits/chunk */
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
@@ -652,11 +657,11 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
    over that chunk's true hits and stop. */
 static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned long long count,
                                   double intv,int reporting,prog_cb cb,void*ud,
-                                  unsigned long long*out_idx,uint32_t out_ci[2]){
+                                  unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz){
   int rck=X->require_ck, n=X->n, size=X->size;
   unsigned long long z0=0; CU(cuMemcpyHtoD(X->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
-  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0};
+  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
   BloomHit *hb=malloc((size_t)X->hitcap*sizeof(BloomHit));
   CUfunction kf=kern("g_crack_addr_bloom");
   for(cstart=start; cstart<start+count; ){
@@ -671,7 +676,7 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
       unsigned int nc=hc>X->hitcap?X->hitcap:hc;
       CU(cuMemcpyDtoH(hb,X->d_hits,(size_t)nc*sizeof(BloomHit)));
       for(unsigned int i=0;i<nc;i++) if(aset_member(X->aset,hb[i].prog)){
-        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; } }
+        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; memcpy(best_prog,hb[i].prog,32); } }
       if(hc>X->hitcap) fprintf(stderr,"  (bloom hit-buffer overflow %u>%u; raise it if this recurs)\n",hc,X->hitcap);
     }
     CU(cuMemcpyDtoH(&hashed,X->dhashed,8)); if(cb) cb(ud,swept,rck?hashed:swept);
@@ -679,7 +684,8 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
     chunk=next_chunk(ccount,csecs,intv,reporting);
   }
   free(hb);
-  if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; }
+  if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
+    if(out_addr&&addrsz){ const char*ma=aset_lookup(X->aset,best_prog); snprintf(out_addr,(size_t)addrsz,"%s",ma?ma:""); } }
   return found;
 }
 
@@ -687,8 +693,9 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
    *out_idx + out_ci[2]), 0 if not. Streams progress via cb (nullable). */
 static int crack_addr_sweep(CrackCtx*X,unsigned long long start,unsigned long long count,
                             double intv,int reporting,prog_cb cb,void*ud,
-                            unsigned long long*out_idx,uint32_t out_ci[2]){
-  if(X->d_bloom) return crack_addr_sweep_bloom(X,start,count,intv,reporting,cb,ud,out_idx,out_ci);
+                            unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz){
+  if(out_addr&&addrsz) out_addr[0]=0;
+  if(X->d_bloom) return crack_addr_sweep_bloom(X,start,count,intv,reporting,cb,ud,out_idx,out_ci,out_addr,addrsz);
   unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
   CU(cuMemcpyHtoD(X->dhi,&init,8)); CU(cuMemcpyHtoD(X->dfound,&zero,4));
   CU(cuMemcpyHtoD(X->dhashed,&z0,8)); CU(cuMemcpyHtoD(X->dhit_ci,hci0,8));
@@ -747,8 +754,8 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
     fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates, buffer %llu MiB -> %s ...\n",count,X.C*8/1024/1024,path); }
   else { prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
     fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path); }
-  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0};
-  int found=crack_addr_sweep(&X,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci);
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0}; char maddr[100]="";
+  int found=crack_addr_sweep(&X,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,maddr,sizeof maddr);
   if(found<0) return 2;
   double secs=now_s()-tt0;
   fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (%s%s)\n",
@@ -760,6 +767,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
   prog_finish(&P,"FOUND",t,fpath);
   printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : %s\n",hidx,t,fpath);
+  if(maddr[0]) printf("  address : %s\n",maddr);
   mpz_clear(j); return 0;
 }
 
@@ -850,7 +858,7 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
     double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
     uint32_t nb=bloom_nblocks((uint64_t)aset->n,bpk); M->bloom_mask=nb-1;
     size_t fbytes=(size_t)nb*8u*4u; uint32_t *hf=calloc(fbytes,1);
-    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->progs+(size_t)i*aset->proglen,M->bloom_mask);
+    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,M->bloom_mask);
     M->d_bloom=up(hf,fbytes); free(hf);
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
     fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), cull on host\n",
@@ -883,7 +891,8 @@ static int crack_missing_sweep_single(MissCtx*M,unsigned long long start,unsigne
    chunk. On a culled-true hit we re-derive that ONE index single-target (target =
    the hit's program) to recover the word array for rendering. */
 static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
-                               prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32]){
+                               prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32],
+                               char*out_addr,int addrsz){
   unsigned long long z0=0; CU(cuMemcpyHtoD(M->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=rep?report_chunk(1):(64ULL<<20);
   int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
@@ -911,12 +920,15 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
   free(hb);
   if(found){ CU(cuMemcpyHtoD(M->dtp,best_prog,32));   /* re-derive the winner to get its words */
     uint32_t ci2[2]; crack_missing_sweep_single(M,best,1,0,0,0,0,out_hidx,ci2,out_hg);
-    *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; }
+    *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
+    if(out_addr&&addrsz){ const char*ma=aset_lookup(M->aset,best_prog); snprintf(out_addr,(size_t)addrsz,"%s",ma?ma:""); } }
   return found;
 }
 static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
-                               prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32]){
-  if(M->d_bloom) return crack_missing_sweep_bloom(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg);
+                               prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32],
+                               char*out_addr,int addrsz){
+  if(out_addr&&addrsz) out_addr[0]=0;
+  if(M->d_bloom) return crack_missing_sweep_bloom(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg,out_addr,addrsz);
   return crack_missing_sweep_single(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg);
 }
 static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
@@ -942,8 +954,8 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   double intv=prog_intv(&P);
   fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
           M.nth?"[:Nth:] CONSTRUCTION":"baseline sieve", M.W, M.U, M.nth?" (last=checksum-constructed)":"", count, path);
-  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0},hg[32];
-  int found=crack_missing_sweep(&M,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,hg);
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0},hg[32]; char maddr[100]="";
+  int found=crack_missing_sweep(&M,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,hg,maddr,sizeof maddr);
   if(found<0) return 2;
   double secs=now_s()-tt0;
   fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s%s)\n",P.swept,secs,secs>0?P.swept/secs/1e6:0.0,
@@ -958,6 +970,7 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   for(int p=0;p<M.W;p++) printf(" %s",WLNAME((int)hg[p]));
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
   printf("\n  path     : %s\n",fpath);
+  if(maddr[0]) printf("  address  : %s\n",maddr);
   { char fw[256]; int L=0; for(int i=0;i<M.U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[M.upos[i]])); prog_finish(&P,"FOUND",fw,fpath); }
   return 0;
 }
@@ -1133,21 +1146,22 @@ static void worker_prog_cb(void*ud,unsigned long long swept,unsigned long long h
 /* A Sweeper adapts a mode's setup/sweep to the worker: sweep a shard and, on a
    hit, hand back the GLOBAL canonical index, change/index, and the mnemonic. */
 typedef int (*sweep_fn)(void*ctx,unsigned long long start,unsigned long long count,double intv,int rep,
-                        prog_cb cb,void*ud,unsigned long long*out_idx,uint32_t out_ci[2],char*out_mn,int mnsz);
-typedef struct { sweep_fn sweep; void*ctx; unsigned long long total; } Sweeper;
+                        prog_cb cb,void*ud,unsigned long long*out_idx,uint32_t out_ci[2],char*out_mn,int mnsz,
+                        char*out_addr,int addrsz);
+typedef struct { sweep_fn sweep; void*ctx; unsigned long long total; int purpose; } Sweeper;
 static int wq_sweep_addr(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
-                         unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz){
+                         unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz){
   CrackCtx*X=c; uint32_t ci[2]; unsigned long long hidx=0;
-  int f=crack_addr_sweep(X,s,n,intv,rep,cb,ud,&hidx,ci);
+  int f=crack_addr_sweep(X,s,n,intv,rep,cb,ud,&hidx,ci,addr,addrsz);
   if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1];
     mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X->r,j); char b[MN_STRIDE]; rxe_current(b,sizeof b,X->r);
     char*t=b; while(*t==' ')t++; snprintf(mn,mnsz,"%s",t); mpz_clear(j); }
   return f;
 }
 static int wq_sweep_missing(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
-                            unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz){
+                            unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz){
   MissCtx*M=c; uint32_t ci[2],hg[32]; unsigned long long hidx=0;
-  int f=crack_missing_sweep(M,s,n,intv,rep,cb,ud,&hidx,ci,hg);
+  int f=crack_missing_sweep(M,s,n,intv,rep,cb,ud,&hidx,ci,hg,addr,addrsz);
   if(f>0){ *oi = M->nth ? ((hidx>>M->freebits)*2048ULL + hg[M->W-1]) : hidx; oc[0]=ci[0]; oc[1]=ci[1];
     int L=0; for(int p=0;p<M->W;p++) L+=snprintf(mn+L,mnsz-L,"%s%s",p?" ":"",WLNAME((int)hg[p])); }
   return f;
@@ -1163,10 +1177,10 @@ static int run_worker(Sweeper*S){
     if(s>S->total) s=S->total;
     if(s+c>S->total) c=S->total-s;
     wp.id=id; wp.cur_swept=0; wp.cur_hashed=0;
-    unsigned long long oi=0; uint32_t oc[2]={0,0}; char mn[512]="";
-    int f=S->sweep(S->ctx,s,c,0.3,1,worker_prog_cb,&wp,&oi,oc,mn,sizeof mn);
+    unsigned long long oi=0; uint32_t oc[2]={0,0}; char mn[512]=""; char addr[100]="";
+    int f=S->sweep(S->ctx,s,c,0.3,1,worker_prog_cb,&wp,&oi,oc,mn,sizeof mn,addr,sizeof addr);
     if(f<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
-    if(f){ printf("FOUND %llu %llu %u %u %s\n",id,oi,oc[0],oc[1],mn); fflush(stdout); }
+    if(f){ printf("FOUND %llu %llu %d %u %u %s %s\n",id,oi,S->purpose,oc[0],oc[1],addr[0]?addr:"-",mn); fflush(stdout); }
     else { /* whole shard swept: bank its full candidate count, emit a final PROG, then DONE */
       wp.base_swept+=c; wp.base_hashed+=wp.cur_hashed;
       printf("PROG %llu %llu %llu\nDONE %llu\n",id,wp.base_swept,wp.base_hashed,id); fflush(stdout); }
@@ -1176,12 +1190,12 @@ static int run_worker(Sweeper*S){
 static int run_worker_addr(const Words*W,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
                            int require_ck,int compact,const char*cu,const AddrSet*aset){
   CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu,aset)) return 2;
-  Sweeper S={wq_sweep_addr,&X,X.total}; return run_worker(&S);
+  Sweeper S={wq_sweep_addr,&X,X.total,purpose}; return run_worker(&S);
 }
 static int run_worker_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
                               int nthmode,const char*cu,const AddrSet*aset){
   MissCtx M; if(crack_missing_setup(&M,tpl,tprog,purpose,changes,gap,nthmode,cu,aset)) return 2;
-  Sweeper S={wq_sweep_missing,&M,M.total}; return run_worker(&S);
+  Sweeper S={wq_sweep_missing,&M,M.total,purpose}; return run_worker(&S);
 }
 
 /* ---------------------- multi-GPU fan-out supervisor ----------------------
@@ -1370,7 +1384,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   /* queue state: next unclaimed order[] slot + a re-queue stack for dead workers */
   long next=0; long*requeue=malloc((size_t)nshards*sizeof(long)); long rq=0;
   #define NEXT_SHARD() (rq>0 ? requeue[--rq] : (next<nshards ? order[next++] : -1))
-  int found=0; unsigned long long win_idx=0; uint32_t win_ci[2]={0,0}; char win_mn[512]="";
+  int found=0; unsigned long long win_idx=0; uint32_t win_ci[2]={0,0}; char win_mn[512]=""; int win_purpose=0; char win_addr[100]="";
   int winner_dev=-1;
   double t0=now_s(), last_print=0, last_rate_t=t0; unsigned long long last_rate_sum=0;
 
@@ -1411,7 +1425,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
             if(s<0){ w->shard=-1; dprintf(w->wfd,"STOP\n"); }
             else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss;
               dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
-          else if(sscanf(ln,"FOUND %llu %llu %u %u %479[^\n]",&id,&win_idx,&win_ci[0],&win_ci[1],mn)>=5){
+          else if(sscanf(ln,"FOUND %llu %llu %d %u %u %99s %479[^\n]",&id,&win_idx,&win_purpose,&win_ci[0],&win_ci[1],win_addr,mn)>=7){
             found=1; winner_dev=map[p]; snprintf(win_mn,sizeof win_mn,"%s",mn); break; }
           else if(sscanf(ln,"ERROR %llu",&id)==1){ long s=NEXT_SHARD();   /* shard failed: re-hand a new one */
             if(s<0){ w->shard=-1; } else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss; dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
@@ -1440,7 +1454,8 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   if(found){
     char fpath[80]; snprintf(fpath,sizeof fpath,"m/?'/0'/0'/%u/%u",win_ci[0],win_ci[1]);
     fprintf(stderr,"workqueue: device %d found it.\n",winner_dev);
-    printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : change/index %u/%u\n",win_idx,win_mn,win_ci[0],win_ci[1]);
+    printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : m/%d'/0'/0'/%u/%u\n",win_idx,win_mn,win_purpose,win_ci[0],win_ci[1]);
+    if(win_addr[0] && strcmp(win_addr,"-")) printf("  address : %s\n",win_addr);
     return 0;
   }
   printf("NOT FOUND\n"); return 1;
@@ -1456,12 +1471,12 @@ static int build_addrset(const char*csv,const char*file,AddrSet*A,int*purpose_ou
     char line[256]; while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
       char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(*s) ADDR_PUSH(s); } fclose(f); }
   if(na==0){ fprintf(stderr,"--addresses: no addresses given\n"); return 2; }
-  int proglen=-1,purpose=-1; uint8_t *progs=malloc((size_t)na*32);
+  int proglen=-1,purpose=-1; AEnt *ent=malloc((size_t)na*sizeof(AEnt));
   for(long i=0;i<na;i++){ uint8_t pr[32]; int pl,pu; if(decode_address(addrs[i],pr,&pl,&pu)){ fprintf(stderr,"--addresses: bad address '%s'\n",addrs[i]); return 2; }
     if(proglen<0){ proglen=pl; purpose=pu; } else if(pl!=proglen||pu!=purpose){ fprintf(stderr,"--addresses: all targets must share one script type (v1); '%s' differs\n",addrs[i]); return 2; }
-    memcpy(progs+(size_t)i*proglen,pr,(size_t)proglen); free(addrs[i]); }
+    memset(ent[i].prog,0,32); memcpy(ent[i].prog,pr,(size_t)proglen); ent[i].str=addrs[i]; }
   free(addrs);
-  A->progs=progs; A->n=na; A->proglen=proglen; aset_sort(A); *purpose_out=purpose;
+  A->ent=ent; A->n=na; A->proglen=proglen; aset_sort(A); *purpose_out=purpose;
   return 0;
 }
 /* Host-only: validate the blocked-bloom construction empirically -- build a
@@ -1719,14 +1734,14 @@ int main(int argc,char**argv){
   if(templ){
     uint8_t prog[32]={0}; int purpose; AddrSet A; const AddrSet*aset=0;
     if(addresses||addresses_file){ int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
-      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; memcpy(prog,A.progs,(size_t)A.proglen); }
+      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; memcpy(prog,A.ent[0].prog,(size_t)A.proglen); }
     else if(address){ int apl,apu; if(decode_address(address,prog,&apl,&apu)) return 2; purpose=purpose_set?(int)purposes[0]:apu; }
     else { fprintf(stderr,"--template needs --address or --addresses\n"); return 2; }
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
     int rc;
     if(g_worker) rc=run_worker_missing(templ,prog,purpose,a_changes,a_gap,nthmode,cu,aset);
     else rc=mode_missing(templ,prog,purpose,a_changes,a_gap,nthmode,cstart,ccount,cu,aset);
-    if(aset) free(A.progs);
+    if(aset) aset_free(&A);
     return rc;
   }
   /* Regime A: fixed mnemonic + passphrase [0-9]{N} + address target */
@@ -1745,9 +1760,9 @@ int main(int argc,char**argv){
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(addresses||addresses_file){ AddrSet A; int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
     int purpose = purpose_set?(int)purposes[0]:apu; int rc;
-    if(g_worker) rc=run_worker_addr(&W,A.progs,purpose,a_changes,a_gap,require_ck,compact,cu,&A);
-    else rc=mode_crack_addr(&W,A.progs,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);
-    free(A.progs); return rc; }
+    if(g_worker) rc=run_worker_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cu,&A);
+    else rc=mode_crack_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);
+    aset_free(&A); return rc; }
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
     if(g_worker) return run_worker_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu,0);
