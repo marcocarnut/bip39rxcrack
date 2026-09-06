@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <spawn.h>
+#include <poll.h>
 #include <errno.h>
 #include <ctype.h>
 #include <gmp.h>
@@ -987,20 +988,23 @@ static int run_worker(const Words*W,const uint8_t tprog[32],int purpose,uint32_t
   CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu)) return 2;
   printf("READY %s dev%d kern=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,X.total); fflush(stdout);
   char line[512];
+  WorkerProg wp={0};   /* cumulative across ALL this worker's shards (base) + in-flight (cur) */
   while(fgets(line,sizeof line,stdin)){
     if(!strncmp(line,"STOP",4)) break;
     unsigned long long id,s,c;
     if(sscanf(line,"SHARD %llu %llu %llu",&id,&s,&c)!=3) continue;
     if(s>X.total) s=X.total;
     if(s+c>X.total) c=X.total-s;
-    WorkerProg wp={0}; wp.id=id;
+    wp.id=id; wp.cur_swept=0; wp.cur_hashed=0;
     unsigned long long hidx=0; uint32_t hci[2]={0,0};
     int found=crack_addr_sweep(&X,s,c,0.3,1,worker_prog_cb,&wp,&hidx,hci);
     if(found<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
     if(found){ mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X.r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,X.r);
       char*t=buf; while(*t==' ')t++;
       printf("FOUND %llu %llu %u %u %s\n",id,hidx,hci[0],hci[1],t); fflush(stdout); mpz_clear(j); }
-    else { printf("DONE %llu\n",id); fflush(stdout); }
+    else { /* whole shard swept: bank its full candidate count, emit a final PROG, then DONE */
+      wp.base_swept+=c; wp.base_hashed+=wp.cur_hashed;
+      printf("PROG %llu %llu %llu\nDONE %llu\n",id,wp.base_swept,wp.base_hashed,id); fflush(stdout); }
   }
   return 0;
 }
@@ -1022,8 +1026,8 @@ static char**child_argv(int argc,char**argv,char*const*extra,int nextra){
   for(int i=0;i<argc;i++){
     if(!strcmp(argv[i],"--devices")||!strcmp(argv[i],"--gpus")||!strcmp(argv[i],"--device")||
        !strcmp(argv[i],"--start")||!strcmp(argv[i],"--count")||!strcmp(argv[i],"--limit")||
-       !strcmp(argv[i],"--loginterval")){ i++; continue; }   /* drop flag + its value */
-    if(!strcmp(argv[i],"--print-total")||!strcmp(argv[i],"--warm")) continue;
+       !strcmp(argv[i],"--loginterval")||!strcmp(argv[i],"--shards")||!strcmp(argv[i],"--order")){ i++; continue; }   /* drop flag + its value */
+    if(!strcmp(argv[i],"--print-total")||!strcmp(argv[i],"--warm")||!strcmp(argv[i],"--worker")||!strcmp(argv[i],"--devtag")) continue;
     out[o++]=argv[i];
   }
   for(int i=0;i<nextra;i++) out[o++]=extra[i];
@@ -1119,6 +1123,153 @@ static int run_supervisor(int argc,char**argv,int*devs,int ndev,
   if(err){ fprintf(stderr,"supervisor: a child errored; result inconclusive.\n"); return 2; }
   fprintf(stderr,"supervisor: NOT FOUND across all %d slice(s).\n",ndev); return 1;
 }
+
+/* ------------------- work-queue supervisor (fine shards) -------------------
+ * Owns a queue of fine shards handed out in a policy order; persistent --worker
+ * processes pull shards, stream PROG, report DONE/FOUND. First FOUND wins ->
+ * STOP all. A worker that dies (EOF) has its in-flight shard re-queued. The
+ * supervisor prints ONE consolidated live line summing all workers. */
+static const char*ORDER_NAMES[]={"first","ends","center","random"};
+static void build_order(int policy,long n,long*out,unsigned long long seed){
+  if(policy==1){ long lo=0,hi=n-1,k=0; while(lo<=hi){ out[k++]=lo++; if(lo<=hi) out[k++]=hi--; } }
+  else if(policy==2){ long c=n/2,k=0; out[k++]=c; for(long off=1;k<n;off++){ if(c-off>=0)out[k++]=c-off; if(k<n&&c+off<n)out[k++]=c+off; } }
+  else if(policy==3){ for(long i=0;i<n;i++) out[i]=i;
+    unsigned long long r=seed?seed:88172645463325252ULL;
+    for(long i=n-1;i>0;i--){ r^=r<<13;r^=r>>7;r^=r<<17; long j=(long)(r%(unsigned long long)(i+1)); long t=out[i];out[i]=out[j];out[j]=t; } }
+  else { for(long i=0;i<n;i++) out[i]=i; }   /* 0 = first-to-last */
+}
+typedef struct { pid_t pid; int wfd,rfd,alive,ready; long shard;
+  unsigned long long swept,hashed; char buf[8192]; int blen; } Wrk;
+static int run_workqueue(int argc,char**argv,int*devs,int ndev,
+                         unsigned long long ostart,unsigned long long ocount,
+                         int order_policy,unsigned long long order_seed,long nshards_arg){
+  /* 1) total (no-GPU child) + 2) warm the PTX cache once */
+  char*pt[]={"--print-total"}; char**ptv=child_argv(argc,argv,pt,1);
+  char nbuf[64]; if(run_capture(ptv,nbuf,sizeof nbuf)){ fprintf(stderr,"workqueue: could not compute total\n"); free(ptv); return 2; }
+  free(ptv); unsigned long long total=strtoull(nbuf,0,10);
+  if(!total){ fprintf(stderr,"workqueue: total is 0\n"); return 2; }
+  if(ostart>total) ostart=total;
+  unsigned long long owin=ocount?ocount:(total-ostart);
+  if(ostart+owin>total) owin=total-ostart;
+  if(owin==0){ fprintf(stderr,"workqueue: empty window\n"); return 1; }
+  char dv0[16]; snprintf(dv0,sizeof dv0,"%d",devs[0]);
+  char*we[]={"--warm","--device",dv0}; char**wv=child_argv(argc,argv,we,3);
+  { pid_t wp; if(!posix_spawn(&wp,"/proc/self/exe",0,0,wv,environ)){ int st; waitpid(wp,&st,0);
+      if(!(WIFEXITED(st)&&WEXITSTATUS(st)==0)){ fprintf(stderr,"workqueue: warm build failed\n"); free(wv); return 2; } } }
+  free(wv);
+
+  /* 3) shard plan: ~8M candidates/shard by default (or --shards N) */
+  unsigned long long SHARD_CAND=8ULL<<20;
+  long nshards = nshards_arg>0 ? nshards_arg : (long)((owin+SHARD_CAND-1)/SHARD_CAND);
+  if(nshards<ndev) nshards=ndev;
+  if(nshards<1) nshards=1;
+  if(nshards>4000000) nshards=4000000;
+  unsigned long long ss=(owin+nshards-1)/nshards; nshards=(long)((owin+ss-1)/ss);
+  long*order=malloc((size_t)nshards*sizeof(long)); build_order(order_policy,nshards,order,order_seed);
+  fprintf(stderr,"workqueue: total=%llu window=[%llu,%llu) shards=%ld (~%llu each) order=%s across %d GPU(s)\n",
+    total,ostart,ostart+owin,nshards,ss,ORDER_NAMES[order_policy],ndev);
+
+  /* 4) spawn workers, each on a stdin/stdout pipe pair */
+  Wrk W[16]; int nw=0; pid_t pgid=0;
+  for(int d=0; d<ndev; d++){
+    int tw[2],fw[2]; if(pipe(tw)||pipe(fw)){ fprintf(stderr,"workqueue: pipe failed\n"); return 2; }
+    char dv[16]; snprintf(dv,sizeof dv,"%d",devs[d]);
+    char*extra[3]={"--worker","--device",dv}; char**cv=child_argv(argc,argv,extra,3);
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa,tw[0],0); posix_spawn_file_actions_adddup2(&fa,fw[1],1);
+    posix_spawn_file_actions_addclose(&fa,tw[1]); posix_spawn_file_actions_addclose(&fa,fw[0]);
+    posix_spawn_file_actions_addclose(&fa,tw[0]); posix_spawn_file_actions_addclose(&fa,fw[1]);
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at,POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at,pgid);
+    pid_t pid; int rc=posix_spawn(&pid,"/proc/self/exe",&fa,&at,cv,environ);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at); free(cv);
+    close(tw[0]); close(fw[1]);
+    if(rc){ fprintf(stderr,"workqueue: spawn dev %d failed: %s\n",devs[d],strerror(rc)); close(tw[1]); close(fw[0]); continue; }
+    if(!pgid){ pgid=pid; g_sup_pgid=pgid; }
+    memset(&W[nw],0,sizeof W[nw]); W[nw].pid=pid; W[nw].wfd=tw[1]; W[nw].rfd=fw[0]; W[nw].alive=1; W[nw].shard=-1; nw++;
+  }
+  if(nw==0){ fprintf(stderr,"workqueue: no workers\n"); free(order); return 2; }
+  signal(SIGINT,sup_sigint); signal(SIGTERM,sup_sigint);
+  signal(SIGPIPE,SIG_IGN);   /* a dead worker's pipe write must not kill the supervisor */
+
+  /* queue state: next unclaimed order[] slot + a re-queue stack for dead workers */
+  long next=0; long*requeue=malloc((size_t)nshards*sizeof(long)); long rq=0;
+  #define NEXT_SHARD() (rq>0 ? requeue[--rq] : (next<nshards ? order[next++] : -1))
+  int found=0; unsigned long long win_idx=0; uint32_t win_ci[2]={0,0}; char win_mn[512]="";
+  int winner_dev=-1;
+  double t0=now_s(), last_print=0, last_rate_t=t0; unsigned long long last_rate_sum=0;
+
+  /* assign each ready worker its first shard as soon as READY arrives (below) */
+  for(;;){
+    /* termination: found, or no shards left and every worker idle */
+    int outstanding=0; for(int i=0;i<nw;i++) if(W[i].alive&&W[i].shard>=0) outstanding++;
+    int any_alive=0; for(int i=0;i<nw;i++) if(W[i].alive) any_alive++;
+    if(found) break;
+    if(!any_alive) break;
+    if(rq==0 && next>=nshards && outstanding==0) break;   /* NOT FOUND: queue drained */
+
+    struct pollfd pfd[16]; int map[16],np=0;
+    for(int i=0;i<nw;i++) if(W[i].alive){ pfd[np].fd=W[i].rfd; pfd[np].events=POLLIN; map[np]=i; np++; }
+    int pr=poll(pfd,np,250);
+    if(pr<0){ if(errno==EINTR) continue; break; }
+    for(int p=0;p<np && !found;p++){
+      if(!(pfd[p].revents&(POLLIN|POLLHUP|POLLERR))) continue;
+      Wrk*w=&W[map[p]];
+      int n=read(w->rfd,w->buf+w->blen,sizeof w->buf-1-w->blen);
+      if(n<=0){ /* worker died: re-queue its in-flight shard */
+        w->alive=0; close(w->rfd); close(w->wfd);
+        if(w->shard>=0){ requeue[rq++]=w->shard; w->shard=-1;
+          fprintf(stderr,"workqueue: worker dev%d died -> re-queued shard\n",map[p]); }
+        continue;
+      }
+      w->blen+=n; w->buf[w->blen]=0;
+      char*ln=w->buf, *nl;
+      while((nl=strchr(ln,'\n'))){
+        *nl=0;
+        if(!strncmp(ln,"READY",5)){ long s=NEXT_SHARD();
+          if(s<0){ dprintf(w->wfd,"STOP\n"); }
+          else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss;
+            dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
+        else { unsigned long long id,a,b; char mn[480];
+          if(sscanf(ln,"PROG %llu %llu %llu",&id,&a,&b)==3){ w->swept=a; w->hashed=b; }
+          else if(sscanf(ln,"DONE %llu",&id)==1){ long s=NEXT_SHARD();
+            if(s<0){ w->shard=-1; dprintf(w->wfd,"STOP\n"); }
+            else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss;
+              dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
+          else if(sscanf(ln,"FOUND %llu %llu %u %u %479[^\n]",&id,&win_idx,&win_ci[0],&win_ci[1],mn)>=5){
+            found=1; winner_dev=map[p]; snprintf(win_mn,sizeof win_mn,"%s",mn); break; }
+          else if(sscanf(ln,"ERROR %llu",&id)==1){ long s=NEXT_SHARD();   /* shard failed: re-hand a new one */
+            if(s<0){ w->shard=-1; } else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss; dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
+        }
+        ln=nl+1;
+      }
+      w->blen-=(int)(ln-w->buf); memmove(w->buf,ln,w->blen); w->buf[w->blen]=0;
+    }
+    /* consolidated live line (supervisor owns it) */
+    if(g_pflag){ double now=now_s();
+      if(now-last_print>=(g_p_secs>0?g_p_secs:1.0)){
+        unsigned long long sw=0,ha=0; for(int i=0;i<nw;i++){ sw+=W[i].swept; ha+=W[i].hashed; }
+        double dt=now-last_rate_t; double rate=dt>0?(double)(sw-last_rate_sum)/dt/1e6:0;
+        last_rate_t=now; last_rate_sum=sw; last_print=now;
+        double pct=owin?100.0*sw/owin:0, eta=(rate>0&&owin>sw)?(owin-sw)/(rate*1e6):0;
+        int live=0; for(int i=0;i<nw;i++) if(W[i].alive) live++;
+        fprintf(stderr,"\r[%6.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.1fM  ETA %.0fs  %dgpu   ",
+          now-t0, sw/1e6, owin/1e6, pct, rate, ha/1e6, eta, live); fflush(stderr); }
+    }
+  }
+  if(g_pflag) fprintf(stderr,"\n");
+  for(int i=0;i<nw;i++) if(W[i].alive) dprintf(W[i].wfd,"STOP\n");
+  if(pgid) killpg(pgid,SIGTERM);
+  while(waitpid(-1,0,0)>0 || errno==EINTR){ if(errno==EINTR) continue; }
+  free(order); free(requeue);
+  if(found){
+    char fpath[80]; snprintf(fpath,sizeof fpath,"m/?'/0'/0'/%u/%u",win_ci[0],win_ci[1]);
+    fprintf(stderr,"workqueue: device %d found it.\n",winner_dev);
+    printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : change/index %u/%u\n",win_idx,win_mn,win_ci[0],win_ci[1]);
+    return 0;
+  }
+  printf("NOT FOUND\n"); return 1;
+}
 static void usage(void){
   fprintf(stderr,
    "bip39rxcrack -- CUDA BIP39 seed cracker (GPU self-enumerate)\n"
@@ -1184,6 +1335,7 @@ int main(int argc,char**argv){
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
+  int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -1226,6 +1378,10 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--print-total")) g_print_total=1;
     else if(!strcmp(argv[i],"--warm")) g_warm=1;
     else if(!strcmp(argv[i],"--worker")) g_worker=1;
+    else if(!strcmp(argv[i],"--shards")&&i+1<argc) nshards_arg=atol(argv[++i]);
+    else if(!strcmp(argv[i],"--order")&&i+1<argc){ char*o=argv[++i]; char*colon=strchr(o,':'); if(colon){*colon=0; order_seed=strtoull(colon+1,0,10);}
+      if(!strcmp(o,"first"))order_policy=0; else if(!strcmp(o,"ends"))order_policy=1; else if(!strcmp(o,"center"))order_policy=2; else if(!strcmp(o,"random"))order_policy=3;
+      else { fprintf(stderr,"--order: first|ends|center|random[:seed], got '%s'\n",o); return 2; } order_given=1; }
     else if(!strcmp(argv[i],"--devtag")) g_devtag=1;
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
@@ -1293,8 +1449,14 @@ int main(int argc,char**argv){
     if(nd>1){ ndev = nd>16?16:nd; for(int d=0;d<ndev;d++) devs[d]=d;
       fprintf(stderr,"(auto: %d GPUs detected -> fanning out; use --device N to pin one)\n",ndev); }
   }
-  /* --devices/--gpus (or the auto-default above): become the fan-out supervisor */
-  if(crackjob && ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
+  /* Route crack jobs to a multi-GPU driver. The address-words path has a
+     persistent-worker WORK-QUEUE (fine shards + ordering + consolidated stats);
+     other modes still use the contiguous supervisor until they get setup/sweep. */
+  if(crackjob && (ndev>0 || order_given || nshards_arg>0)){
+    if(address && words && !templ){ int nd=ndev>0?ndev:1; if(ndev==0) devs[0]=g_device;
+      return run_workqueue(argc,argv,devs,nd,cstart,ccount,order_policy,order_seed,nshards_arg); }
+    if(ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
+  }
   /* open the deferred CSV now that we know we're an actual cracker, not a supervisor
      (--resume already opened its own append handle, so only open when unset) */
   if(g_loginterval_ms && !g_csv){
