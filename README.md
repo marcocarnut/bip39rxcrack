@@ -151,31 +151,44 @@ Measured on 1× RTX 5090 (native sm_120), correctness-only kernels:
 
 | run | rate |
 |-----|------|
-| words, checksum-ON — compaction, dense PBKDF2 (default) | **~10.6 Mcand/s** |
-| words, checksum-ON — fused sieve→PBKDF2 (`--no-compact`) | ~1.17 Mcand/s |
-| passphrase (every candidate: PBKDF2 + full derive + EC) | ~0.67 Mcand/s (p2wpkh) |
-| PBKDF2 seed rate | ~0.69 Mseed/s |
+| words, checksum-ON — compaction, dense PBKDF2 (default) | **~20.9 Mcand/s** |
+| words, checksum-ON — fused sieve→PBKDF2 (`--no-compact`) | ~1.61 Mcand/s |
+| passphrase (every candidate: PBKDF2 + full derive + EC) | ~1.38 Mcand/s |
+| PBKDF2 seed rate (dense) | ~1.4 Mseed/s |
 
-The full 479M-permutation example recovers in **~46 s** by default (411 s with
+Multi-address scans cost more EC per seed: a 24-word `[:Nth:]` run does **~1.40
+Mcand/s at `--gap 1`** and **~1.18 Mcand/s at `--gap 5`** (five address derivations
+per candidate).
+
+The full 479M-permutation example recovers in **~23 s** by default (~5 min with
 `--no-compact`); with an actual winner it early-exits far sooner. A `[0-9]{7}`
-(10M) passphrase deep-winner is found in ~15 s.
+(10M) passphrase deep-winner is found in ~7 s.
 
-**What moves the needle:** the tool is **PBKDF2-bound**, not EC-bound — the EC-free
-(xpub) and with-EC (address) per-candidate rates are nearly identical. The two
-biggest wins reflect that:
+**What moves the needle:** at `--gap 1` the tool is **PBKDF2-bound** (SHA-512
+dominates); at `--gap > 1` the extra secp256k1 derivations per seed make EC a real
+factor too. The biggest wins, in order:
 
-- **A fixed-block HMAC** that builds each SHA-512 block straight from the ipad/opad
-  midstate (the general streaming path was padding one byte at a time): ~2.2×.
-- **Stream compaction** de-diverging the checksum-sieved path: 9.1× on the
-  permutation sweep, because the fused kernel wasted most PBKDF2 lanes on the
-  ~15/16 candidates that fail the checksum.
+- **Unrolled SHA-512 with a register-resident 16-word schedule** (~1.83×). The full
+  `w[80]` message schedule was indexed by a runtime loop counter, so it lived in
+  local memory; fully unrolling the 80 rounds makes every `w[i&15]` a compile-time
+  index (registers, no spill) and exposes instruction-level parallelism. Counter-
+  intuitively this is an **ILP** win, not occupancy: forcing higher occupancy (fewer
+  registers) actually *slowed* the kernel — a serial-dependency hash hides its
+  latency better by overlapping one thread's instructions than by adding warps.
+- **Inlined + unrolled `fe_mul`** (secp256k1): the 512-bit product `t[8]` was passed
+  by pointer into `__noinline__` helpers and indexed by non-unrolled loops → local
+  memory on every limb. Inlining and unrolling makes it register-resident; up to
+  **+68%** on EC-heavy (`--gap 5`) runs.
+- **Stream compaction** de-diverging the checksum-sieved path: it keeps the dense
+  PBKDF2 kernel busy instead of wasting ~15/16 lanes on checksum-failing candidates.
+- **A fixed-block HMAC** built straight from the ipad/opad midstate (~2.2×).
 
-A fixed-base comb for `k·G` and a fixed-key HMAC-midstate precompute are correct
-and gated but give ~0 speedup here — an honest null result of being PBKDF2-bound,
-not EC-bound. The remaining ceiling is SHA-512 itself: it's 64-bit-integer-bound,
-and consumer GeForce silicon runs 64-bit ops at a reduced rate, so ~0.69 M
-seeds/s is near this card's practical PBKDF2 limit. A full-rate-INT64 datacenter
-card, or a second GPU, is the real throughput lever from here.
+The remaining ceiling is SHA-512's arithmetic itself. NVIDIA GPUs have no native
+64-bit integer ALU — 64-bit ops are synthesised from 32-bit — so the compression
+function is INT-throughput-bound even on this card; ~1.4 M seeds/s is close to the
+practical limit for this implementation. Batch inversion (amortising the Fermat
+`fe_inv` across many points) would help EC-heavy scans further; a second GPU
+(`--start/--count` sharding) scales linearly.
 
 ## Layout
 
