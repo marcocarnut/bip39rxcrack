@@ -186,6 +186,30 @@ more work than the naive one.
    *address data source* (full-node `dumptxoutset` vs an indexer like electrs).
 4. (Later) fold the prebuilt `--bloom` into the hive so each box loads/ships its own `.blf`.
 
+## Regime A (passphrase / PIN) + bloom SET + `--exhaustive` — **DONE**
+
+The fixed-mnemonic passphrase crack (`--mnemonic … --passphrase [0-9]{N}`) now shares the
+whole SET/work-queue machinery. `mode_crack_pass` is split into `crack_pass_setup` /
+`crack_pass_sweep` (single target) + `crack_pass_sweep_bloom`, so it **joins the work-queue**
+(fine shards, ordering, consolidated stats, crash-recovery) and **fans out over all GPUs** —
+routed via `run_workqueue`/`run_worker_pass` exactly like the words/template modes. It accepts
+a **SET target**: `--addresses`/`--bloom` (multi-purpose, mixed script types), not just a single
+`--address`. The new kernel `g_crack_pass_bloom` reuses `g_crack_pass`'s precomputed-HMAC seed
+(the mnemonic is the fixed PBKDF2 password) then feeds `derive_address_bloom`; the sieve/compaction
+path doesn't apply (a fixed valid mnemonic has no checksum to sieve — every PIN is a full PBKDF2).
+
+`--exhaustive` (SET modes) stops the "first hit wins" short-circuit and reports **every** distinct
+culled-true match. This is the PIN/passphrase-confusion case: one mnemonic used with several PINs
+(e.g. `1701` normally, `1705` from a one-time touchscreen glitch, and no-passphrase), each deriving
+a *different* funded address — all of which must be recovered, not just the lowest PIN. The bloom
+path already appends all hits; exhaustive keeps sweeping the whole window and collects them
+(`BMatchList`, deduped by idx/purpose/change/index). In the work-queue, workers emit one `FOUND`
+line per match and still `DONE` (never stopping the queue); the supervisor accumulates all and
+prints a numbered list at the end. `--exhaustive` is not yet wired for `--template` (missing-word
+mode formats words from the kernel hit, not the index) — it warns and reports the first match.
+Gate `gate/e2e_pass_bloom.js` (`make pass-e2e`): plant one mnemonic, two PINs → two addresses in
+one `--addresses` set, assert BOTH found + a single-target regression + a decoys-only negative.
+
 ## Mixed script types = multi-PURPOSE derivation — **DONE** (main, multi-purpose derive)
 
 Implemented: `--addresses` may now MIX script types. `build_addrset` collects the distinct

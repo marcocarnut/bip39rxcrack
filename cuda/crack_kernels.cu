@@ -205,6 +205,27 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
   }
 }
 
+/* Regime A, BLOOM target set: fixed mnemonic + passphrase [0-9]{pwidth}. Same
+ * precomputed-HMAC-key seed as g_crack_pass, but derive+probe under a PURPOSE
+ * LIST against the blocked bloom and APPEND every hit for the host cull (so a
+ * PIN search can hit "any of my addresses" / a prebuilt filter). gidx = the PIN
+ * index j (maps directly to the digits). */
+extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int pwidth,
+                                        unsigned long long start, unsigned long long count,
+                                        const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                        const u32 *bloom, u32 bmask,
+                                        BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start+t;
+    u8 salt[8+16]; salt[0]='m';salt[1]='n';salt[2]='e';salt[3]='m';salt[4]='o';salt[5]='n';salt[6]='i';salt[7]='c';
+    unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
+    u32 slen=8+pwidth;
+    u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
+    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+  }
+}
+
 /* Regime B (address target): words permutation self-enumerate -> checksum sieve
  * -> PBKDF2 -> derive_address(purpose,change,index) -> 20-byte program compare. */
 extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, const int *bw_len,

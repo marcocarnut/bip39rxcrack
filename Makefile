@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -72,6 +72,12 @@ bloom-e2e: $(CRACK)
 # multi-xpub via a chaincode bloom (EC-free): winner xpub among a decoy -> FOUND at rank
 xpubs-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_xpubs.js
+
+# regime A (fixed mnemonic + passphrase [0-9]{N}) with a bloom SET + --exhaustive:
+# the PIN/passphrase-confusion case -- several PINs each deriving a funded address,
+# ALL reported (not just the first). Plus single-target regression + negative.
+pass-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_pass_bloom.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
