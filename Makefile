@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -44,6 +44,10 @@ miss-gate: $(CRACK)
 # at the global librxe rank (needs >=2 CUDA devices).
 multigpu-gate: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_multigpu.js
+
+# address-target crack (mode_crack_addr, compacted + fused paths) vs a planted winner
+addr-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_addr.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a

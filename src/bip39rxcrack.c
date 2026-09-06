@@ -116,6 +116,7 @@ static char *inline_includes(char *src,const char *cu){
 /* FNV-1a of a string (PTX cache key). */
 static unsigned long long fnv1a(const char*s){ unsigned long long h=1469598103934665603ULL; for(;*s;s++){ h^=(unsigned char)*s; h*=1099511628211ULL; } return h; }
 static void build_module(const char *cu_path){
+  if(g_mod) return;   /* idempotent: a persistent worker builds its context once */
   const char *arch="--gpu-architecture=compute_120";
   const char*mr=getenv("CRACK_MAXREG");
   const char*def=getenv("CRACK_DEF");   /* e.g. -DSHA512_UNROLL16 for A/B experiments */
@@ -571,99 +572,122 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
 }
 
 /* ------------------ Regime B: words permutation, ADDRESS target --------- */
+/* ---- setup-once / sweep(start,count) split (foundation for the work-queue) ----
+ * A persistent worker builds the CUDA context + uploads once (crack_addr_setup),
+ * then sweeps arbitrary [start,count) shards repeatedly (crack_addr_sweep) on the
+ * SAME context. mode_crack_addr is just setup + one whole-window sweep + render,
+ * so single-GPU behaviour stays byte-identical (gated). */
+typedef void (*prog_cb)(void*ud, unsigned long long swept, unsigned long long hashed);
+typedef struct {
+  struct rxe*r; unsigned long long total;
+  CUdeviceptr dd,dof,dln,dix, dtp, dhi,dfound,dhashed,dhit_ci, dsurv,dctr;
+  unsigned long long C;   /* survivor-buffer capacity (compact); 0 = fused */
+  int n,size, require_ck, purpose; uint32_t pu,changes,gap; int grid,tpb;
+} CrackCtx;
+
+static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int purpose,
+                            uint32_t changes,uint32_t gap,int require_ck,int compact,const char*cu){
+  memset(X,0,sizeof *X);
+  char pat[2048]; wordset_pattern(W,pat,sizeof pat);
+  X->r=rxe_parse(pat,0); if(!X->r||rxe_error(X->r)){fprintf(stderr,"rxe parse err\n");return 2;}
+  if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
+  { mpz_t total; mpz_init(total); mpz_set(total,X->r->nitems); X->total=mpz_get_ui(total); mpz_clear(total); }
+  build_module(cu);
+  gpu_upload_words(W,&X->dd,&X->dof,&X->dln,&X->dix);
+  X->dtp=up(tprog,32);
+  unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
+  X->dhi=up(&init,8); X->dfound=up(&zero,4); X->dhashed=up(&z0,8); X->dhit_ci=up(hci0,8);
+  X->n=W->n; X->size=W->n; X->pu=(uint32_t)purpose; X->changes=changes; X->gap=gap;
+  X->require_ck=require_ck; X->purpose=purpose; X->grid=1024; X->tpb=128;
+  /* survivor buffer (chunked compaction): sized for a chunk's FULL worst case so
+     overflow is structurally impossible. Allocated ONCE here, reused per sweep. */
+  if(compact && require_ck){
+    unsigned long long budget=1024ULL*1024*1024;
+    const char*mb=getenv("COMPACT_BUDGET_MB"); if(mb){ long v=atol(mb); if(v>16) budget=(unsigned long long)v*1024*1024; }
+    unsigned long long C=budget/8; CUdeviceptr dsurv=0;
+    while(C>=(1ULL<<20)){ if(cuMemAlloc(&dsurv,C*8)==CUDA_SUCCESS) break; C/=2; dsurv=0; }
+    if(dsurv){ X->dsurv=dsurv; X->C=C; X->dctr=up(&z0,8); }
+    else fprintf(stderr,"regime B: compaction buffer won't allocate on this GPU -- falling back to fused.\n");
+  }
+  return 0;
+}
+
+/* Sweep [start,count). Resets per-sweep hit state, returns 1 if found (sets
+   *out_idx + out_ci[2]), 0 if not. Streams progress via cb (nullable). */
+static int crack_addr_sweep(CrackCtx*X,unsigned long long start,unsigned long long count,
+                            double intv,int reporting,prog_cb cb,void*ud,
+                            unsigned long long*out_idx,uint32_t out_ci[2]){
+  unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
+  CU(cuMemcpyHtoD(X->dhi,&init,8)); CU(cuMemcpyHtoD(X->dfound,&zero,4));
+  CU(cuMemcpyHtoD(X->dhashed,&z0,8)); CU(cuMemcpyHtoD(X->dhit_ci,hci0,8));
+  int found=0; int rck=X->require_ck; int n=X->n,size=X->size;
+  if(X->dsurv){   /* compacted: sieve -> dense PBKDF2 on survivors */
+    unsigned long long z64=0, tot_surv=0, swept=0, cchunk=reporting?(1ULL<<20):X->C;
+    for(unsigned long long cs=start; cs<start+count; ){
+      unsigned long long cc=(start+count-cs<cchunk)?(start+count-cs):cchunk; double c0=now_s();
+      CU(cuMemcpyHtoD(X->dctr,&z64,8));
+      void*sa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cs,&cc,&X->dsurv,&X->C,&X->dctr};
+      CU(cuLaunchKernel(kern("g_sieve_perm"),X->grid,1,1,X->tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
+      unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,X->dctr,8)); tot_surv+=nsurv;
+      if(nsurv>X->C){ fprintf(stderr,"ERROR: chunk survivors %llu > chunk size %llu (bug)\n",nsurv,X->C); return -1; }
+      if(nsurv){ void*pa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&X->dsurv,&nsurv,&X->pu,&X->changes,&X->gap,&X->dtp,&X->dhi,&X->dfound,&X->dhit_ci};
+        CU(cuLaunchKernel(kern("g_pbkdf2_perm"),X->grid,1,1,X->tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
+      double csecs=now_s()-c0; swept+=cc; cs+=cc; if(cb) cb(ud,swept,tot_surv);
+      CU(cuMemcpyDtoH(&found,X->dfound,4)); if(found) break;
+      cchunk=next_chunk(cc,csecs,intv,reporting); if(cchunk>X->C) cchunk=X->C;
+    }
+  } else {        /* fused: sieve+PBKDF2+EC in one kernel */
+    unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
+    void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->pu,&X->changes,&X->gap,&X->dtp,&rck,&X->dhi,&X->dfound,&X->dhashed,&X->dhit_ci};
+    for(cstart=start; cstart<start+count; ){
+      ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
+      CU(cuLaunchKernel(kern("g_crack_addr"),X->grid,1,1,X->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+      double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+      CU(cuMemcpyDtoH(&hashed,X->dhashed,8)); if(cb) cb(ud,swept,rck?hashed:swept);
+      CU(cuMemcpyDtoH(&found,X->dfound,4)); if(found) break;
+      chunk=next_chunk(ccount,csecs,intv,reporting);
+    }
+  }
+  CU(cuMemcpyDtoH(&found,X->dfound,4));
+  if(found){ CU(cuMemcpyDtoH(out_idx,X->dhi,8)); CU(cuMemcpyDtoH(out_ci,X->dhit_ci,8)); }
+  return found;
+}
+
+/* progress callback for the single-GPU mode path: drives the CSV/-p machinery */
+static void mode_prog_cb(void*ud,unsigned long long swept,unsigned long long hashed){ prog_tick((Prog*)ud,swept,hashed); }
+
 static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
                            uint32_t changes,uint32_t gap,int require_ck,int compact,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
-  char pat[2048]; wordset_pattern(W,pat,sizeof pat);
-  struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
-  mpz_t total; mpz_init(total); mpz_set(total,r->nitems);
-  if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
-  if(g_print_total){ gmp_printf("%Zd\n",total); return 0; }
-  build_module(cu);
-  CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
-  CUdeviceptr dtp=up(tprog,32);
-  unsigned long long init=~0ULL; int zero=0;
-  CUdeviceptr dhi=up(&init,8),dfound=up(&zero,4);
-  unsigned long long total_u=mpz_get_ui(total);
-  unsigned long long start=ustart>total_u?total_u:ustart;
-  unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
-  int n=W->n,size=W->n; uint32_t pu=(uint32_t)purpose;
-  int tpb=128,grid=1024; struct timeval t0,t1; double secs=0; (void)t0;(void)t1;
+  if(g_print_total){ char pat[2048]; wordset_pattern(W,pat,sizeof pat);
+    struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
+    if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
+    gmp_printf("%Zd\n",r->nitems); rxe_free(r); return 0; }
+  CrackCtx X; int rc=crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu); if(rc) return rc;
+  unsigned long long start=ustart>X.total?X.total:ustart;
+  unsigned long long count=ucount?ucount:(X.total-start); if(start+count>X.total) count=X.total-start;
   int reporting=(g_pflag||g_loginterval_ms);
   char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
   Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
   double intv=prog_intv(&P);
-  unsigned long long z0=0; CUdeviceptr dhashed=up(&z0,8);
-  uint32_t hci0[2]={0,0}; CUdeviceptr dhit_ci=up(hci0,8);
-  int used_compact=0;
-  if(compact && require_ck){
-    /* CHUNKED compaction: size the survivor buffer for a chunk's FULL size
-     * (worst case: every candidate survives) -> overflow is STRUCTURALLY
-     * impossible. Chunk size C = budget/8 (default ~1 GiB; COMPACT_BUDGET_MB env
-     * override). One global hit_index (atomicMin across chunks) -> lowest-index
-     * wins across chunk boundaries; early-exit once a chunk finds a hit (later
-     * chunks only hold higher indices). Fall back to fused if no chunk fits. */
-    unsigned long long budget = 1024ULL*1024*1024;
-    const char*mb=getenv("COMPACT_BUDGET_MB"); if(mb){ long v=atol(mb); if(v>16) budget=(unsigned long long)v*1024*1024; }
-    unsigned long long C = budget/8;
-    CUdeviceptr dsurv=0;
-    while(C>=(1ULL<<20)){ if(cuMemAlloc(&dsurv,C*8)==CUDA_SUCCESS) break; C/=2; dsurv=0; }
-    if(dsurv){
-      used_compact=1;
-      unsigned long long z64=0; CUdeviceptr dctr=up(&z64,8);
-      prog_hdr(&P,"regime B (words, compacted)",g_target_str,g_pattern_str,path,C,C*8/1024/1024);
-      fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates, buffer %llu MiB -> %s ...\n",count,C*8/1024/1024,path);
-      double tt0=now_s(); int found=0; unsigned long long tot_surv=0, swept=0;
-      unsigned long long cchunk = reporting?(1ULL<<20):C;
-      for(unsigned long long cs=start; cs<start+count; ){
-        unsigned long long cc = (start+count-cs < cchunk) ? (start+count-cs) : cchunk;
-        double c0=now_s();
-        CU(cuMemcpyHtoD(dctr,&z64,8));
-        void*sa[]={&dd,&dof,&dln,&dix,&n,&size,&cs,&cc,&dsurv,&C,&dctr};
-        CU(cuLaunchKernel(kern("g_sieve_perm"),grid,1,1,tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
-        unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,dctr,8)); tot_surv+=nsurv;
-        if(nsurv>C){ fprintf(stderr,"ERROR: chunk survivors %llu > chunk size %llu -- impossible (bug)\n",nsurv,C); return 2; }
-        if(nsurv){ void*pa[]={&dd,&dof,&dln,&dix,&n,&size,&dsurv,&nsurv,&pu,&changes,&gap,&dtp,&dhi,&dfound,&dhit_ci};
-          CU(cuLaunchKernel(kern("g_pbkdf2_perm"),grid,1,1,tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
-        double csecs=now_s()-c0; swept+=cc; cs+=cc; prog_tick(&P,swept,tot_surv);
-        CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
-        cchunk=next_chunk(cc,csecs,intv,reporting); if(cchunk>C) cchunk=C;
-      }
-      secs=now_s()-tt0; cuMemFree(dsurv);
-      fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s  (%llu survivors -> dense PBKDF2%s)\n",swept,secs,swept/secs/1e6,tot_surv,swept<count?", early-exit":"");
-    } else {
-      fprintf(stderr,"regime B: compaction buffer won't allocate on this GPU -- falling back to fused.\n");
-    }
-  }
-  int found=0;
-  if(!used_compact){
-    unsigned long long cstart=start,ccount=0;
-    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&ccount,&pu,&changes,&gap,&dtp,&require_ck,&dhi,&dfound,&dhashed,&dhit_ci};
-    prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
-    fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path);
-    double tt0=now_s(); unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
-    for(cstart=start; cstart<start+count; ){
-      ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk;
-      double c0=now_s();
-      CU(cuLaunchKernel(kern("g_crack_addr"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
-      double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
-      CU(cuMemcpyDtoH(&hashed,dhashed,8)); prog_tick(&P,swept,require_ck?hashed:swept);
-      CU(cuMemcpyDtoH(&found,dfound,4)); if(found) break;
-      chunk=next_chunk(ccount,csecs,intv,reporting);
-    }
-    secs=now_s()-tt0;
-    fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (sieve->PBKDF2+EC on survivors%s)\n",swept,secs,swept/secs/1e6,swept<count?", early-exit":"");
-  }
-  (void)secs;
-  unsigned long long hidx=0; CU(cuMemcpyDtoH(&found,dfound,4)); CU(cuMemcpyDtoH(&hidx,dhi,8));
+  if(X.dsurv){ prog_hdr(&P,"regime B (words, compacted)",g_target_str,g_pattern_str,path,X.C,X.C*8/1024/1024);
+    fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates, buffer %llu MiB -> %s ...\n",count,X.C*8/1024/1024,path); }
+  else { prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
+    fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path); }
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0};
+  int found=crack_addr_sweep(&X,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci);
+  if(found<0) return 2;
+  double secs=now_s()-tt0;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (%s%s)\n",
+    P.swept,secs,secs>0?P.swept/secs/1e6:0.0,
+    X.dsurv?"compacted->dense PBKDF2":"fused sieve->PBKDF2+EC", (found&&P.swept<count)?", early-exit":"");
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
-  mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
+  mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X.r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,X.r);
   char*t=buf; while(*t==' ')t++;
-  uint32_t hci[2]; CU(cuMemcpyDtoH(hci,dhit_ci,8));
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
   prog_finish(&P,"FOUND",t,fpath);
   printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : %s\n",hidx,t,fpath);
-  mpz_clear(j); rxe_free(r); return 0;
+  mpz_clear(j); return 0;
 }
 
 /* ---------------------- Missing-word ([:bip39-en:]) --------------------- */
