@@ -158,6 +158,26 @@ more work than the naive one.
    an address source (full-node dump) and the on-disk formats.
 4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.
 
+## Mixed script types = multi-PURPOSE derivation (needed for "any funded address")
+
+The 1.5B "any funded" set spans p2pkh/p2sh/p2wpkh/p2tr. That is NOT a filter problem —
+the bloom is type-agnostic (raw fingerprints), and the v1 "one script type per set" rule
+is just a liftable `build_addrset` validation. The real requirement is on the CANDIDATE
+side: script type ↔ BIP purpose ↔ derivation path (p2pkh `m/44'/…`, p2wpkh `m/84'/…`), so
+different purposes derive DIFFERENT keys → different programs. To match a mixed-type filter,
+each candidate must derive + probe its program under each purpose (44/49/84/86).
+
+- **Cost is small, not ×4**: PBKDF2 (2048 HMAC, the bottleneck) is computed ONCE per
+  candidate and shared across purposes; each extra purpose adds only a BIP32 account
+  derivation + change/index EC. At gap 1 (PBKDF2-bound) that's ~+10-20% for all four, not
+  ×4. So "any funded address, any script type" is feasible.
+- **Implementation**: `derive_*_bloom` loops over a purpose list; the BloomHit gains a
+  `purpose` field (it already carries change/index) so a hit reports the right script type;
+  the cull stays a type-agnostic program lookup (purpose only used to report/encode the
+  found address). This ALSO lifts the mixed-`--addresses` limit for free.
+- **Prerequisite for**: the `--bloom` "any funded address" mode (stage 3). Build it there
+  (or when mixed `--addresses` is wanted).
+
 ## Multi-currency (forward-looking — design so we don't trap ourselves)
 
 The bloom/cull/work-queue/hive are **coin-agnostic**: they operate on uniform 20/32-byte
