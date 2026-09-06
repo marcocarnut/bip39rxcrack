@@ -158,7 +158,15 @@ more work than the naive one.
    an address source (full-node dump) and the on-disk formats.
 4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.
 
-## Mixed script types = multi-PURPOSE derivation (needed for "any funded address")
+## Mixed script types = multi-PURPOSE derivation — **DONE** (main, multi-purpose derive)
+
+Implemented: `--addresses` may now MIX script types. `build_addrset` collects the distinct
+purposes present (`--purpose` overrides the set); the cull compares 32-byte zero-padded
+programs so 20B (h160) and 32B (taproot) coexist; `derive_*_bloom` loops the purpose list,
+appending each hit; on a cull-true match the matched `AEnt` gives the script type, so FOUND
+reports the correct `m/purpose'/…` path + address. Gate `gate/e2e_bloom_mixed.js` (p2pkh
+winner among p2wpkh + p2tr decoys → derived under {44,84,86}, found under 44). This is the
+key prerequisite for the stage-3 "any funded address" mode. Original analysis below.
 
 The 1.5B "any funded" set spans p2pkh/p2sh/p2wpkh/p2tr. That is NOT a filter problem —
 the bloom is type-agnostic (raw fingerprints), and the v1 "one script type per set" rule

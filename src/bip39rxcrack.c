@@ -585,15 +585,16 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
  * so single-GPU behaviour stays byte-identical (gated). */
 typedef void (*prog_cb)(void*ud, unsigned long long swept, unsigned long long hashed);
 /* A set of target programs (bloom mode), SORTED for the exact cull. Each entry
- * keeps the original address string so a hit can report WHICH address matched.
- * NULL/n==0 => single-target (the existing exact-compare path). */
-typedef struct { uint8_t prog[32]; char *str; } AEnt;
-typedef struct { AEnt *ent; long n; int proglen; } AddrSet;
-static int g_aset_len=20;
-static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,(size_t)g_aset_len); }
-static void aset_sort(AddrSet*A){ g_aset_len=A->proglen; qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
-static const char* aset_lookup(const AddrSet*A,const uint8_t*prog){ g_aset_len=A->proglen;
-  AEnt key; memcpy(key.prog,prog,(size_t)A->proglen); AEnt*e=bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); return e?e->str:0; }
+ * keeps its address string + purpose (script type). Programs are zero-padded to
+ * 32 bytes and the cull compares all 32, so a set may MIX script types (20B h160
+ * + 32B taproot). `purposes` is the distinct set of script types to derive under
+ * (multi-purpose). NULL/n==0 => single-target (the existing exact-compare path). */
+typedef struct { uint8_t prog[32]; char *str; int purpose; } AEnt;
+typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp; } AddrSet;
+static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,32); }
+static void aset_sort(AddrSet*A){ qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
+static const AEnt* aset_lookup(const AddrSet*A,const uint8_t*prog){
+  AEnt key; memcpy(key.prog,prog,32); return (const AEnt*)bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
 static int aset_member(const AddrSet*A,const uint8_t*prog){ return aset_lookup(A,prog)!=0; }
 static void aset_free(AddrSet*A){ if(!A->ent) return; for(long i=0;i<A->n;i++) free(A->ent[i].str); free(A->ent); A->ent=0; }
 
@@ -602,7 +603,7 @@ typedef struct {
   CUdeviceptr dd,dof,dln,dix, dtp, dhi,dfound,dhashed,dhit_ci, dsurv,dctr;
   unsigned long long C;   /* survivor-buffer capacity (compact); 0 = fused */
   int n,size, require_ck, purpose; uint32_t pu,changes,gap; int grid,tpb;
-  CUdeviceptr d_bloom, d_hits, d_hitcnt; uint32_t bloom_mask, hitcap;  /* bloom mode */
+  CUdeviceptr d_bloom, d_hits, d_hitcnt, d_purposes; uint32_t bloom_mask, hitcap; int bnpurp;  /* bloom mode */
   const AddrSet *aset;    /* exact cull set; 0 => single-target */
 } CrackCtx;
 
@@ -645,8 +646,9 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
     X->hitcap=1u<<18;                                /* 262144 hits/chunk */
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
     X->d_hitcnt=up(&z0,4);
-    fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), cull on host\n",
-            aset->n, (double)fbytes/1048576.0, nb, (double)nb*256.0/(double)aset->n);
+    X->bnpurp=aset->npurp; X->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
+    fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
+            aset->n, (double)fbytes/1048576.0, nb, (double)nb*256.0/(double)aset->n, aset->npurp);
   }
   return 0;
 }
@@ -657,7 +659,7 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
    over that chunk's true hits and stop. */
 static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned long long count,
                                   double intv,int reporting,prog_cb cb,void*ud,
-                                  unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz){
+                                  unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz,int*out_purpose){
   int rck=X->require_ck, n=X->n, size=X->size, compact=(X->dsurv!=0);
   unsigned long long z0=0; CU(cuMemcpyHtoD(X->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0;
@@ -673,11 +675,11 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
       CU(cuLaunchKernel(kern("g_sieve_perm"),X->grid,1,1,X->tpb,1,1,0,0,sa,0)); CU(cuCtxSynchronize());
       unsigned long long nsurv=0; CU(cuMemcpyDtoH(&nsurv,X->dctr,8)); hashed+=nsurv;
       if(nsurv>X->C){ fprintf(stderr,"ERROR: chunk survivors %llu > %llu (bug)\n",nsurv,X->C); free(hb); return -1; }
-      if(nsurv){ void*pa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&X->dsurv,&nsurv,&X->pu,&X->changes,&X->gap,
+      if(nsurv){ void*pa[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&X->dsurv,&nsurv,&X->d_purposes,&X->bnpurp,&X->changes,&X->gap,
                             &X->d_bloom,&X->bloom_mask,&X->d_hits,&X->d_hitcnt,&X->hitcap};
         CU(cuLaunchKernel(kern("g_pbkdf2_perm_bloom"),X->grid,1,1,X->tpb,1,1,0,0,pa,0)); CU(cuCtxSynchronize()); }
     } else {       /* fused sieve+PBKDF2+EC -> probe */
-      void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->pu,&X->changes,&X->gap,
+      void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->d_purposes,&X->bnpurp,&X->changes,&X->gap,
                    &X->d_bloom,&X->bloom_mask,&rck,&X->d_hits,&X->d_hitcnt,&X->hitcap,&X->dhashed};
       CU(cuLaunchKernel(kern("g_crack_addr_bloom"),X->grid,1,1,X->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     }
@@ -697,7 +699,8 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
   }
   free(hb);
   if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
-    if(out_addr&&addrsz){ const char*ma=aset_lookup(X->aset,best_prog); snprintf(out_addr,(size_t)addrsz,"%s",ma?ma:""); } }
+    const AEnt*me=aset_lookup(X->aset,best_prog);
+    if(me){ if(out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); if(out_purpose) *out_purpose=me->purpose; } }
   return found;
 }
 
@@ -705,9 +708,9 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
    *out_idx + out_ci[2]), 0 if not. Streams progress via cb (nullable). */
 static int crack_addr_sweep(CrackCtx*X,unsigned long long start,unsigned long long count,
                             double intv,int reporting,prog_cb cb,void*ud,
-                            unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz){
+                            unsigned long long*out_idx,uint32_t out_ci[2],char*out_addr,int addrsz,int*out_purpose){
   if(out_addr&&addrsz) out_addr[0]=0;
-  if(X->d_bloom) return crack_addr_sweep_bloom(X,start,count,intv,reporting,cb,ud,out_idx,out_ci,out_addr,addrsz);
+  if(X->d_bloom) return crack_addr_sweep_bloom(X,start,count,intv,reporting,cb,ud,out_idx,out_ci,out_addr,addrsz,out_purpose);
   unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
   CU(cuMemcpyHtoD(X->dhi,&init,8)); CU(cuMemcpyHtoD(X->dfound,&zero,4));
   CU(cuMemcpyHtoD(X->dhashed,&z0,8)); CU(cuMemcpyHtoD(X->dhit_ci,hci0,8));
@@ -766,8 +769,8 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
     fprintf(stderr,"regime B (COMPACTED, chunked): %llu candidates, buffer %llu MiB -> %s ...\n",count,X.C*8/1024/1024,path); }
   else { prog_hdr(&P,require_ck?"regime B (words, fused)":"regime B (words, no-sieve)",g_target_str,g_pattern_str,path,0,0);
     fprintf(stderr,"regime B: %llu permutations (checksum-%s) -> %s ...\n",count,require_ck?"ON":"OFF",path); }
-  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0}; char maddr[100]="";
-  int found=crack_addr_sweep(&X,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,maddr,sizeof maddr);
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0}; char maddr[100]=""; int mpurpose=purpose;
+  int found=crack_addr_sweep(&X,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,maddr,sizeof maddr,&mpurpose);
   if(found<0) return 2;
   double secs=now_s()-tt0;
   fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (%s%s)\n",
@@ -776,7 +779,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
   mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X.r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,X.r);
   char*t=buf; while(*t==' ')t++;
-  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
+  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",mpurpose,hci[0],hci[1]);
   prog_finish(&P,"FOUND",t,fpath);
   printf("FOUND\n  index (canonical): %llu\n  mnemonic: %s\n  path    : %s\n",hidx,t,fpath);
   if(maddr[0]) printf("  address : %s\n",maddr);
@@ -841,7 +844,7 @@ typedef struct {
   CUdeviceptr dwl,dwoff,dwlen,dtmpl,dupos,dtp,dhi,dfound,dhg,dhashed,dhit_ci;
   int W,U,passU,nth,freebits, upos[32]; uint32_t pu,changes,gap; int grid,tpb;
   unsigned long long total;
-  CUdeviceptr d_bloom, d_hits, d_hitcnt; uint32_t bloom_mask, hitcap;  /* bloom mode */
+  CUdeviceptr d_bloom, d_hits, d_hitcnt, d_purposes; uint32_t bloom_mask, hitcap; int bnpurp;  /* bloom mode */
   const AddrSet *aset;
 } MissCtx;
 static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],int purpose,
@@ -873,8 +876,9 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
     for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,M->bloom_mask);
     M->d_bloom=up(hf,fbytes); free(hf);
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
-    fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), cull on host\n",
-            aset->n,(double)fbytes/1048576.0,nb,(double)nb*256.0/(double)aset->n);
+    M->bnpurp=aset->npurp; M->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
+    fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
+            aset->n,(double)fbytes/1048576.0,nb,(double)nb*256.0/(double)aset->n,aset->npurp);
   }
   return 0;
 }
@@ -904,7 +908,7 @@ static int crack_missing_sweep_single(MissCtx*M,unsigned long long start,unsigne
    the hit's program) to recover the word array for rendering. */
 static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
                                prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32],
-                               char*out_addr,int addrsz){
+                               char*out_addr,int addrsz,int*out_purpose){
   unsigned long long z0=0; CU(cuMemcpyHtoD(M->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=rep?report_chunk(1):(64ULL<<20);
   int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
@@ -913,7 +917,7 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
   for(cstart=start; cstart<start+count; ){
     ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
     unsigned int zc=0; CU(cuMemcpyHtoD(M->d_hitcnt,&zc,4));
-    void*args[]={&M->dwl,&M->dwoff,&M->dwlen,&M->dtmpl,&M->W,&M->dupos,&M->passU,&cstart,&ccount,&M->pu,&M->changes,&M->gap,
+    void*args[]={&M->dwl,&M->dwoff,&M->dwlen,&M->dtmpl,&M->W,&M->dupos,&M->passU,&cstart,&ccount,&M->d_purposes,&M->bnpurp,&M->changes,&M->gap,
                  &M->d_bloom,&M->bloom_mask,&M->d_hits,&M->d_hitcnt,&M->hitcap,&M->dhashed};
     CU(cuLaunchKernel(kf,M->grid,1,1,M->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
@@ -933,14 +937,15 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
   if(found){ CU(cuMemcpyHtoD(M->dtp,best_prog,32));   /* re-derive the winner to get its words */
     uint32_t ci2[2]; crack_missing_sweep_single(M,best,1,0,0,0,0,out_hidx,ci2,out_hg);
     *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
-    if(out_addr&&addrsz){ const char*ma=aset_lookup(M->aset,best_prog); snprintf(out_addr,(size_t)addrsz,"%s",ma?ma:""); } }
+    const AEnt*me=aset_lookup(M->aset,best_prog);
+    if(me){ if(out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); if(out_purpose) *out_purpose=me->purpose; } }
   return found;
 }
 static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
                                prog_cb cb,void*ud,unsigned long long*out_hidx,uint32_t out_ci[2],uint32_t out_hg[32],
-                               char*out_addr,int addrsz){
+                               char*out_addr,int addrsz,int*out_purpose){
   if(out_addr&&addrsz) out_addr[0]=0;
-  if(M->d_bloom) return crack_missing_sweep_bloom(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg,out_addr,addrsz);
+  if(M->d_bloom) return crack_missing_sweep_bloom(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg,out_addr,addrsz,out_purpose);
   return crack_missing_sweep_single(M,start,count,intv,rep,cb,ud,out_hidx,out_ci,out_hg);
 }
 static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
@@ -966,8 +971,8 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   double intv=prog_intv(&P);
   fprintf(stderr,"missing-word %s: W=%d, %d unknown(s)%s -> %llu candidates (%s)...\n",
           M.nth?"[:Nth:] CONSTRUCTION":"baseline sieve", M.W, M.U, M.nth?" (last=checksum-constructed)":"", count, path);
-  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0},hg[32]; char maddr[100]="";
-  int found=crack_missing_sweep(&M,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,hg,maddr,sizeof maddr);
+  double tt0=now_s(); unsigned long long hidx=0; uint32_t hci[2]={0,0},hg[32]; char maddr[100]=""; int mpurpose=purpose;
+  int found=crack_missing_sweep(&M,start,count,intv,reporting,mode_prog_cb,&P,&hidx,hci,hg,maddr,sizeof maddr,&mpurpose);
   if(found<0) return 2;
   double secs=now_s()-tt0;
   fprintf(stderr,"  swept %llu candidates in %.3fs = %.3f Mcand/s (%s%s)\n",P.swept,secs,secs>0?P.swept/secs/1e6:0.0,
@@ -980,7 +985,7 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   for(int i=0;i<M.U;i++) printf(" [pos %d]=%s",M.upos[i],WLNAME((int)hg[M.upos[i]]));
   printf("\n  mnemonic :");
   for(int p=0;p<M.W;p++) printf(" %s",WLNAME((int)hg[p]));
-  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",purpose,hci[0],hci[1]);
+  char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",mpurpose,hci[0],hci[1]);
   printf("\n  path     : %s\n",fpath);
   if(maddr[0]) printf("  address  : %s\n",maddr);
   { char fw[256]; int L=0; for(int i=0;i<M.U;i++) L+=snprintf(fw+L,sizeof fw-L,"%s%s",i?" ":"",WLNAME((int)hg[M.upos[i]])); prog_finish(&P,"FOUND",fw,fpath); }
@@ -1159,21 +1164,21 @@ static void worker_prog_cb(void*ud,unsigned long long swept,unsigned long long h
    hit, hand back the GLOBAL canonical index, change/index, and the mnemonic. */
 typedef int (*sweep_fn)(void*ctx,unsigned long long start,unsigned long long count,double intv,int rep,
                         prog_cb cb,void*ud,unsigned long long*out_idx,uint32_t out_ci[2],char*out_mn,int mnsz,
-                        char*out_addr,int addrsz);
+                        char*out_addr,int addrsz,int*out_purpose);
 typedef struct { sweep_fn sweep; void*ctx; unsigned long long total; int purpose; } Sweeper;
 static int wq_sweep_addr(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
-                         unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz){
+                         unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz,int*opur){
   CrackCtx*X=c; uint32_t ci[2]; unsigned long long hidx=0;
-  int f=crack_addr_sweep(X,s,n,intv,rep,cb,ud,&hidx,ci,addr,addrsz);
+  int f=crack_addr_sweep(X,s,n,intv,rep,cb,ud,&hidx,ci,addr,addrsz,opur);
   if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1];
     mpz_t j; mpz_init_set_ui(j,hidx); rxe_seek(X->r,j); char b[MN_STRIDE]; rxe_current(b,sizeof b,X->r);
     char*t=b; while(*t==' ')t++; snprintf(mn,mnsz,"%s",t); mpz_clear(j); }
   return f;
 }
 static int wq_sweep_missing(void*c,unsigned long long s,unsigned long long n,double intv,int rep,prog_cb cb,void*ud,
-                            unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz){
+                            unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz,int*opur){
   MissCtx*M=c; uint32_t ci[2],hg[32]; unsigned long long hidx=0;
-  int f=crack_missing_sweep(M,s,n,intv,rep,cb,ud,&hidx,ci,hg,addr,addrsz);
+  int f=crack_missing_sweep(M,s,n,intv,rep,cb,ud,&hidx,ci,hg,addr,addrsz,opur);
   if(f>0){ *oi = M->nth ? ((hidx>>M->freebits)*2048ULL + hg[M->W-1]) : hidx; oc[0]=ci[0]; oc[1]=ci[1];
     int L=0; for(int p=0;p<M->W;p++) L+=snprintf(mn+L,mnsz-L,"%s%s",p?" ":"",WLNAME((int)hg[p])); }
   return f;
@@ -1189,10 +1194,10 @@ static int run_worker(Sweeper*S){
     if(s>S->total) s=S->total;
     if(s+c>S->total) c=S->total-s;
     wp.id=id; wp.cur_swept=0; wp.cur_hashed=0;
-    unsigned long long oi=0; uint32_t oc[2]={0,0}; char mn[512]=""; char addr[100]="";
-    int f=S->sweep(S->ctx,s,c,0.3,1,worker_prog_cb,&wp,&oi,oc,mn,sizeof mn,addr,sizeof addr);
+    unsigned long long oi=0; uint32_t oc[2]={0,0}; char mn[512]=""; char addr[100]=""; int mpur=S->purpose;
+    int f=S->sweep(S->ctx,s,c,0.3,1,worker_prog_cb,&wp,&oi,oc,mn,sizeof mn,addr,sizeof addr,&mpur);
     if(f<0){ printf("ERROR %llu\n",id); fflush(stdout); continue; }
-    if(f){ printf("FOUND %llu %llu %d %u %u %s %s\n",id,oi,S->purpose,oc[0],oc[1],addr[0]?addr:"-",mn); fflush(stdout); }
+    if(f){ printf("FOUND %llu %llu %d %u %u %s %s\n",id,oi,mpur,oc[0],oc[1],addr[0]?addr:"-",mn); fflush(stdout); }
     else { /* whole shard swept: bank its full candidate count, emit a final PROG, then DONE */
       wp.base_swept+=c; wp.base_hashed+=wp.cur_hashed;
       printf("PROG %llu %llu %llu\nDONE %llu\n",id,wp.base_swept,wp.base_hashed,id); fflush(stdout); }
@@ -1483,12 +1488,13 @@ static int build_addrset(const char*csv,const char*file,AddrSet*A,int*purpose_ou
     char line[256]; while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
       char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(*s) ADDR_PUSH(s); } fclose(f); }
   if(na==0){ fprintf(stderr,"--addresses: no addresses given\n"); return 2; }
-  int proglen=-1,purpose=-1; AEnt *ent=malloc((size_t)na*sizeof(AEnt));
+  AEnt *ent=malloc((size_t)na*sizeof(AEnt)); A->npurp=0;
   for(long i=0;i<na;i++){ uint8_t pr[32]; int pl,pu; if(decode_address(addrs[i],pr,&pl,&pu)){ fprintf(stderr,"--addresses: bad address '%s'\n",addrs[i]); return 2; }
-    if(proglen<0){ proglen=pl; purpose=pu; } else if(pl!=proglen||pu!=purpose){ fprintf(stderr,"--addresses: all targets must share one script type (v1); '%s' differs\n",addrs[i]); return 2; }
-    memset(ent[i].prog,0,32); memcpy(ent[i].prog,pr,(size_t)proglen); ent[i].str=addrs[i]; }
+    memset(ent[i].prog,0,32); memcpy(ent[i].prog,pr,(size_t)pl); ent[i].str=addrs[i]; ent[i].purpose=pu;
+    int seen=0; for(int k=0;k<A->npurp;k++) if(A->purposes[k]==(uint32_t)pu) seen=1;   /* distinct script types */
+    if(!seen && A->npurp<8) A->purposes[A->npurp++]=(uint32_t)pu; }
   free(addrs);
-  A->ent=ent; A->n=na; A->proglen=proglen; aset_sort(A); *purpose_out=purpose;
+  A->ent=ent; A->n=na; aset_sort(A); *purpose_out=(int)A->purposes[0];
   return 0;
 }
 /* Host-only: validate the blocked-bloom construction empirically -- build a
@@ -1544,8 +1550,9 @@ static void usage(void){
    "TARGET (choose one):\n"
    "  --address ADDR          base58 (1../3..) or bech32 (bc1q p2wpkh / bc1p p2tr)\n"
    "  --addresses A,B,..      a SET of target addresses (blocked bloom + host cull);\n"
-   "  --addresses-file PATH   ... or one per line. v1: all one script type. Works with\n"
-   "                          --words and --template/--pattern; fans out over all GPUs.\n"
+   "  --addresses-file PATH   ... or one per line. MIXED script types ok (derives each\n"
+   "                          candidate under every type present; --purpose overrides the\n"
+   "                          set). Works with --words and --template; fans out over GPUs.\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --target-chaincode HEX  32-byte account chain code directly\n"
    "  --purpose 44,49,84,86   BIP purpose(s) to try (default 84; auto from address)\n"
@@ -1746,7 +1753,8 @@ int main(int argc,char**argv){
   if(templ){
     uint8_t prog[32]={0}; int purpose; AddrSet A; const AddrSet*aset=0;
     if(addresses||addresses_file){ int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
-      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; memcpy(prog,A.ent[0].prog,(size_t)A.proglen); }
+      if(purpose_set){ A.npurp=npurp>8?8:npurp; for(int k=0;k<A.npurp;k++) A.purposes[k]=purposes[k]; }
+      aset=&A; purpose=purpose_set?(int)purposes[0]:apu; memcpy(prog,A.ent[0].prog,32); }
     else if(address){ int apl,apu; if(decode_address(address,prog,&apl,&apu)) return 2; purpose=purpose_set?(int)purposes[0]:apu; }
     else { fprintf(stderr,"--template needs --address or --addresses\n"); return 2; }
     /* auto: construction if the last position is [:bip39-en:]; --nth/--no-nth override */
@@ -1771,6 +1779,7 @@ int main(int argc,char**argv){
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
   if(addresses||addresses_file){ AddrSet A; int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
+    if(purpose_set){ A.npurp=npurp>8?8:npurp; for(int k=0;k<A.npurp;k++) A.purposes[k]=purposes[k]; }  /* --purpose overrides the derive set */
     int purpose = purpose_set?(int)purposes[0]:apu; int rc;
     if(g_worker) rc=run_worker_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cu,&A);
     else rc=mode_crack_addr(&W,A.ent[0].prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);

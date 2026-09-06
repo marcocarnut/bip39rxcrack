@@ -66,6 +66,7 @@ bloom-selftest: $(CRACK)
 bloom-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_missing.js
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_mixed.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
