@@ -153,7 +153,12 @@ more work than the naive one.
     checksum-sieve speed (measured ~37-48 Mc/s combined on 2 GPUs, vs ~3.4 fused); and FOUND
     now prints the full path `m/purpose'/0'/0'/change/index` + the matched address. Gates
     `gate/e2e_bloom.js` + `gate/e2e_bloom_missing.js` (`make bloom-e2e`). **S1c complete.**
-2. **`--xpubs`** (chaincode filter; trivial once the above exist — different key length + EC-free).
+2. **`--xpubs`** — **DONE** (chaincode bloom): `--xpubs X,..`/`--xpubs-file` builds a blocked
+   bloom of 32-byte account chaincodes; `g_crack_bloom` (words, EC-free) derives the account
+   node under each purpose (default {44,49,84,86}; `--purpose` overrides) and probes; the host
+   culls and reports the matched xpub + its purpose (`BloomHit` now carries the derive purpose,
+   which the address paths also use). Fans out via the contiguous supervisor like `--xpub`.
+   Gate `gate/e2e_xpubs.js` (`make xpubs-e2e`).
 3. **`bloom-build` + `--bloom` + the sorted `.cull`** (the "any funded address" mode). Needs
    an address source (full-node dump) and the on-disk formats.
 4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.

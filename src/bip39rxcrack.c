@@ -664,7 +664,7 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
   unsigned long long z0=0; CU(cuMemcpyHtoD(X->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0;
   unsigned long long chunk = compact ? (reporting?(1ULL<<20):X->C) : (reporting?report_chunk(1):(64ULL<<20));
-  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
+  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0}; int best_purpose=0;
   BloomHit *hb=malloc((size_t)X->hitcap*sizeof(BloomHit));
   for(cstart=start; cstart<start+count; ){
     ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
@@ -689,7 +689,7 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
       unsigned int nc=hc>X->hitcap?X->hitcap:hc;
       CU(cuMemcpyDtoH(hb,X->d_hits,(size_t)nc*sizeof(BloomHit)));
       for(unsigned int i=0;i<nc;i++) if(aset_member(X->aset,hb[i].prog)){
-        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; memcpy(best_prog,hb[i].prog,32); } }
+        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; best_purpose=(int)hb[i].purpose; memcpy(best_prog,hb[i].prog,32); } }
       if(hc>X->hitcap) fprintf(stderr,"  (bloom hit-buffer overflow %u>%u; raise it if this recurs)\n",hc,X->hitcap);
     }
     if(!compact) CU(cuMemcpyDtoH(&hashed,X->dhashed,8));
@@ -698,9 +698,8 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
     chunk=next_chunk(ccount,csecs,intv,reporting); if(compact && chunk>X->C) chunk=X->C;
   }
   free(hb);
-  if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
-    const AEnt*me=aset_lookup(X->aset,best_prog);
-    if(me){ if(out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); if(out_purpose) *out_purpose=me->purpose; } }
+  if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
+    const AEnt*me=aset_lookup(X->aset,best_prog); if(me && out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); }
   return found;
 }
 
@@ -911,7 +910,7 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
                                char*out_addr,int addrsz,int*out_purpose){
   unsigned long long z0=0; CU(cuMemcpyHtoD(M->dhashed,&z0,8));
   unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=rep?report_chunk(1):(64ULL<<20);
-  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0};
+  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0}; unsigned char best_prog[32]={0}; int best_purpose=0;
   BloomHit *hb=malloc((size_t)M->hitcap*sizeof(BloomHit));
   CUfunction kf=kern(M->nth?"g_crack_nth_bloom":"g_crack_missing_bloom");
   for(cstart=start; cstart<start+count; ){
@@ -925,7 +924,7 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
     if(hc>0){ unsigned int nc=hc>M->hitcap?M->hitcap:hc;
       CU(cuMemcpyDtoH(hb,M->d_hits,(size_t)nc*sizeof(BloomHit)));
       for(unsigned int i=0;i<nc;i++) if(aset_member(M->aset,hb[i].prog)){
-        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; memcpy(best_prog,hb[i].prog,32); } }
+        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; best_purpose=(int)hb[i].purpose; memcpy(best_prog,hb[i].prog,32); } }
       if(hc>M->hitcap) fprintf(stderr,"  (bloom hit-buffer overflow %u>%u)\n",hc,M->hitcap);
     }
     if(M->nth) hashed=swept; else CU(cuMemcpyDtoH(&hashed,M->dhashed,8));
@@ -936,9 +935,8 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
   free(hb);
   if(found){ CU(cuMemcpyHtoD(M->dtp,best_prog,32));   /* re-derive the winner to get its words */
     uint32_t ci2[2]; crack_missing_sweep_single(M,best,1,0,0,0,0,out_hidx,ci2,out_hg);
-    *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1];
-    const AEnt*me=aset_lookup(M->aset,best_prog);
-    if(me){ if(out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); if(out_purpose) *out_purpose=me->purpose; } }
+    *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
+    const AEnt*me=aset_lookup(M->aset,best_prog); if(me && out_addr&&addrsz) snprintf(out_addr,(size_t)addrsz,"%s",me->str); }
   return found;
 }
 static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
@@ -1497,6 +1495,85 @@ static int build_addrset(const char*csv,const char*file,AddrSet*A,int*purpose_ou
   A->ent=ent; A->n=na; aset_sort(A); *purpose_out=(int)A->purposes[0];
   return 0;
 }
+/* --xpubs / --xpubs-file -> a sorted set of 32-byte account CHAINCODES (bloom +
+   cull). An xpub doesn't encode its BIP purpose, so the derive tries a default
+   set {44,49,84,86} (--purpose overrides it). */
+static int build_xpubset(const char*csv,const char*file,AddrSet*A){
+  char **xs=0; long nx=0,cap=0;
+  #define XPUB_PUSH(s) do{ if(nx==cap){ cap=cap?cap*2:32; xs=realloc(xs,(size_t)cap*sizeof(char*)); } xs[nx++]=strdup(s); }while(0)
+  if(csv){ char*buf=strdup(csv); char*t=strtok(buf,","); while(t){ while(*t==' ')t++; if(*t) XPUB_PUSH(t); t=strtok(0,","); } free(buf); }
+  if(file){ FILE*f=fopen(file,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",file); return 2; }
+    char line[256]; while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
+      char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(*s) XPUB_PUSH(s); } fclose(f); }
+  #undef XPUB_PUSH
+  if(nx==0){ fprintf(stderr,"--xpubs: no xpubs given\n"); return 2; }
+  AEnt *ent=malloc((size_t)nx*sizeof(AEnt));
+  for(long i=0;i<nx;i++){ uint8_t cc[32]; if(xpub_chaincode(xs[i],cc)){ fprintf(stderr,"--xpubs: bad xpub '%s'\n",xs[i]); return 2; }
+    memset(ent[i].prog,0,32); memcpy(ent[i].prog,cc,32); ent[i].str=xs[i]; ent[i].purpose=0; }
+  free(xs);
+  A->ent=ent; A->n=nx; aset_sort(A);
+  A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86;
+  return 0;
+}
+/* xpub SET (words, EC-free): a blocked bloom of account chaincodes; multi-purpose
+   derive; host cull; reports the matched xpub + its purpose. Fans out over GPUs via
+   the contiguous supervisor (like --xpub). */
+static int mode_crack_xpubs(const Words*W,const AddrSet*xset,int require_ck,
+                            unsigned long long ustart,unsigned long long ucount,const char*cu){
+  char pat[2048]; wordset_pattern(W,pat,sizeof pat);
+  struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
+  mpz_t total; mpz_init(total); mpz_set(total,r->nitems);
+  if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
+  if(g_print_total){ gmp_printf("%Zd\n",total); return 0; }
+  build_module(cu);
+  CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
+  double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
+  uint32_t nb=bloom_nblocks((uint64_t)xset->n,bpk), mask=nb-1; size_t fbytes=(size_t)nb*8u*4u;
+  uint32_t *hf=calloc(fbytes,1); for(long i=0;i<xset->n;i++) bloom_insert(hf,xset->ent[i].prog,mask);
+  CUdeviceptr d_bloom=up(hf,fbytes); free(hf);
+  unsigned long long z0=0; uint32_t hitcap=1u<<18;
+  CUdeviceptr d_hits; CU(cuMemAlloc(&d_hits,(size_t)hitcap*sizeof(BloomHit)));
+  CUdeviceptr d_hitcnt=up(&z0,4);
+  int npurp=xset->npurp; CUdeviceptr d_purposes=up(xset->purposes,(size_t)npurp*sizeof(uint32_t));
+  unsigned long long total_u=mpz_get_ui(total);
+  unsigned long long start=ustart>total_u?total_u:ustart;
+  unsigned long long count=ucount?ucount:(total_u-start); if(start+count>total_u) count=total_u-start;
+  int n=W->n,size=W->n,rck=require_ck,tpb=128,grid=1024,reporting=(g_pflag||g_loginterval_ms);
+  CUdeviceptr dhashed=up(&z0,8);
+  char path[80]; snprintf(path,sizeof path,"xpub chaincode set (%ld, %d purpose%s)",xset->n,npurp,npurp>1?"s":"");
+  Prog P; prog_init(&P,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
+  prog_hdr(&P,"xpubs (words, EC-free, bloom)",g_target_str,g_pattern_str,path,0,0);
+  fprintf(stderr,"bloom: %ld xpub(s), filter %.1f MiB, %d purpose(s), cull on host\n",xset->n,(double)fbytes/1048576.0,npurp);
+  double intv=prog_intv(&P);
+  BloomHit *hb=malloc((size_t)hitcap*sizeof(BloomHit));
+  int found=0; unsigned long long best=~0ULL; int best_purpose=0; unsigned char best_cc[32]={0};
+  unsigned long long swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20); double tt0=now_s();
+  for(unsigned long long cstart=start; cstart<start+count; ){
+    unsigned long long ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
+    unsigned int zc=0; CU(cuMemcpyHtoD(d_hitcnt,&zc,4));
+    void*args[]={&dd,&dof,&dln,&dix,&n,&size,&cstart,&ccount,&d_purposes,&npurp,&rck,&d_bloom,&mask,&d_hits,&d_hitcnt,&hitcap,&dhashed};
+    CU(cuLaunchKernel(kern("g_crack_bloom"),grid,1,1,tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+    unsigned int hc=0; CU(cuMemcpyDtoH(&hc,d_hitcnt,4));
+    if(hc>0){ unsigned int ncp=hc>hitcap?hitcap:hc; CU(cuMemcpyDtoH(hb,d_hits,(size_t)ncp*sizeof(BloomHit)));
+      for(unsigned int i=0;i<ncp;i++) if(aset_member(xset,hb[i].prog)){ found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_purpose=(int)hb[i].purpose; memcpy(best_cc,hb[i].prog,32); } } }
+    CU(cuMemcpyDtoH(&hashed,dhashed,8)); prog_tick(&P,swept,rck?hashed:swept);
+    if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,reporting);
+  }
+  free(hb); double secs=now_s()-tt0;
+  fprintf(stderr,"  swept %llu candidates in %.2fs = %.3f Mcand/s (enumerate+sieve->PBKDF2, EC-free%s)\n",
+          swept,secs,secs>0?swept/secs/1e6:0.0, (found&&swept<count)?", early-exit":"");
+  if(!found){ prog_finish(&P,"NOT_FOUND",0,path); printf("NOT FOUND (no candidate derived a target chain code)\n"); return 1; }
+  mpz_t j; mpz_init_set_ui(j,best); rxe_seek(r,j); char buf[MN_STRIDE]; rxe_current(buf,sizeof buf,r);
+  char*t=buf; while(*t==' ')t++;
+  const AEnt*me=aset_lookup(xset,best_cc);
+  char fpath[64]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'",best_purpose);
+  prog_finish(&P,"FOUND",t,fpath);
+  printf("FOUND\n  index   : %llu\n  mnemonic: %s\n  path    : %s  (account 0)\n",best,t,fpath);
+  if(me) printf("  xpub    : %s\n",me->str);
+  mpz_clear(j); rxe_free(r); return 0;
+}
 /* Host-only: validate the blocked-bloom construction empirically -- build a
  * filter of N random uniform "programs", confirm zero false NEGATIVES, and
  * measure the false-POSITIVE rate across a sweep of bits/key. No GPU. */
@@ -1554,6 +1631,8 @@ static void usage(void){
    "                          candidate under every type present; --purpose overrides the\n"
    "                          set). Works with --words and --template; fans out over GPUs.\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
+   "  --xpubs X,.. / --xpubs-file PATH  a SET of account xpubs (chaincode bloom,\n"
+   "                          EC-free; tries purposes 44/49/84/86, --purpose overrides)\n"
    "  --target-chaincode HEX  32-byte account chain code directly\n"
    "  --purpose 44,49,84,86   BIP purpose(s) to try (default 84; auto from address)\n"
    "\n"
@@ -1605,6 +1684,7 @@ int main(int argc,char**argv){
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   const char *addresses=0,*addresses_file=0;   /* bloom target set */
+  const char *xpubs=0,*xpubs_file=0;            /* xpub (chaincode) bloom set */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
@@ -1638,6 +1718,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--address")&&i+1<argc) address=argv[++i];
     else if(!strcmp(argv[i],"--addresses")&&i+1<argc) addresses=argv[++i];
     else if(!strcmp(argv[i],"--addresses-file")&&i+1<argc) addresses_file=argv[++i];
+    else if(!strcmp(argv[i],"--xpubs")&&i+1<argc) xpubs=argv[++i];
+    else if(!strcmp(argv[i],"--xpubs-file")&&i+1<argc) xpubs_file=argv[++i];
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -1789,6 +1871,9 @@ int main(int argc,char**argv){
     if(g_worker) return run_worker_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu,0);
     return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,0); }
   if(g_worker){ fprintf(stderr,"--worker supports the --words/--address and --template/--address paths\n"); return 2; }
+  if(xpubs||xpubs_file){ AddrSet Xs; if(build_xpubset(xpubs,xpubs_file,&Xs)) return 2;
+    if(purpose_set){ Xs.npurp=npurp>8?8:npurp; for(int k=0;k<Xs.npurp;k++) Xs.purposes[k]=purposes[k]; }
+    int rc=mode_crack_xpubs(&W,&Xs,require_ck,cstart,ccount,cu); aset_free(&Xs); return rc; }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
   else if(tcc_hex){ if(hex2bin(tcc_hex,tcc,32)!=32){ fprintf(stderr,"target-chaincode must be 32 bytes hex\n"); return 2; } }

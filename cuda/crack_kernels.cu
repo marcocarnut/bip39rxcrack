@@ -48,7 +48,7 @@ __device__ void derive_address_bloom(const u8 seed[64], const u32 *purposes, int
         u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
         if(bloom_probe(bloom,prog,bmask)){
           unsigned int slot=atomicAdd(hitcnt,1u);
-          if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i;
+          if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i; r->purpose=purpose;
             for(int b=0;b<tlen;b++) r->prog[b]=prog[b]; for(int b=tlen;b<32;b++) r->prog[b]=0; }
         }
       }
@@ -123,6 +123,38 @@ extern "C" __global__ void g_crack(const u8 *bw_data, const int *bw_off, const i
         atomicMin(hit_index, ji);
         atomicExch(hit_found, 1);
         atomicExch(hit_purpose, (int)purposes[pp]);
+      }
+    }
+  }
+}
+
+/* Bloom variant of g_crack (xpub SET): enumerate -> sieve -> PBKDF2 -> for each
+ * purpose derive the account-node chaincode (EC-free) -> probe the chaincode bloom
+ * -> append. Same construction as the address bloom, over 32-byte chaincodes. */
+extern "C" __global__ void g_crack_bloom(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                   const u32 *bw_idx, int n, int size,
+                                   unsigned long long start_lo, unsigned long long count,
+                                   const u32 *purposes, int npurp, int require_ck,
+                                   const u32 *bloom, u32 bmask,
+                                   BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
+                                   unsigned long long *hashed){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start_lo+t;
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    if(require_ck && !bip39_checksum_ok(g,size)) continue;
+    if(hashed) atomicAdd(hashed,1ULL);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    for(int pp=0; pp<npurp; pp++){
+      u32 idx3[3]={ purposes[pp]|HARD, 0u|HARD, 0u|HARD };
+      u8 cc[32],kk[32]; derive_hardened(seed,64,idx3,3,cc,kk);
+      if(bloom_probe(bloom,cc,bmask)){
+        unsigned int slot=atomicAdd(hitcnt,1u);
+        if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=j; r->change=0; r->index=0; r->purpose=purposes[pp];
+          for(int b=0;b<32;b++) r->prog[b]=cc[b]; }
       }
     }
   }

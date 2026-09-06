@@ -23,8 +23,11 @@
 #define BLOOM_K 16   /* bits set/tested per key; k position-bytes + 4 block-bytes <= 20 */
 
 /* One bloom-probe hit, emitted by the GPU for the host to cull (bloom hits are
- * many -- true positive + false positives -- unlike the single-target atomicMin). */
-typedef struct { unsigned long long gidx; unsigned int change, index; unsigned char prog[32]; } BloomHit;
+ * many -- true positive + false positives -- unlike the single-target atomicMin).
+ * `purpose` is the BIP purpose the match was derived under (an xpub/chaincode
+ * doesn't encode its type, so the derive is authoritative). prog holds the
+ * fingerprint (20/32B address program, or a 32B account chaincode). */
+typedef struct { unsigned long long gidx; unsigned int change, index, purpose; unsigned char prog[32]; } BloomHit;
 
 /* 4 big-endian bytes -> u32 (same on host and device). */
 BLOOM_FN unsigned int bloom_u32be(const unsigned char *p){
