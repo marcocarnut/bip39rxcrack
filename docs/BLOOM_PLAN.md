@@ -73,16 +73,20 @@ matching the estimate below; 6 GiB (~33 bits/key) buys ~1e-5.
 So run the filter loose; the cull mops up. Trade memory for FPR freely (we use ~2 GiB of
 32; a 4-8 GiB filter is comfortable — each GPU/process holds its own copy).
 
-## The cull (exact, CPU-side)
+## The cull (host-side)
 
-A bloom hit is emitted to the existing hit buffer; the host culls it against an exact set:
+> **Update (shipped):** the `--bloom` prebuilt path no longer keeps a sorted exact set.
+> It uses a **second independent bloom** as the cull (see Stage 3 below) — no sort, no
+> stored address list, ~12 GiB total at 1.5e9. The narrative below is the original
+> design; `--addresses`/`--xpubs` still use the small in-RAM exact set described first.
+
+A bloom hit is emitted to the existing hit buffer; the host culls it against a second set:
 - **small N** (`--addresses`/`--xpubs`): the N programs in RAM (hash set) — trivial, zero FP.
-- **"any address"** (`--bloom`): an exact backing set for ~1.5e9 programs. A sorted array
-  of the programs, mmap'd, binary-searched. Full 20-byte = ~30 GB; a **sorted 10-byte
-  prefix** (~15 GB, collision prob ~2^-something negligible at 1.5e9) is enough for a
-  near-exact cull, with the full program only needed to *report* the hit. Built alongside
-  the filter (see below). False-hit volume at FPR 1e-4 x 2e6/s = ~200/s -> the cull must be
-  automatic (too many to hand-check over a long run), but 200 exact lookups/s is nothing.
+- **"any address"** (`--bloom`): a **second bloom over `sha256(program)`**, independent of the
+  GPU filter, probed only on the GPU filter's rare hits. Two independent blooms multiply FPRs
+  (effective k=32), so combined FPR ~5.7e-14 at 1.5e9 with no exact set stored. *(Originally
+  planned as a sorted 10-byte-prefix mmap'd array ~15 GB; the dual-bloom is smaller and needs
+  no sort.)* A surviving hit's program is re-encoded to report the address.
 
 The cull is the final arbiter, which is *why* we can drop script-type handling: different
 purposes derive different keys (different programs); a same-key cross-type match is a true
@@ -159,24 +163,27 @@ more work than the naive one.
    culls and reports the matched xpub + its purpose (`BloomHit` now carries the derive purpose,
    which the address paths also use). Fans out via the contiguous supervisor like `--xpub`.
    Gate `gate/e2e_xpubs.js` (`make xpubs-e2e`).
-3. **`--bloom-build` + `--bloom`** — **DONE** (the "any funded address" mode). `.blf` format:
-   `[BlfHeader][filter nblocks*32B][cull n_addrs*32B sorted]`. `--bloom-build IN OUT` reads an
-   address list (one per line), decodes each to its 32-byte program, records the distinct
-   script types, builds the filter, sorts the cull, writes OUT. `IN='-'` reads **stdin**, so
-   the indexer/full-node output pipes straight in (no ~50 GB intermediate address file):
-   `bitcoin-cli … | bip39rxcrack --bloom-build - funded.blf`. `--bloom FILE` **mmaps** it
-   (filter → GPU, cull → host bsearch — the cull is paged from disk, never fully loaded, so it
-   scales toward ~1.5e9), works with `--words`/`--template` and fans out over GPUs like
-   `--addresses`; a hit reports the matched hash160 (prebuilt files carry no address strings).
-   `k` is stamped in the header and checked on load. The cull stores a **10-byte prefix** per
-   program (80-bit; ~1e-15 false-cull/candidate at 1.5e9) — 15 GB not 48 GB for the full set; a
-   found address is re-encoded from the derived program (base58check/bech32, host SHA-256).
-   Gate `gate/e2e_bloom_file.js` (`make bloom-e2e`). **1.5e9 build sizing** (503 GB host /
-   124 GB instance RAM, +120 GB disk): filter ~8.6 GB + 10-byte cull ~15 GB = **~24 GB .blf**;
-   build peak RAM ~72 GB (20-byte records in RAM for the sieve + filter) — **in-RAM qsort, NO
-   external merge sort**; stream the source compressed via `zcat … | --bloom-build - out.blf`
-   (never decompress to disk). OPEN: the *address data source* (full-node `dumptxoutset` vs an
-   indexer like electrs).
+3. **`--bloom-build` + `--bloom`** — **DONE, DUAL-BLOOM** (the "any funded address" mode).
+   `.blf` v2 format `[BlfHeader][filter1 nblocks1*32B][filter2 nblocks2*32B]` (magic `BLF2`).
+   **No exact cull, no sort, no stored address list** — two *independent* blooms whose FPRs
+   multiply. Filter 1 slices the raw 32-byte program (the GPU prefilter); filter 2 slices
+   `sha256(program)` (host, probed only on filter 1's rare hits). A single k=16 filter can't
+   do better (the 20-byte program only feeds 16 lane bytes); two of them behave like k=32, so
+   the false-positive rate is `fpr1·fpr2` — ~5.7e-14 at 1.5e9. `--bloom-build IN OUT --bloom-n N
+   [--fpr P]`: `--bloom-n` (approx address count) sizes the pair to minimal total blocks with
+   combined FPR ≤ P (default 1e-12); it decodes each line to its program, stream-inserts into
+   both filters, records the distinct script types, writes OUT. `IN='-'` reads **stdin**, so the
+   indexer/full-node output pipes straight in — and, since nothing is stored but the two filters,
+   the source never needs to touch disk: `curl -s LIST | zcat | bip39rxcrack --bloom-build -
+   funded.blf --bloom-n 1500000000`. `--bloom FILE` **mmaps** it (filter1 → GPU, filter2 stays
+   paged on the host), works with `--words`/`--template`, fans out over GPUs like `--addresses`;
+   a hit re-encodes the matched program (base58check/bech32, host SHA-256). `k` and magic are
+   stamped and checked on load. Gate `gate/e2e_bloom_file.js` (`make bloom-e2e`).
+   **1.5e9 sizing**: 2^28 + 2^27 blocks = **12.00 GiB .blf** (8 GiB filter1 on the GPU, fits the
+   32 GiB card beside the ~2 GiB working set; 4 GiB filter2 mmap'd on the host), combined FPR
+   ~5.7e-14. Build peak RAM = the two filters (~12 GiB) — **no sort, no external merge, no extra
+   disk**; the 12 GiB output fits the 25 GB system disk (the +120 GB request is moot). OPEN: the
+   *address data source* (full-node `dumptxoutset` vs an indexer like electrs).
 4. (Later) fold the prebuilt `--bloom` into the hive so each box loads/ships its own `.blf`.
 
 ## Mixed script types = multi-PURPOSE derivation — **DONE** (main, multi-purpose derive)

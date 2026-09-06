@@ -40,7 +40,7 @@ console.log('planted :',M);
 console.log('winner  :',winner,'among',L.length-1,'mixed decoys; J =',J.toString());
 
 let fail=0; const check=(c,m)=>{ console.log((c?'  ok   ':'  FAIL ')+m); if(!c)fail++; };
-try{ execFileSync(CLI,['--bloom-build','-',blf],{input:listText,stdio:['pipe','ignore','inherit']}); }  // pipe list via stdin
+try{ execFileSync(CLI,['--bloom-build','-',blf,'--bloom-n',String(L.length)],{input:listText,stdio:['pipe','ignore','inherit']}); }  // pipe list via stdin
 catch(e){ check(false,'--bloom-build (stdin) failed'); }
 check(fs.existsSync(blf), 'built .blf from stdin exists');
 
