@@ -357,18 +357,24 @@ static int bech32_decode(const char*addr,int*witver,uint8_t*prog,int*proglen,int
 /* Any supported address target -> program (up to 32B) + proglen + purpose:
  *   base58 p2pkh 0x00 -> 44 (20B) ; p2sh 0x05 -> 49 (20B)
  *   bech32 v0 20B     -> 84 (p2wpkh) ; bech32m v1 32B -> 86 (p2tr) */
+/* When set, decode_address stays silent on unsupported/bad input (the caller
+   counts skips instead) -- used by the bulk --bloom-build stream, where millions
+   of legitimately-unsupported lines (P2WSH, other witness versions) would
+   otherwise flood stderr. */
+static int g_decode_quiet=0;
 static int decode_address(const char*addr,uint8_t prog[32],int*proglen,int*purpose){
   if(!strncmp(addr,"bc1",3)||!strncmp(addr,"tb1",3)||!strncmp(addr,"bcrt1",5)){
-    int wv,pl,ism; if(bech32_decode(addr,&wv,prog,&pl,&ism)){ fprintf(stderr,"bad bech32 address\n"); return -1; }
+    int wv,pl,ism; if(bech32_decode(addr,&wv,prog,&pl,&ism)){ if(!g_decode_quiet)fprintf(stderr,"bad bech32 address\n"); return -1; }
     if(wv==0&&pl==20&&ism==0){ *purpose=84; *proglen=20; return 0; }
     if(wv==1&&pl==32&&ism==1){ *purpose=86; *proglen=32; return 0; }
-    fprintf(stderr,"unsupported witness v%d len %d (v1: p2wpkh bc1q / p2tr bc1p)\n",wv,pl); return -1;
+    if(!g_decode_quiet)fprintf(stderr,"unsupported witness v%d len %d (v1: p2wpkh bc1q / p2tr bc1p)\n",wv,pl);
+    return -1;
   }
   uint8_t raw[64]; int n=b58decode(addr,raw,sizeof raw);
-  if(n!=25){ fprintf(stderr,"address base58 decode length %d (want 25)\n",n); return -1; }
+  if(n!=25){ if(!g_decode_quiet)fprintf(stderr,"address base58 decode length %d (want 25)\n",n); return -1; }
   int ver=raw[0]; memcpy(prog,raw+1,20); *proglen=20;
   if(ver==0x00) *purpose=44; else if(ver==0x05) *purpose=49;
-  else { fprintf(stderr,"unsupported address version 0x%02x\n",ver); return -1; }
+  else { if(!g_decode_quiet)fprintf(stderr,"unsupported address version 0x%02x\n",ver); return -1; }
   return 0;
 }
 
@@ -1652,10 +1658,14 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   if(!f1||!f2){ fprintf(stderr,"oom (filters %.2f GiB)\n",(double)(f1b+f2b)/1073741824.0); return 2; }
   fprintf(stderr,"bloom-build: filters %u+%u blocks = %.2f GiB (target FPR %.0e), streaming...\n",nb1,nb2,(double)(f1b+f2b)/1073741824.0,fpr);
   FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
-  long n=0,bad=0; uint32_t purposes[8]; int npurp=0; char line[256];
+  long n=0,bad=0,skip_wsh=0,skip_other=0; uint32_t purposes[8]; int npurp=0; char line[256];
+  g_decode_quiet=1;   /* silence per-line errors; we count + categorize instead */
   while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
     char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
-    uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(s,pr,&pl,&pu)){ if(bad<5) fprintf(stderr,"  skip bad address: %s\n",s); bad++; continue; }
+    uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(s,pr,&pl,&pu)){
+      /* expected & non-derivable: native-segwit script/other-witness (bc1... but not p2wpkh/p2tr) */
+      if(!strncmp(s,"bc1",3)) skip_wsh++; else { skip_other++; if(skip_other<=5) fprintf(stderr,"  skip: %s\n",s); }
+      bad++; continue; }
     (void)pl;
     bloom_insert(f1,pr,nb1-1);
     uint8_t hh[32]; sha256_host(pr,32,hh); bloom_insert(f2,hh,nb2-1);   /* filter 2 = independent */
@@ -1663,7 +1673,10 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
     n++; if((n&0x3FFFFFF)==0) fprintf(stderr,"  ... %ld addresses\r",n); }
   if(f!=stdin) fclose(f);
+  g_decode_quiet=0;
   if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
+  if(bad) fprintf(stderr,"bloom-build: skipped %ld (%ld native-segwit script / other-witness, not seed-derivable; %ld other)\n",bad,skip_wsh,skip_other);
+  if((unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target (rebuild with a larger --bloom-n)\n",n,n_hint);
   double efpr=blf_fpr(nb1,(uint64_t)n)*blf_fpr(nb2,(uint64_t)n);
   FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
   BlfHeader h; memset(&h,0,sizeof h); h.magic=BLF_MAGIC; h.version=2; h.nblocks1=nb1; h.nblocks2=nb2; h.k=BLOOM_K; h.npurp=(uint32_t)npurp;
