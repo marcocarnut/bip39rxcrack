@@ -33,6 +33,7 @@
 #include <cuda.h>
 #include <nvrtc.h>
 #include "rxe.h"
+#include "../cuda/bloom_common.h"
 
 #define CU(x)  do{ CUresult r=(x); if(r!=CUDA_SUCCESS){ const char*s=0; cuGetErrorString(r,&s); \
                    fprintf(stderr,"CUDA error %d (%s) at %s:%d\n",r,s?s:"?",__FILE__,__LINE__); exit(2);} }while(0)
@@ -1322,6 +1323,42 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   }
   printf("NOT FOUND\n"); return 1;
 }
+/* Host-only: validate the blocked-bloom construction empirically -- build a
+ * filter of N random uniform "programs", confirm zero false NEGATIVES, and
+ * measure the false-POSITIVE rate across a sweep of bits/key. No GPU. */
+static uint64_t bst_splitmix(uint64_t *x){   /* high-quality uniform in every bit */
+  uint64_t z=(*x+=0x9E3779B97F4A7C15ULL);
+  z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL; z=(z^(z>>27))*0x94D049BB133111EBULL; return z^(z>>31);
+}
+static void bst_fill(uint64_t *x,uint8_t *p,int n){ for(int i=0;i<n;i+=8){ uint64_t r=bst_splitmix(x); for(int b=0;b<8&&i+b<n;b++) p[i+b]=(uint8_t)(r>>(8*b)); } }
+static int mode_bloom_selftest(long N){
+  if(N<=0) N=1000000;
+  uint64_t s=0x243f6a8885a308d3ULL;
+  uint8_t *mem=malloc((size_t)N*20);
+  for(long i=0;i<N;i++) bst_fill(&s,mem+(size_t)i*20,20);
+  const long M=10000000;   /* non-member probes for the FPR estimate */
+  printf("bloom self-test: N=%ld members, 256-bit block, k=%d (sliced, no re-hash), %ld FP probes\n",N,BLOOM_K,M);
+  printf("  bits/key   filter      members      FP/probes        measured FPR    ~1 in\n");
+  double bpks[]={8,12,16,20,24,32}; int fail=0;
+  double prev_fpr=1.0;
+  for(unsigned bi=0; bi<sizeof bpks/sizeof*bpks; bi++){
+    double bpk=bpks[bi];
+    uint32_t nb=bloom_nblocks((uint64_t)N,bpk), mask=nb-1;
+    uint32_t *filt=calloc((size_t)nb*8,4);
+    for(long i=0;i<N;i++) bloom_insert(filt,mem+(size_t)i*20,mask);
+    long mok=0; for(long i=0;i<N;i++) mok+=bloom_probe(filt,mem+(size_t)i*20,mask);
+    long fp=0; for(long i=0;i<M;i++){ uint8_t q[20]; bst_fill(&s,q,20); fp+=bloom_probe(filt,q,mask); }
+    double fpr=(double)fp/M; double mib=(double)nb*32.0/1048576.0;
+    printf("  %6.0f   %8.2f MiB  %ld/%ld  %8ld/%ld   %.3e   %.0f\n",
+           bpk, mib, mok, N, fp, M, fpr, fp?1.0/fpr:0.0);
+    if(mok!=N){ printf("    FAIL: %ld/%ld members missed (false negative -- construction bug)\n",N-mok,N); fail=1; }
+    (void)prev_fpr; prev_fpr=fpr;
+    free(filt);
+  }
+  free(mem);
+  printf("==== bloom self-test: %s ====\n", fail?"FAILED (false negatives)":"PASSED (no false negatives; FPR falls with bits/key)");
+  return fail?1:0;
+}
 static void usage(void){
   fprintf(stderr,
    "bip39rxcrack -- CUDA BIP39 seed cracker (GPU self-enumerate)\n"
@@ -1392,6 +1429,7 @@ int main(int argc,char**argv){
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
+  int bloom_selftest=0; long bloom_selftest_n=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -1439,6 +1477,7 @@ int main(int argc,char**argv){
       if(!strcmp(o,"first"))order_policy=0; else if(!strcmp(o,"ends"))order_policy=1; else if(!strcmp(o,"center"))order_policy=2; else if(!strcmp(o,"random"))order_policy=3;
       else { fprintf(stderr,"--order: first|ends|center|random[:seed], got '%s'\n",o); return 2; } order_given=1; }
     else if(!strcmp(argv[i],"--devtag")) g_devtag=1;
+    else if(!strcmp(argv[i],"--bloom-selftest")){ bloom_selftest=1; if(i+1<argc&&isdigit((unsigned char)argv[i+1][0])) bloom_selftest_n=atol(argv[++i]); }
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
   /* --resume LOG: reconstruct the run from a saved CSV log and continue from
@@ -1496,7 +1535,7 @@ int main(int argc,char**argv){
   if(g_warm){ build_module(cu); return 0; }
   /* Fan-out applies only to real crack jobs, not gate/util modes (which run once
      on a single device). */
-  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker);
+  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest);
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
      CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
@@ -1520,6 +1559,7 @@ int main(int argc,char**argv){
     else g_csv=stderr;
   }
   /* gate/util modes need no pattern */
+  if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);

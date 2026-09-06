@@ -58,6 +58,10 @@ workqueue-gate: $(CRACK)
 missing-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_missing.js
 
+# blocked-bloom construction: no false negatives + FPR-vs-bits/key sweep (host-only)
+bloom-selftest: $(CRACK)
+	./$(CRACK) --bloom-selftest 1000000
+
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
 

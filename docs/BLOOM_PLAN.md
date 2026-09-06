@@ -44,8 +44,24 @@ for i in 0..k-1:                         // k bits, all within that one block
   the one loaded block; the cost is the single load.
 - **Bit budget**: b + 8k bits. 4 GiB -> b=27; k=16 -> 27+128 = 155 of 160 (hash160) — fits,
   with independent (not double-hashed) positions. Chaincodes/taproot (256 b) fit trivially.
-- This is the Parquet/Impala **split-block bloom filter** (SBBF); the k=8-one-bit-per-lane
-  variant is a SIMD-friendly specialization. k is a tuning dial, not fundamental.
+- Chosen **k=16** (bit position j from byte `P[4+j]`, `0..255` in the 256-bit block):
+  uses `P[0..19]` = exactly one hash160, and lands near optimal k for our 16-32 bits/key
+  range. (k=8-one-bit-per-lane, the Parquet/Impala SBBF, is a simpler variant but far from
+  optimal at high bits/key — measured FPR ~1e-3 vs k=16's ~1e-5 at 33 bits/key.)
+
+**Empirically validated** (`make bloom-selftest`, host-only, `cuda/bloom_common.h`):
+zero false negatives, and FPR tracks theory once probed with *uniform* keys (a real
+hash160 is uniform; an early test using a weak xorshift low-byte inflated FPR ~370x and
+was the test's bug, not the filter's):
+
+| bits/key | filter (1M keys) | measured FPR (k=16) |
+|---|---|---|
+| ~8  | 1 MiB | 1e-1  (k too high for so few bits) |
+| ~17 | 2 MiB | 2.2e-3 |
+| ~33 | 4 MiB | ~1.5e-5 |
+
+At the real target (1.5e9 keys, 4 GiB = ~23 bits/key) this interpolates to **FPR ~1e-4**,
+matching the estimate below; 6 GiB (~33 bits/key) buys ~1e-5.
 
 ## Sizing & FPR — and why we have huge latitude
 
