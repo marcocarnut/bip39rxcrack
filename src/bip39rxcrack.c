@@ -22,7 +22,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <signal.h>
+#include <spawn.h>
+#include <errno.h>
 #include <ctype.h>
 #include <gmp.h>
 #include <cuda.h>
@@ -94,6 +98,12 @@ static int g_change_v=1,g_gap_v=1,g_checksum_v=1,g_nth_v=-1,g_compact_v=1;
 static unsigned long long g_orig_start=0;
 /* --resume overrides: report global progress over the ORIGINAL job window */
 static unsigned long long g_prog_total=0, g_swept_base=0, g_hashed_base=0; static int g_resuming=0;
+static int g_device=0;        /* CUDA ordinal to run on (--device) */
+static int g_print_total=0;   /* --print-total: print the job size and exit before any GPU work */
+static int g_warm=0;          /* --warm: build/JIT the module (populate PTX cache) and exit */
+static int g_devtag=0;        /* prefix -p progress with the device index (multi-GPU children) */
+static char g_li_raw[320];    /* raw --loginterval value (survives in-place arg mutation) */
+static const char *g_csv_path=0;  /* CSV file to open (deferred: supervisors don't log) */
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
   char dir[512]; snprintf(dir,sizeof dir,"%s",cu); char*sl=strrchr(dir,'/'); if(sl)*sl=0; else strcpy(dir,".");
@@ -130,9 +140,12 @@ static void build_module(const char *cu_path){
     }
     if(cr!=NVRTC_SUCCESS){ fprintf(stderr,"kernel compile failed\n"); exit(2); }
     size_t ptxn=0; NVR(nvrtcGetPTXSize(prog,&ptxn)); ptx=malloc(ptxn); NVR(nvrtcGetPTX(prog,ptx)); nvrtcDestroyProgram(&prog);
-    FILE*wf=fopen(cpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); }
+    /* Atomic write (tmp+rename): concurrent multi-GPU children never read a
+       half-written PTX -- each sees the old-complete or the new-complete file. */
+    char tpath[300]; snprintf(tpath,sizeof tpath,"%s.tmp.%d",cpath,(int)getpid());
+    FILE*wf=fopen(tpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); if(rename(tpath,cpath)) unlink(tpath); }
   }
-  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,0)); g_dev=dev;
+  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,g_device)); g_dev=dev;
   char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
   cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
@@ -148,7 +161,7 @@ static void build_module(const char *cu_path){
       void*a[]={&tbl}; CU(cuLaunchKernel(gi,1,1,1,1,1,1,0,0,a,0)); CU(cuCtxSynchronize());
       CUdeviceptr sym; size_t sz; if(cuModuleGetGlobal(&sym,&sz,g_mod,"d_comb")==CUDA_SUCCESS) CU(cuMemcpyHtoD(sym,&tbl,sizeof tbl));
     } }
-  fprintf(stderr,"device: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n",name,M,m);
+  fprintf(stderr,"device %d: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n",g_device,name,M,m);
   if(getenv("KERN_INFO")){
     const char*ks[]={"g_crack_pass","g_crack_addr","g_crack"};
     for(int i=0;i<3;i++){ CUfunction f; if(cuModuleGetFunction(&f,g_mod,ks[i])!=CUDA_SUCCESS) continue;
@@ -211,7 +224,9 @@ static void prog_emit_p(Prog*P){
   double dwt=now-P->p_win_t; unsigned long long dsw=P->swept-P->p_win_swept;
   double inst=dwt>0.01?dsw/dwt/1e6:cum, pct=P->total?100.0*gsw/P->total:0.0;
   double eta=(inst>0&&P->total>gsw)?(P->total-gsw)/(inst*1e6):0.0;
-  fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
+  if(g_devtag) fprintf(stderr,"[dev%d] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs\n",
+      g_device,gsw/1e6,P->total/1e6,pct,inst,ghash/1e6,eta);
+  else fprintf(stderr,"\r[%7.1fs] %.1f/%.1fM (%.1f%%) %.2f Mc/s  hashed %.2fM  ETA %.0fs    ",
       el,gsw/1e6,P->total/1e6,pct,inst,ghash/1e6,eta);
   P->p_last=now; P->p_win_t=now; P->p_win_swept=P->swept;
 }
@@ -506,6 +521,7 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
   struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
   mpz_t total; mpz_init(total); mpz_set(total,r->nitems);
   if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words (20! < 2^64). Got %d.\n",W->n); return 2; }
+  if(g_print_total){ gmp_printf("%Zd\n",total); return 0; }
   build_module(cu);
   CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
   CUdeviceptr dtc=up(target_cc,32), dpu=up(purposes,npurp*sizeof(uint32_t));
@@ -562,6 +578,7 @@ static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
   struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
   mpz_t total; mpz_init(total); mpz_set(total,r->nitems);
   if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
+  if(g_print_total){ gmp_printf("%Zd\n",total); return 0; }
   build_module(cu);
   CUdeviceptr dd,dof,dln,dix; gpu_upload_words(W,&dd,&dof,&dln,&dix);
   CUdeviceptr dtp=up(tprog,32);
@@ -709,15 +726,17 @@ static int mode_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint3
   if(nthmode==1){ if(!last_unknown){ fprintf(stderr,"--nth needs the LAST position to be [:bip39-en:]\n"); return 2; } nth=1; }
   else if(nthmode==0) nth=0;
   else nth = last_unknown;
-  build_module(cu);
-  CUdeviceptr dwl,dwoff,dwlen; gpu_upload_wordlist(&dwl,&dwoff,&dwlen);
-  CUdeviceptr dtmpl=up(tmpl,W*sizeof(uint32_t)), dtp=up(tprog,32);
-  /* unknown positions passed to the kernel: baseline=all U; nth=others (exclude last W-1) */
+  /* unknown positions passed to the kernel: baseline=all U; nth=others (exclude last
+     W-1). Compute the job size here (host-only) so --print-total needs no GPU. */
   int kpos[32],kU; unsigned long long total=1;
   if(nth){ kU=0; for(int i=0;i<U;i++) if(upos[i]!=W-1) kpos[kU++]=upos[i];
     for(int i=0;i<kU;i++) total*=2048ULL;
     total <<= freebits; }
   else { kU=U; for(int i=0;i<U;i++) kpos[i]=upos[i]; for(int i=0;i<U;i++) total*=2048ULL; }
+  if(g_print_total){ printf("%llu\n",total); return 0; }
+  build_module(cu);
+  CUdeviceptr dwl,dwoff,dwlen; gpu_upload_wordlist(&dwl,&dwoff,&dwlen);
+  CUdeviceptr dtmpl=up(tmpl,W*sizeof(uint32_t)), dtp=up(tprog,32);
   CUdeviceptr dupos=up(kpos, (kU?kU:1)*sizeof(int));
   unsigned long long start=ustart>total?total:ustart;
   unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
@@ -841,13 +860,14 @@ static int passphrase_width(const char*pat){
 static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32],
                            int purpose,uint32_t changes,uint32_t gap,
                            unsigned long long ustart,unsigned long long ucount,const char*cu){
+  unsigned long long total=1; for(int i=0;i<pwidth;i++) total*=10ULL;
+  if(g_print_total){ printf("%llu\n",total); return 0; }
   build_module(cu);
   int mnlen=(int)strlen(mnemonic);
   CUdeviceptr dmn=up(mnemonic,mnlen), dtp=up(tprog,32);
   /* precompute the fixed-mnemonic HMAC key context once (regime A) */
   CUdeviceptr dhctx; CU(cuMemAlloc(&dhctx,16*sizeof(unsigned long long)));
   { void*ia[]={&dmn,&mnlen,&dhctx}; CU(cuLaunchKernel(kern("g_hctx_init"),1,1,1,1,1,1,0,0,ia,0)); CU(cuCtxSynchronize()); }
-  unsigned long long total=1; for(int i=0;i<pwidth;i++) total*=10ULL;
   unsigned long long start=ustart>total?total:ustart;
   unsigned long long count=ucount?ucount:(total-start); if(start+count>total) count=total-start;
   unsigned long long init=~0ULL; int zero=0;
@@ -922,6 +942,120 @@ static int mode_profile(const char*cu){
          " low occupancy on a latency-bound serial hash = headroom via fewer regs / more ILP.)\n");
   return 0;
 }
+/* ---------------------- multi-GPU fan-out supervisor ----------------------
+ * --devices/--gpus turns this process into a supervisor: it computes the job
+ * size once (a --print-total child, no GPU), warms the PTX cache once, then
+ * forks one crack child per GPU over a contiguous slice of the canonical index
+ * space (reusing --device/--start/--count). First child to exit 0 (FOUND) wins;
+ * the supervisor SIGTERMs the siblings' process group. Ctrl-C kills them too. */
+extern char **environ;
+static volatile sig_atomic_t g_sup_pgid=0;
+static void sup_sigint(int sig){ (void)sig; if(g_sup_pgid) killpg(g_sup_pgid,SIGTERM); _exit(130); }
+
+/* Copy argv, dropping the fan-out/slice flags (and their values), then append
+   `extra` verbatim. Returns a NULL-terminated malloc'd argv (argv[0] kept). */
+static char**child_argv(int argc,char**argv,char*const*extra,int nextra){
+  char**out=calloc((size_t)argc+nextra+2,sizeof(char*)); int o=0;
+  for(int i=0;i<argc;i++){
+    if(!strcmp(argv[i],"--devices")||!strcmp(argv[i],"--gpus")||!strcmp(argv[i],"--device")||
+       !strcmp(argv[i],"--start")||!strcmp(argv[i],"--count")||!strcmp(argv[i],"--limit")||
+       !strcmp(argv[i],"--loginterval")){ i++; continue; }   /* drop flag + its value */
+    if(!strcmp(argv[i],"--print-total")||!strcmp(argv[i],"--warm")) continue;
+    out[o++]=argv[i];
+  }
+  for(int i=0;i<nextra;i++) out[o++]=extra[i];
+  out[o]=0; return out;
+}
+/* Spawn cargv, capture its stdout into out[]. Returns 0 iff it exited 0. */
+static int run_capture(char**cargv,char*out,size_t outn){
+  int pfd[2]; if(pipe(pfd)) return -1;
+  posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa,pfd[1],STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&fa,pfd[0]);
+  posix_spawn_file_actions_addclose(&fa,pfd[1]);
+  pid_t pid; int rc=posix_spawn(&pid,"/proc/self/exe",&fa,0,cargv,environ);
+  posix_spawn_file_actions_destroy(&fa); close(pfd[1]);
+  if(rc){ close(pfd[0]); return -1; }
+  size_t k=0; ssize_t r; while(k+1<outn && (r=read(pfd[0],out+k,outn-1-k))>0) k+=(size_t)r;
+  out[k]=0; close(pfd[0]); int st; waitpid(pid,&st,0);
+  return (WIFEXITED(st)&&WEXITSTATUS(st)==0)?0:-1;
+}
+static int run_supervisor(int argc,char**argv,int*devs,int ndev,
+                          unsigned long long ostart,unsigned long long ocount){
+  /* 1) job size via a no-GPU --print-total child */
+  char*pt[]={"--print-total"}; char**ptv=child_argv(argc,argv,pt,1);
+  char nbuf[64]; if(run_capture(ptv,nbuf,sizeof nbuf)){ fprintf(stderr,"supervisor: could not compute job total\n"); free(ptv); return 2; }
+  free(ptv);
+  unsigned long long total=strtoull(nbuf,0,10);
+  if(!total){ fprintf(stderr,"supervisor: job total is 0 (nothing to sweep)\n"); return 2; }
+  if(ostart>total) ostart=total;
+  unsigned long long owin = ocount?ocount:(total-ostart);
+  if(ostart+owin>total) owin=total-ostart;
+  fprintf(stderr,"supervisor: total=%llu, window=[%llu,%llu), fan-out to %d GPU(s)\n",total,ostart,ostart+owin,ndev);
+
+  /* 2) warm the PTX cache once so the N children don't all compile in parallel */
+  char dv0[16]; snprintf(dv0,sizeof dv0,"%d",devs[0]);
+  char*we[]={"--warm","--device",dv0}; char**wv=child_argv(argc,argv,we,3);
+  { pid_t wp; if(!posix_spawn(&wp,"/proc/self/exe",0,0,wv,environ)){ int st; waitpid(wp,&st,0);
+      if(!(WIFEXITED(st)&&WEXITSTATUS(st)==0)){ fprintf(stderr,"supervisor: warm build failed\n"); free(wv); return 2; } } }
+  free(wv);
+
+  /* original --loginterval (if any): give each child its own .devN file.
+     Use the captured globals -- argv was mutated in place during parse. */
+  int li_ms = g_loginterval_ms>0 ? g_loginterval_ms : -1;
+  const char *li_file = g_csv_path;
+
+  /* 3) fan out one child per device over a contiguous slice */
+  pid_t pids[16]={0}; int alive=0; pid_t pgid=0;
+  signal(SIGINT,sup_sigint); signal(SIGTERM,sup_sigint);  /* armed before the first child exists */
+  for(int d=0; d<ndev; d++){
+    unsigned long long s = ostart + (unsigned long long)((__int128)owin*d/ndev);
+    unsigned long long e = ostart + (unsigned long long)((__int128)owin*(d+1)/ndev);
+    if(e<=s) continue;   /* empty slice (fewer indices than GPUs): --count 0 would mean
+                            "sweep to end" to the child, so skip spawning it entirely */
+    char dv[16],sd[24],cd[24],liarg[320];
+    snprintf(dv,sizeof dv,"%d",devs[d]); snprintf(sd,sizeof sd,"%llu",s); snprintf(cd,sizeof cd,"%llu",e-s);
+    char*extra[12]; int ne=0;
+    extra[ne++]="--device"; extra[ne++]=dv;
+    extra[ne++]="--start";  extra[ne++]=sd;
+    extra[ne++]="--count";  extra[ne++]=cd;
+    extra[ne++]="--devtag";
+    if(li_ms>=0){
+      if(li_file){ const char*dot=strrchr(li_file,'.');
+        if(dot) snprintf(liarg,sizeof liarg,"%d:%.*s.dev%d%s",li_ms,(int)(dot-li_file),li_file,devs[d],dot);
+        else    snprintf(liarg,sizeof liarg,"%d:%s.dev%d",li_ms,li_file,devs[d]); }
+      else snprintf(liarg,sizeof liarg,"%d",li_ms);
+      extra[ne++]="--loginterval"; extra[ne++]=liarg;
+    }
+    char**cv=child_argv(argc,argv,extra,ne);
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at,POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&at,pgid);   /* 0 => new group (this child leads it) */
+    pid_t pid; int rc=posix_spawn(&pid,"/proc/self/exe",0,&at,cv,environ);
+    posix_spawnattr_destroy(&at); free(cv);
+    if(rc){ fprintf(stderr,"supervisor: spawn dev %d failed: %s\n",devs[d],strerror(rc)); continue; }
+    if(!pgid){ pgid=pid; g_sup_pgid=pgid; }  /* first child's pid is the group id; arm the handler */
+    pids[d]=pid; alive++;
+  }
+  if(alive==0){ fprintf(stderr,"supervisor: no children spawned\n"); return 2; }
+
+  /* 4) supervise: first child to exit 0 (FOUND) wins; kill the siblings */
+  int winner=-1, err=0;
+  while(alive>0){
+    int st; pid_t pid=waitpid(-1,&st,0);
+    if(pid<0){ if(errno==EINTR) continue; break; }
+    int which=-1; for(int d=0;d<ndev;d++) if(pids[d]==pid) which=d;
+    alive--;
+    int code = WIFEXITED(st)?WEXITSTATUS(st):-1;
+    if(code==0){ winner=which; killpg(pgid,SIGTERM);
+      while(alive>0){ if(waitpid(-1,0,0)>0) alive--; else if(errno!=EINTR) break; }
+      break;
+    } else if(code!=1) err=1;   /* 1 = this slice NOT FOUND; anything else = error */
+  }
+  if(winner>=0){ fprintf(stderr,"supervisor: device %d found it.\n",devs[winner]); return 0; }
+  if(err){ fprintf(stderr,"supervisor: a child errored; result inconclusive.\n"); return 2; }
+  fprintf(stderr,"supervisor: NOT FOUND across all %d slice(s).\n",ndev); return 1;
+}
 static void usage(void){
   fprintf(stderr,
    "bip39rxcrack -- CUDA BIP39 seed cracker (GPU self-enumerate)\n"
@@ -951,6 +1085,11 @@ static void usage(void){
    "  --compact / --no-compact   dense-survivor path (default on; words+address+sieve)\n"
    "  --start IDX --count N    sweep a fixed index slice (windowed benchmark)\n"
    "  --limit N               alias of --count\n"
+   "  --device D              run on CUDA ordinal D (default 0)\n"
+   "  --devices D0,D1,..      fan out one child process per GPU over disjoint index\n"
+   "  --gpus N                slices; first to FOUND wins, siblings are killed\n"
+   "                          (--devices 0,1  ==  --gpus 2). Honours an outer --start/--count.\n"
+   "  --print-total           print the job size (index count) and exit (no GPU)\n"
    "  --kernels PATH          crack_kernels.cu (default cuda/crack_kernels.cu)\n"
    "  env: COMPACT_BUDGET_MB (survivor buffer, default 1024), CRACK_NOCACHE=1 (recompile)\n"
    "\n"
@@ -980,6 +1119,7 @@ int main(int argc,char**argv){
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
   const char *resumearg=0;
+  int devs[16], ndev=0;   /* --devices/--gpus: fan out one child per GPU */
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -989,9 +1129,12 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--compact")) compact=1;
     else if(!strcmp(argv[i],"--no-compact")) compact=0;
     else if(!strcmp(argv[i],"-p")){ g_pflag=1; if(i+1<argc && (isdigit((unsigned char)argv[i+1][0])||argv[i+1][0]=='.')) g_p_secs=atof(argv[++i]); }
-    else if(!strcmp(argv[i],"--loginterval")&&i+1<argc){ char*a=argv[++i]; char*colon=strchr(a,':');
-      if(colon){ *colon=0; g_loginterval_ms=atoi(a); g_csv=fopen(colon+1,"w"); g_csv_own=1; if(!g_csv){fprintf(stderr,"cannot open %s\n",colon+1);return 2;} }
-      else { g_loginterval_ms=atoi(a); g_csv=stderr; } }
+    else if(!strcmp(argv[i],"--loginterval")&&i+1<argc){
+      /* capture raw first (the fan-out supervisor re-reads it), and DEFER the fopen:
+         a supervisor must not open the log -- each child opens its own per-device file. */
+      snprintf(g_li_raw,sizeof g_li_raw,"%s",argv[++i]);
+      char*colon=strchr(g_li_raw,':'); if(colon){ *colon=0; g_csv_path=colon+1; }
+      g_loginterval_ms=atoi(g_li_raw); }
     else if(!strcmp(argv[i],"--recon-gate")){ recon=1; if(i+1<argc&&argv[i+1][0]!='-') recon_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--miss-gate")){ missgate=1; if(i+1<argc&&isdigit((unsigned char)argv[i+1][0])) missgate_n=atoi(argv[++i]); }
     else if(!strcmp(argv[i],"--profile")) profile=1;
@@ -1013,6 +1156,12 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--gap")&&i+1<argc) a_gap=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else if(!strcmp(argv[i],"--resume")&&i+1<argc) resumearg=argv[++i];
+    else if(!strcmp(argv[i],"--device")&&i+1<argc) g_device=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--devices")&&i+1<argc){ ndev=0; char*s=strtok(argv[++i],","); while(s&&ndev<16){ devs[ndev++]=atoi(s); s=strtok(0,","); } }
+    else if(!strcmp(argv[i],"--gpus")&&i+1<argc){ int N=atoi(argv[++i]); if(N>16)N=16; ndev=N; for(int d=0;d<N;d++)devs[d]=d; }
+    else if(!strcmp(argv[i],"--print-total")) g_print_total=1;
+    else if(!strcmp(argv[i],"--warm")) g_warm=1;
+    else if(!strcmp(argv[i],"--devtag")) g_devtag=1;
     else { fprintf(stderr,"unknown arg: %s\n",argv[i]); usage(); return 2; }
   }
   /* --resume LOG: reconstruct the run from a saved CSV log and continue from
@@ -1065,6 +1214,16 @@ int main(int argc,char**argv){
     static char purpbuf[64];
     if(purpose_set){ int L=0; for(int i=0;i<npurp;i++) L+=snprintf(purpbuf+L,sizeof purpbuf-L,"%s%u",i?",":"",purposes[i]); g_purpose_str=purpbuf; }
     else g_purpose_str="auto";
+  }
+  /* --warm: build/JIT the module (populate the PTX cache) and exit */
+  if(g_warm){ build_module(cu); return 0; }
+  /* --devices/--gpus: become the fan-out supervisor over the local GPUs */
+  if(ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
+  /* open the deferred CSV now that we know we're an actual cracker, not a supervisor
+     (--resume already opened its own append handle, so only open when unset) */
+  if(g_loginterval_ms && !g_csv){
+    if(g_csv_path){ g_csv=fopen(g_csv_path,"w"); g_csv_own=1; if(!g_csv){ fprintf(stderr,"cannot open %s\n",g_csv_path); return 2; } }
+    else g_csv=stderr;
   }
   /* gate/util modes need no pattern */
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;

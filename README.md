@@ -109,13 +109,25 @@ make decode-gate  # address target decode vs the oracle
 make nth-gate   # [:Nth:] construction == brute + sieve
 make miss-gate  # missing-word/[:Nth:] unrank index == librxe canonical rank
 node gate/e2e.js  # xpub end-to-end: plant → crack → assert index / mnemonic / path
+node gate/e2e_multigpu.js  # multi-GPU: plant → fan out → assert one GPU FOUND at global rank
 ```
 
 Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` |
 `--target-chaincode`; `--purpose --change --index --no-checksum`; `--nth` /
 `--no-nth`; `--no-compact` (compaction is on by default); sharding
 `--start --count --limit`; `--rank` (librxe index of an arrangement);
-`--resume LOG` (continue a killed run from its progress log).
+`--resume LOG` (continue a killed run from its progress log); multi-GPU
+`--device D`, `--devices 0,1` / `--gpus N`, `--print-total`.
+
+**Multi-GPU.** `--devices 0,1` (or `--gpus 2`) turns the process into a supervisor:
+it computes the job size once (`--print-total`, no GPU), warms the PTX cache, then
+forks one crack child per GPU over a **contiguous slice of the canonical index
+space** (reusing `--device`/`--start`/`--count`). The first child to find a hit exits
+0 and the supervisor kills the siblings; Ctrl-C kills the whole group. The reported
+index stays the **global** librxe rank regardless of which GPU found it, and an outer
+`--start/--count` still applies (so a cluster can split first, then fan out locally).
+Speedup is linear — a 100M-candidate sweep drops from 50.4 s on one 5090 to 25.4 s on
+two (**1.99×**). Each child logs its own `-p`/CSV (`[devN]` tag, `<file>.devN.csv`).
 
 **Progress & logging.** `-p` prints a live status line (~1/s: elapsed, swept/total,
 rate, ETA — the ETA uses a recent-window rate so it tracks the real throughput):
@@ -162,7 +174,8 @@ per candidate).
 
 The full 479M-permutation example recovers in **~23 s** by default (~5 min with
 `--no-compact`); with an actual winner it early-exits far sooner. A `[0-9]{7}`
-(10M) passphrase deep-winner is found in ~7 s.
+(10M) passphrase deep-winner is found in ~7 s. These are **per-GPU** figures;
+`--devices` scales them linearly (measured **1.99×** on 2× RTX 5090).
 
 **What moves the needle:** at `--gap 1` the tool is **PBKDF2-bound** (SHA-512
 dominates); at `--gap > 1` the extra secp256k1 derivations per seed make EC a real

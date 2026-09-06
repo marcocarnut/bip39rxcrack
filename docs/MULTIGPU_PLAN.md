@@ -1,8 +1,40 @@
 # Multi-GPU fan-out — implementation plan
 
-Status: **not started** (written 2026-09-06, for the dual-RTX-5090 session).
+Status: **IMPLEMENTED 2026-09-06** on the dual-RTX-5090 box (branch `multigpu`).
 Baseline: single 5090 at ~1.43 Mc/s (gap=1) / ~1.23 Mc/s (gap=5), 24-word `[:Nth:]`,
 after the SHA-512 + secp256k1 unroll wins. `main` @ `8c902ff`.
+
+## Implementation status (what actually shipped)
+
+Phases A–E done; the design below held with no surprises.
+
+- **A `--device D`** — `build_module()` selects the CUDA ordinal; banner prints it.
+- **B `--print-total`** — each mode computes its `total` host-side and prints it before
+  any GPU work (no shared helper needed; the early-return lives in the mode, so it can
+  never disagree with the crack). 24-word 3-missing `[:Nth:]` → `68719476736` (2³⁶). ✓
+- **C `--devices 0,1` / `--gpus N`** — supervisor computes total via a `--print-total`
+  child, warms the PTX cache once (`--warm`, atomic tmp+rename write), then
+  `posix_spawn`s one crack child per GPU over a contiguous canonical slice
+  (`--device d --start … --count …`), all in one process group. First child to exit 0
+  (FOUND) wins → `killpg(SIGTERM)` the siblings; Ctrl-C on the supervisor kills the group.
+  Honours an outer `--start/--count` (cluster-then-local two-level split).
+- **D progress** — `--devtag` prefixes each child's `-p` line with `[devN]`; per-child
+  CSV logs are auto-suffixed `<file>.devN.csv` (supervisor no longer opens the log itself).
+- **E gating** — `gate/e2e_multigpu.js`: plant → rank J → fan out over a window that puts
+  J in the **upper** slice → assert exactly one device FOUND, reported index == J ==
+  librxe rank, mnemonic == planted. PASSES on 2 GPUs.
+
+**Measured**: 100M-candidate sweep 1 GPU 50.4s → 2 GPU 25.4s = **1.99× (linear)**;
+each GPU holds full per-GPU rate (~1.97 Mc/s), no contention. Group-kill leaves no orphans.
+
+### Gotchas that actually bit
+- The main arg-parse mutated `argv` in place (`*colon=0`) when opening `--loginterval`'s
+  CSV, so the supervisor re-reading `argv` lost the filename → children logged to stderr.
+  Fix: capture the raw value into a stable global and **defer** the `fopen` until we know
+  the process is a cracker, not a supervisor (supervisors never open the log).
+
+---
+### Original plan (for reference)
 
 ## Goal
 

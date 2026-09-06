@@ -33,12 +33,17 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
 miss-gate: $(CRACK)
 	./$(CRACK) --miss-gate 64
+
+# multi-GPU fan-out parity: plant -> fan out over both GPUs -> assert one FOUND
+# at the global librxe rank (needs >=2 CUDA devices).
+multigpu-gate: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_multigpu.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
