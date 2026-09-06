@@ -168,9 +168,15 @@ more work than the naive one.
    (filter → GPU, cull → host bsearch — the cull is paged from disk, never fully loaded, so it
    scales toward ~1.5e9), works with `--words`/`--template` and fans out over GPUs like
    `--addresses`; a hit reports the matched hash160 (prebuilt files carry no address strings).
-   `k` is stamped in the header and checked on load. Gate `gate/e2e_bloom_file.js`
-   (`make bloom-e2e`). OPEN: the *address data source* (full-node `dumptxoutset` vs an indexer)
-   and, for the true 1.5e9 build, an external sort (the builder currently sorts in RAM).
+   `k` is stamped in the header and checked on load. The cull stores a **10-byte prefix** per
+   program (80-bit; ~1e-15 false-cull/candidate at 1.5e9) — 15 GB not 48 GB for the full set; a
+   found address is re-encoded from the derived program (base58check/bech32, host SHA-256).
+   Gate `gate/e2e_bloom_file.js` (`make bloom-e2e`). **1.5e9 build sizing** (503 GB host /
+   124 GB instance RAM, +120 GB disk): filter ~8.6 GB + 10-byte cull ~15 GB = **~24 GB .blf**;
+   build peak RAM ~72 GB (20-byte records in RAM for the sieve + filter) — **in-RAM qsort, NO
+   external merge sort**; stream the source compressed via `zcat … | --bloom-build - out.blf`
+   (never decompress to disk). OPEN: the *address data source* (full-node `dumptxoutset` vs an
+   indexer like electrs).
 4. (Later) fold the prebuilt `--bloom` into the hive so each box loads/ships its own `.blf`.
 
 ## Mixed script types = multi-PURPOSE derivation — **DONE** (main, multi-purpose derive)

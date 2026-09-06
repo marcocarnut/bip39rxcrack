@@ -669,16 +669,19 @@ typedef struct { uint8_t prog[32]; char *str; int purpose; } AEnt;
  * `flat` (a sorted 32-byte-record array, e.g. mmap'd from a prebuilt .blf; --bloom).
  * `prefilter` (when set) is a ready-made filter to upload instead of building one. */
 typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp;
-                 const uint8_t *flat; long flatn;
+                 const uint8_t *flat; long flatn; int cull_stride;   /* flat-cull record size (10 or 32) */
                  const uint32_t *prefilter; uint32_t prefilter_nblocks; } AddrSet;
 static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,32); }
-static int prog32_cmp(const void*a,const void*b){ return memcmp(a,b,32); }
+static int g_cull_stride=32;   /* flat-cull compare width; a truncated prefix (e.g. 10B) is
+                                  exact enough at 1.5e9 (~1e-15 false-cull/candidate) and cuts
+                                  the on-disk cull from ~48 GB to ~15 GB. */
+static int cmp_cull(const void*a,const void*b){ return memcmp(a,b,(size_t)g_cull_stride); }
 static void aset_sort(AddrSet*A){ qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
 static const AEnt* aset_lookup(const AddrSet*A,const uint8_t*prog){   /* only ent-backed carries strings */
   if(A->flat||!A->ent) return 0;
   AEnt key; memcpy(key.prog,prog,32); return (const AEnt*)bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
 static int aset_member(const AddrSet*A,const uint8_t*prog){
-  if(A->flat) return bsearch(prog,A->flat,(size_t)A->flatn,32,prog32_cmp)!=0;
+  if(A->flat){ g_cull_stride=A->cull_stride; return bsearch(prog,A->flat,(size_t)A->flatn,(size_t)A->cull_stride,cmp_cull)!=0; }
   return aset_lookup(A,prog)!=0; }
 static void aset_free(AddrSet*A){ if(!A->ent) return; for(long i=0;i<A->n;i++) free(A->ent[i].str); free(A->ent); A->ent=0; }
 
@@ -1610,37 +1613,41 @@ static int build_xpubset(const char*csv,const char*file,AddrSet*A){
  * program mmaps it: filter -> GPU, cull -> host bsearch. Scales to ~1.5e9 (the
  * cull is paged from disk, never fully loaded). */
 #define BLF_MAGIC 0x31464C42u   /* 'B','L','F','1' */
-typedef struct { uint32_t magic,version,nblocks,k,npurp; uint32_t purposes[8]; uint64_t n_addrs,reserved; } BlfHeader;
+#define CULL_BYTES 10           /* cull record = first 10B of the program (80-bit prefix) */
+typedef struct { uint32_t magic,version,nblocks,k,npurp; uint32_t purposes[8]; uint64_t n_addrs; uint32_t cull_bytes,reserved; } BlfHeader;
 
 /* Read addresses (one per line) -> a .blf. Decodes each to its 32-byte (zero-padded)
    program, records the distinct script types, builds the filter, sorts the cull. */
 static int build_bloom_file(const char*infile,const char*outfile,double bpk){
   FILE*f = (!strcmp(infile,"-")) ? stdin : fopen(infile,"r");   /* "-" reads stdin (pipe the indexer/full node) */
   if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
+  /* store 20B/record: enough for bloom_insert (reads P[0..19]) and the 10B cull prefix. */
   uint8_t *progs=0; long n=0,cap=0; uint32_t purposes[8]; int npurp=0; long bad=0;
   char line[256];
   while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
     char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
     uint8_t pr[32]; int pl,pu; if(decode_address(s,pr,&pl,&pu)){ if(bad<5) fprintf(stderr,"  skip bad address: %s\n",s); bad++; continue; }
-    if(n==cap){ cap=cap?cap*2:(1L<<20); progs=realloc(progs,(size_t)cap*32); if(!progs){ fprintf(stderr,"oom\n"); return 2; } }
-    memset(progs+(size_t)n*32,0,32); memcpy(progs+(size_t)n*32,pr,(size_t)pl); n++;
+    (void)pl;
+    if(n==cap){ cap=cap?cap*2:(1L<<20); progs=realloc(progs,(size_t)cap*20); if(!progs){ fprintf(stderr,"oom\n"); return 2; } }
+    memcpy(progs+(size_t)n*20,pr,20); n++;   /* first 20B (h160; or taproot key prefix) */
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu; }
   if(f!=stdin) fclose(f);
   if(n==0){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
-  qsort(progs,(size_t)n,32,prog32_cmp);
   uint32_t nb=bloom_nblocks((uint64_t)n,bpk); size_t fbytes=(size_t)nb*32u;
   uint32_t *filt=calloc(fbytes,1); if(!filt){ fprintf(stderr,"oom (filter %.1f GiB)\n",(double)fbytes/1073741824.0); return 2; }
-  for(long i=0;i<n;i++) bloom_insert(filt,progs+(size_t)i*32,nb-1);
+  for(long i=0;i<n;i++) bloom_insert(filt,progs+(size_t)i*20,nb-1);
+  g_cull_stride=CULL_BYTES; qsort(progs,(size_t)n,20,cmp_cull);     /* sort 20B recs by 10B prefix */
+  for(long i=0;i<n;i++) memmove(progs+(size_t)i*CULL_BYTES,progs+(size_t)i*20,CULL_BYTES);  /* compact to 10B cull */
   FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
   BlfHeader h; memset(&h,0,sizeof h); h.magic=BLF_MAGIC; h.version=1; h.nblocks=nb; h.k=BLOOM_K; h.npurp=(uint32_t)npurp;
   for(int i=0;i<npurp;i++) h.purposes[i]=purposes[i];
-  h.n_addrs=(uint64_t)n;
-  fwrite(&h,sizeof h,1,o); fwrite(filt,fbytes,1,o); fwrite(progs,(size_t)n*32,1,o);
+  h.n_addrs=(uint64_t)n; h.cull_bytes=CULL_BYTES;
+  fwrite(&h,sizeof h,1,o); fwrite(filt,fbytes,1,o); fwrite(progs,(size_t)n*CULL_BYTES,1,o);
   if(fclose(o)){ fprintf(stderr,"write error %s\n",outfile); return 2; }
   free(filt); free(progs);
-  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), %u blocks = %.1f MiB filter, %d purpose(s) -> %s (%.1f MiB total)\n",
-          n,bad,nb,(double)fbytes/1048576.0,npurp,outfile,(double)(sizeof h+fbytes+(size_t)n*32)/1048576.0);
+  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), %u blocks = %.1f MiB filter, %d purpose(s), %dB cull -> %s (%.1f MiB total)\n",
+          n,bad,nb,(double)fbytes/1048576.0,npurp,CULL_BYTES,outfile,(double)(sizeof h+fbytes+(size_t)n*CULL_BYTES)/1048576.0);
   return 0;
 }
 /* mmap a .blf into an AddrSet (prefilter + flat cull; no strings). */
@@ -1656,10 +1663,11 @@ static int load_bloom_file(const char*path,AddrSet*A){
   memset(A,0,sizeof *A);
   A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)); A->prefilter_nblocks=h->nblocks;
   A->flat=(const uint8_t*)base+sizeof(BlfHeader)+fbytes; A->flatn=(long)h->n_addrs;
+  A->cull_stride=h->cull_bytes?(int)h->cull_bytes:32;   /* 0 => legacy 32B cull */
   A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
   if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
-  fprintf(stderr,"bloom: loaded %s -- %ld addresses, %u blocks (%.1f MiB), %d purpose(s)\n",
-          path,A->flatn,h->nblocks,(double)fbytes/1048576.0,A->npurp);
+  fprintf(stderr,"bloom: loaded %s -- %ld addresses, %u blocks (%.1f MiB), %dB cull, %d purpose(s)\n",
+          path,A->flatn,h->nblocks,(double)fbytes/1048576.0,A->cull_stride,A->npurp);
   return 0;
 }
 /* xpub SET (words, EC-free): a blocked bloom of account chaincodes; multi-purpose
