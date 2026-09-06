@@ -371,6 +371,78 @@ static int decode_address(const char*addr,uint8_t prog[32],int*proglen,int*purpo
   return 0;
 }
 
+/* --------------- address ENCODE (program+purpose -> string) --------------
+ * Inverse of decode_address, for reporting a found address from a prebuilt bloom
+ * (which carries no strings). Needs host SHA-256 for base58check. */
+#define ROR32(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void sha256_host(const uint8_t*msg,size_t len,uint8_t out[32]){
+  static const uint32_t K[64]={
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+  uint32_t h[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  size_t padlen=((len+8)/64+1)*64; uint8_t*m=calloc(padlen,1); memcpy(m,msg,len); m[len]=0x80;
+  uint64_t bits=(uint64_t)len*8; for(int i=0;i<8;i++) m[padlen-1-i]=(uint8_t)(bits>>(8*i));
+  for(size_t off=0;off<padlen;off+=64){
+    uint32_t w[64];
+    for(int i=0;i<16;i++) w[i]=((uint32_t)m[off+i*4]<<24)|((uint32_t)m[off+i*4+1]<<16)|((uint32_t)m[off+i*4+2]<<8)|m[off+i*4+3];
+    for(int i=16;i<64;i++){ uint32_t s0=ROR32(w[i-15],7)^ROR32(w[i-15],18)^(w[i-15]>>3); uint32_t s1=ROR32(w[i-2],17)^ROR32(w[i-2],19)^(w[i-2]>>10); w[i]=w[i-16]+s0+w[i-7]+s1; }
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(int i=0;i<64;i++){ uint32_t S1=ROR32(e,6)^ROR32(e,11)^ROR32(e,25); uint32_t ch=(e&f)^((~e)&g); uint32_t t1=hh+S1+ch+K[i]+w[i];
+      uint32_t S0=ROR32(a,2)^ROR32(a,13)^ROR32(a,22); uint32_t maj=(a&b)^(a&c)^(b&c); uint32_t t2=S0+maj;
+      hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+  }
+  free(m); for(int i=0;i<8;i++){ out[i*4]=h[i]>>24; out[i*4+1]=h[i]>>16; out[i*4+2]=h[i]>>8; out[i*4+3]=h[i]; }
+}
+static void b58encode(const uint8_t*data,int len,char*out){
+  int zeros=0; while(zeros<len && data[zeros]==0) zeros++;
+  uint8_t tmp[256]; int tn=0; memset(tmp,0,sizeof tmp);
+  for(int i=zeros;i<len;i++){ int carry=data[i];
+    for(int j=0;j<tn;j++){ carry+=(int)tmp[j]<<8; tmp[j]=carry%58; carry/=58; }
+    while(carry){ tmp[tn++]=carry%58; carry/=58; } }
+  int oi=0; for(int i=0;i<zeros;i++) out[oi++]='1';
+  for(int i=tn-1;i>=0;i--) out[oi++]=B58[tmp[i]];
+  out[oi]=0;
+}
+static void b58check(const uint8_t*payload,int plen,char*out){
+  uint8_t buf[64]; memcpy(buf,payload,plen);
+  uint8_t d1[32],d2[32]; sha256_host(payload,plen,d1); sha256_host(d1,32,d2);
+  memcpy(buf+plen,d2,4); b58encode(buf,plen+4,out);
+}
+static void bech32_encode(const char*hrp,const uint8_t*data5,int n5,int is_m,char*out){
+  uint8_t values[130]; int vn=0,hlen=(int)strlen(hrp);
+  for(int i=0;i<hlen;i++) values[vn++]=hrp[i]>>5;
+  values[vn++]=0;
+  for(int i=0;i<hlen;i++) values[vn++]=hrp[i]&31;
+  for(int i=0;i<n5;i++) values[vn++]=data5[i];
+  for(int i=0;i<6;i++) values[vn+i]=0;
+  uint32_t pm=bech_polymod(values,vn+6)^(is_m?0x2bc830a3u:1u);
+  int oi=0; for(int i=0;i<hlen;i++) out[oi++]=hrp[i]; out[oi++]='1';
+  for(int i=0;i<n5;i++) out[oi++]=BECH[data5[i]];
+  for(int i=0;i<6;i++) out[oi++]=BECH[(pm>>(5*(5-i)))&31];
+  out[oi]=0;
+}
+static void segwit_encode(const char*hrp,int witver,const uint8_t*prog,int plen,char*out){
+  uint8_t d5[90]; int n5=0; d5[n5++]=(uint8_t)witver; uint32_t acc=0; int bits=0;
+  for(int i=0;i<plen;i++){ acc=(acc<<8)|prog[i]; bits+=8; while(bits>=5){ bits-=5; d5[n5++]=(acc>>bits)&31; } }
+  if(bits) d5[n5++]=(acc<<(5-bits))&31;
+  bech32_encode(hrp,d5,n5,witver>=1?1:0,out);
+}
+/* program (20 or 32 B) + BIP purpose -> address string. Returns 0 on success. */
+static int encode_address(const uint8_t*prog,int purpose,char*out){
+  if(purpose==44){ uint8_t p[21]; p[0]=0x00; memcpy(p+1,prog,20); b58check(p,21,out); return 0; }
+  if(purpose==49){ uint8_t p[21]; p[0]=0x05; memcpy(p+1,prog,20); b58check(p,21,out); return 0; }
+  if(purpose==84){ segwit_encode("bc",0,prog,20,out); return 0; }
+  if(purpose==86){ segwit_encode("bc",1,prog,32,out); return 0; }
+  return -1;
+}
+
 /* ------------------------------ GPU launch ------------------------------ */
 static void gpu_upload_words(const Words*W, CUdeviceptr*d_data,CUdeviceptr*d_off,CUdeviceptr*d_len,CUdeviceptr*d_idx){
   uint8_t data[512]; int off[32],len[32]; int p=0;
@@ -713,7 +785,7 @@ static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned l
   if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
     const AEnt*me=aset_lookup(X->aset,best_prog);
     if(out_addr&&addrsz){ if(me) snprintf(out_addr,(size_t)addrsz,"%s",me->str);
-      else { char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
+      else if(encode_address(best_prog,best_purpose,out_addr)){ char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
   return found;
 }
 
@@ -953,7 +1025,7 @@ static int crack_missing_sweep_bloom(MissCtx*M,unsigned long long start,unsigned
     *out_hidx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; if(out_purpose) *out_purpose=best_purpose;
     const AEnt*me=aset_lookup(M->aset,best_prog);
     if(out_addr&&addrsz){ if(me) snprintf(out_addr,(size_t)addrsz,"%s",me->str);
-      else { char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
+      else if(encode_address(best_prog,best_purpose,out_addr)){ char hx[66]; tohex_(best_prog,best_purpose==86?32:20,hx); snprintf(out_addr,(size_t)addrsz,"program:%s",hx); } } }
   return found;
 }
 static int crack_missing_sweep(MissCtx*M,unsigned long long start,unsigned long long count,double intv,int rep,
