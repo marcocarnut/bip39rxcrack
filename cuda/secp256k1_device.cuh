@@ -60,10 +60,13 @@ __device__ void fe_sub(fe *r, const fe *a, const fe *b){
 }
 
 /* full 256x256 -> 512 (t[8]) schoolbook via mulhi */
-__device__ __noinline__ void mul_256(const u64 a[4], const u64 b[4], u64 t[8]){
+__device__ __forceinline__ void mul_256(const u64 a[4], const u64 b[4], u64 t[8]){
+  #pragma unroll
   for(int i=0;i<8;i++) t[i]=0;
+  #pragma unroll
   for(int i=0;i<4;i++){
     u64 carry=0;
+    #pragma unroll
     for(int j=0;j<4;j++){
       u64 lo=a[i]*b[j], hi=mulhi(a[i],b[j]);
       u64 c1=0; u64 s=addc(t[i+j],lo,&c1);
@@ -75,17 +78,19 @@ __device__ __noinline__ void mul_256(const u64 a[4], const u64 b[4], u64 t[8]){
   }
 }
 /* multiply 4-limb by scalar c (u64) -> 5-limb out */
-__device__ void mul_scalar(const u64 a[4], u64 c, u64 out[5]){
+__device__ __forceinline__ void mul_scalar(const u64 a[4], u64 c, u64 out[5]){
   u64 carry=0;
+  #pragma unroll
   for(int i=0;i<4;i++){ u64 lo=a[i]*c, hi=mulhi(a[i],c); u64 cc=0; out[i]=addc(lo,carry,&cc); carry=hi+cc; }
   out[4]=carry;
 }
 /* reduce 512-bit t[8] mod p into r (fe) */
-__device__ __noinline__ void fe_reduce(fe *r, u64 t[8]){
+__device__ __forceinline__ void fe_reduce(fe *r, u64 t[8]){
   /* r0 = lo + hi*C  (hi = t[4..7]) */
   u64 hi[4]={t[4],t[5],t[6],t[7]};
   u64 m[5]; mul_scalar(hi,SECP_C,m);          /* hi*C : 5 limbs */
   u64 s[5]; u64 c=0;
+  #pragma unroll
   for(int i=0;i<4;i++) s[i]=addc(t[i],m[i],&c);
   s[4]=m[4]+c;                                 /* overflow above 2^256 */
   /* fold s[4] again: result = s[0..3] + s[4]*C (s[4] small) */
