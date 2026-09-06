@@ -13,9 +13,42 @@
  */
 #include "bip39_device.cuh"
 #include "secp256k1_device.cuh"
+#include "bloom_common.h"
 
 #define MN_STRIDE 256   /* max reconstructed mnemonic bytes (24w * ~9 + slack) */
 #define HARD 0x80000000u
+
+/* Bloom variant of derive_address_match: for a SET of targets (a blocked bloom),
+ * probe every derived program across change x gap and APPEND each hit to a buffer
+ * for the host to cull. Unlike the single-target path there may be many hits
+ * (one true + false positives), so we don't atomicMin -- we emit them all. */
+__device__ void derive_address_bloom(const u8 seed[64], u32 purpose, u32 changes, u32 gap,
+                                     const u32 *bloom, u32 bmask, unsigned long long gidx,
+                                     BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
+  int tlen = (purpose==86)?32:20;
+  u32 hidx[3]={ purpose|HARD, HARD, HARD };
+  u8 ca[32],ka[32]; derive_hardened(seed,64,hidx,3,ca,ka);
+  for(u32 c=0;c<changes;c++){
+    u8 kch[32],cch[32]; for(int b=0;b<32;b++){ kch[b]=ka[b]; cch[b]=ca[b]; }
+    ckd_normal(kch,cch,c);
+    u8 pubc[33]; scalar_mul_G(kch,pubc);
+    HCTX h; hmac512_ctx(cch,32,&h);
+    for(u32 i=0;i<gap;i++){
+      u8 data[37]; for(int b=0;b<33;b++) data[b]=pubc[b];
+      data[33]=(i>>24)&255; data[34]=(i>>16)&255; data[35]=(i>>8)&255; data[36]=i&255;
+      u8 I[64]; hmac512_run(&h,data,37,I);
+      u8 IL[32]; for(int b=0;b<32;b++) IL[b]=I[b];
+      u8 ki[32]; modn_add(IL,kch,ki);
+      u8 pub[33]; scalar_mul_G(ki,pub);
+      u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
+      if(bloom_probe(bloom,prog,bmask)){
+        unsigned int slot=atomicAdd(hitcnt,1u);
+        if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i;
+          for(int b=0;b<tlen;b++) r->prog[b]=prog[b]; for(int b=tlen;b<32;b++) r->prog[b]=0; }
+      }
+    }
+  }
+}
 
 /* Build the BIP39 mnemonic bytes for permutation position digits dig[0..size-1]
  * from the base-word string table; single-space separated, no trailing space
@@ -155,6 +188,30 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
     int oc,oi;
     if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+  }
+}
+
+/* Regime B, BLOOM target set: same enumerate -> sieve -> PBKDF2 as g_crack_addr,
+ * but probe each derived program against the blocked bloom and append hits for
+ * the host cull (bloom, bmask + hits/hitcnt/hitcap replace target_prog + hit_*). */
+extern "C" __global__ void g_crack_addr_bloom(const u8 *bw_data, const int *bw_off, const int *bw_len,
+                                        const u32 *bw_idx, int n, int size,
+                                        unsigned long long start_lo, unsigned long long count,
+                                        u32 purpose, u32 changes, u32 gap,
+                                        const u32 *bloom, u32 bmask, int require_ck,
+                                        BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
+                                        unsigned long long *hashed){
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
+    unsigned long long j=start_lo+t;
+    int dig[32]; decode_perm(dig,n,size,j);
+    u8 mn[MN_STRIDE]; u32 g[32];
+    int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
+    if(require_ck && !bip39_checksum_ok(g,size)) continue;
+    if(hashed) atomicAdd(hashed,1ULL);
+    u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
+    pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
+    derive_address_bloom(seed,purpose,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 

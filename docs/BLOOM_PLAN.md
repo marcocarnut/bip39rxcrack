@@ -136,11 +136,18 @@ more work than the naive one.
 
 ## Staging
 
-1. **Blocked-bloom core + `--addresses`/`--addresses-file`** (startup build, RAM cull). Gate:
-   plant K addresses, one of them the winner, assert FOUND + the other K-1 don't false-fire
-   beyond the measured FPR; empirically confirm FPR vs the sizing formula on a large planted
-   set.
-2. **`--xpubs`** (chaincode filter; trivial once (1) exists — different key length + EC-free).
+1a. **DONE** — blocked-bloom core (`cuda/bloom_common.h`, slice-don't-hash, k=16, one
+    fetch) + host self-test (`make bloom-selftest`): zero false negatives, FPR ~1.5e-5 at
+    33 bits/key, extrapolating to ~1e-4 at the 1.5e9 / 4 GiB target.
+1b. **DONE** — GPU wiring for `--words + --addresses`/`--addresses-file`: `g_crack_addr_bloom`
+    (fused) probes each derived program + appends to a device hit buffer;
+    `crack_addr_sweep_bloom` culls per chunk against the sorted RAM set (first chunk with a
+    culled-true hit holds the lowest rank → min + stop). Single-target path untouched
+    (byte-exact). Gate `make bloom-e2e`: winner among decoys → FOUND at rank; decoys-only →
+    NOT FOUND. v1 limits: one script type per set; in-process (no fan-out yet); fused only.
+1c. (next) compact bloom path (`g_sieve_perm` → `g_pbkdf2_perm_bloom`) for ~20 Mc/s; the
+    missing-word bloom (`g_crack_nth/_missing`); and fold `--addresses` into the work-queue.
+2. **`--xpubs`** (chaincode filter; trivial once the above exist — different key length + EC-free).
 3. **`bloom-build` + `--bloom` + the sorted `.cull`** (the "any funded address" mode). Needs
    an address source (full-node dump) and the on-disk formats.
 4. (Later) fold into the work-queue/hive so each worker/box loads its own filter.

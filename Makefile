@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -61,6 +61,10 @@ missing-e2e: $(CRACK)
 # blocked-bloom construction: no false negatives + FPR-vs-bits/key sweep (host-only)
 bloom-selftest: $(CRACK)
 	./$(CRACK) --bloom-selftest 1000000
+
+# bloom target SET crack: winner hidden among decoys -> FOUND at rank; decoys-only -> NOT FOUND
+bloom-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a

@@ -584,15 +584,26 @@ static int mode_crack(const Words*W,const uint8_t target_cc[32],uint32_t*purpose
  * SAME context. mode_crack_addr is just setup + one whole-window sweep + render,
  * so single-GPU behaviour stays byte-identical (gated). */
 typedef void (*prog_cb)(void*ud, unsigned long long swept, unsigned long long hashed);
+/* A set of target programs (bloom mode). progs = n*proglen bytes, SORTED for the
+ * exact cull. NULL/n==0 => single-target (the existing exact-compare path). */
+typedef struct { uint8_t *progs; long n; int proglen; } AddrSet;
+static int g_aset_len=20;
+static int aset_cmp(const void*a,const void*b){ return memcmp(a,b,(size_t)g_aset_len); }
+static void aset_sort(AddrSet*A){ g_aset_len=A->proglen; qsort(A->progs,(size_t)A->n,(size_t)A->proglen,aset_cmp); }
+static int aset_member(const AddrSet*A,const uint8_t*prog){ g_aset_len=A->proglen; return bsearch(prog,A->progs,(size_t)A->n,(size_t)A->proglen,aset_cmp)!=0; }
+
 typedef struct {
   struct rxe*r; unsigned long long total;
   CUdeviceptr dd,dof,dln,dix, dtp, dhi,dfound,dhashed,dhit_ci, dsurv,dctr;
   unsigned long long C;   /* survivor-buffer capacity (compact); 0 = fused */
   int n,size, require_ck, purpose; uint32_t pu,changes,gap; int grid,tpb;
+  CUdeviceptr d_bloom, d_hits, d_hitcnt; uint32_t bloom_mask, hitcap;  /* bloom mode */
+  const AddrSet *aset;    /* exact cull set; 0 => single-target */
 } CrackCtx;
 
 static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int purpose,
-                            uint32_t changes,uint32_t gap,int require_ck,int compact,const char*cu){
+                            uint32_t changes,uint32_t gap,int require_ck,int compact,const char*cu,
+                            const AddrSet*aset){
   memset(X,0,sizeof *X);
   char pat[2048]; wordset_pattern(W,pat,sizeof pat);
   X->r=rxe_parse(pat,0); if(!X->r||rxe_error(X->r)){fprintf(stderr,"rxe parse err\n");return 2;}
@@ -606,8 +617,9 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
   X->n=W->n; X->size=W->n; X->pu=(uint32_t)purpose; X->changes=changes; X->gap=gap;
   X->require_ck=require_ck; X->purpose=purpose; X->grid=1024; X->tpb=128;
   /* survivor buffer (chunked compaction): sized for a chunk's FULL worst case so
-     overflow is structurally impossible. Allocated ONCE here, reused per sweep. */
-  if(compact && require_ck){
+     overflow is structurally impossible. Allocated ONCE here, reused per sweep.
+     (skipped in bloom mode -- the *_bloom kernel is fused.) */
+  if(compact && require_ck && !(aset && aset->n>0)){
     unsigned long long budget=1024ULL*1024*1024;
     const char*mb=getenv("COMPACT_BUDGET_MB"); if(mb){ long v=atol(mb); if(v>16) budget=(unsigned long long)v*1024*1024; }
     unsigned long long C=budget/8; CUdeviceptr dsurv=0;
@@ -615,7 +627,60 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
     if(dsurv){ X->dsurv=dsurv; X->C=C; X->dctr=up(&z0,8); }
     else fprintf(stderr,"regime B: compaction buffer won't allocate on this GPU -- falling back to fused.\n");
   }
+  /* bloom target set: build the blocked filter on the host, upload it, and alloc
+     the GPU hit buffer. The fused *_bloom kernel probes + appends; the host culls. */
+  if(aset && aset->n>0){
+    X->aset=aset;
+    double bpk=24.0; const char*e=getenv("BLOOM_BPK"); if(e){ double v=atof(e); if(v>=4) bpk=v; }
+    uint32_t nb=bloom_nblocks((uint64_t)aset->n,bpk); X->bloom_mask=nb-1;
+    size_t fbytes=(size_t)nb*8u*4u;                  /* nb blocks * 8 u32 */
+    uint32_t *hf=calloc(fbytes,1);
+    for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->progs+(size_t)i*aset->proglen,X->bloom_mask);
+    X->d_bloom=up(hf,fbytes); free(hf);
+    X->hitcap=1u<<18;                                /* 262144 hits/chunk */
+    CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
+    X->d_hitcnt=up(&z0,4);
+    fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), cull on host\n",
+            aset->n, (double)fbytes/1048576.0, nb, (double)nb*256.0/(double)aset->n);
+  }
   return 0;
+}
+
+/* Bloom sweep [start,count): fused *_bloom kernel probes each program, appends
+   hits; the host culls per chunk. The FIRST chunk with a culled-true hit holds the
+   lowest global index (chunks run in increasing-index order), so we take the min
+   over that chunk's true hits and stop. */
+static int crack_addr_sweep_bloom(CrackCtx*X,unsigned long long start,unsigned long long count,
+                                  double intv,int reporting,prog_cb cb,void*ud,
+                                  unsigned long long*out_idx,uint32_t out_ci[2]){
+  int rck=X->require_ck, n=X->n, size=X->size;
+  unsigned long long z0=0; CU(cuMemcpyHtoD(X->dhashed,&z0,8));
+  unsigned long long cstart=start,ccount=0,swept=0,hashed=0, chunk=reporting?report_chunk(1):(64ULL<<20);
+  int found=0; unsigned long long best=~0ULL; uint32_t best_ci[2]={0,0};
+  BloomHit *hb=malloc((size_t)X->hitcap*sizeof(BloomHit));
+  CUfunction kf=kern("g_crack_addr_bloom");
+  for(cstart=start; cstart<start+count; ){
+    ccount=(start+count-cstart<chunk)?(start+count-cstart):chunk; double c0=now_s();
+    unsigned int zc=0; CU(cuMemcpyHtoD(X->d_hitcnt,&zc,4));
+    void*args[]={&X->dd,&X->dof,&X->dln,&X->dix,&n,&size,&cstart,&ccount,&X->pu,&X->changes,&X->gap,
+                 &X->d_bloom,&X->bloom_mask,&rck,&X->d_hits,&X->d_hitcnt,&X->hitcap,&X->dhashed};
+    CU(cuLaunchKernel(kf,X->grid,1,1,X->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
+    double csecs=now_s()-c0; swept+=ccount; cstart+=ccount;
+    unsigned int hc=0; CU(cuMemcpyDtoH(&hc,X->d_hitcnt,4));
+    if(hc>0){
+      unsigned int nc=hc>X->hitcap?X->hitcap:hc;
+      CU(cuMemcpyDtoH(hb,X->d_hits,(size_t)nc*sizeof(BloomHit)));
+      for(unsigned int i=0;i<nc;i++) if(aset_member(X->aset,hb[i].prog)){
+        found=1; if(hb[i].gidx<best){ best=hb[i].gidx; best_ci[0]=hb[i].change; best_ci[1]=hb[i].index; } }
+      if(hc>X->hitcap) fprintf(stderr,"  (bloom hit-buffer overflow %u>%u; raise it if this recurs)\n",hc,X->hitcap);
+    }
+    CU(cuMemcpyDtoH(&hashed,X->dhashed,8)); if(cb) cb(ud,swept,rck?hashed:swept);
+    if(found) break;
+    chunk=next_chunk(ccount,csecs,intv,reporting);
+  }
+  free(hb);
+  if(found){ *out_idx=best; out_ci[0]=best_ci[0]; out_ci[1]=best_ci[1]; }
+  return found;
 }
 
 /* Sweep [start,count). Resets per-sweep hit state, returns 1 if found (sets
@@ -623,6 +688,7 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
 static int crack_addr_sweep(CrackCtx*X,unsigned long long start,unsigned long long count,
                             double intv,int reporting,prog_cb cb,void*ud,
                             unsigned long long*out_idx,uint32_t out_ci[2]){
+  if(X->d_bloom) return crack_addr_sweep_bloom(X,start,count,intv,reporting,cb,ud,out_idx,out_ci);
   unsigned long long init=~0ULL,z0=0; int zero=0; uint32_t hci0[2]={0,0};
   CU(cuMemcpyHtoD(X->dhi,&init,8)); CU(cuMemcpyHtoD(X->dfound,&zero,4));
   CU(cuMemcpyHtoD(X->dhashed,&z0,8)); CU(cuMemcpyHtoD(X->dhit_ci,hci0,8));
@@ -664,12 +730,13 @@ static void mode_prog_cb(void*ud,unsigned long long swept,unsigned long long has
 
 static int mode_crack_addr(const Words*W,const uint8_t tprog[32],int purpose,
                            uint32_t changes,uint32_t gap,int require_ck,int compact,
-                           unsigned long long ustart,unsigned long long ucount,const char*cu){
+                           unsigned long long ustart,unsigned long long ucount,const char*cu,
+                           const AddrSet*aset){
   if(g_print_total){ char pat[2048]; wordset_pattern(W,pat,sizeof pat);
     struct rxe*r=rxe_parse(pat,0); if(!r||rxe_error(r)){fprintf(stderr,"rxe parse err\n");return 2;}
     if(W->n>20){ fprintf(stderr,"v1 self-enumerate hit-index is u64: max 20 words. Got %d.\n",W->n); return 2; }
     gmp_printf("%Zd\n",r->nitems); rxe_free(r); return 0; }
-  CrackCtx X; int rc=crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu); if(rc) return rc;
+  CrackCtx X; int rc=crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu,aset); if(rc) return rc;
   unsigned long long start=ustart>X.total?X.total:ustart;
   unsigned long long count=ucount?ucount:(X.total-start); if(start+count>X.total) count=X.total-start;
   int reporting=(g_pflag||g_loginterval_ms);
@@ -1053,7 +1120,7 @@ static int run_worker(Sweeper*S){
 }
 static int run_worker_addr(const Words*W,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
                            int require_ck,int compact,const char*cu){
-  CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu)) return 2;
+  CrackCtx X; if(crack_addr_setup(&X,W,tprog,purpose,changes,gap,require_ck,compact,cu,0)) return 2;
   Sweeper S={wq_sweep_addr,&X,X.total}; return run_worker(&S);
 }
 static int run_worker_missing(const char*tpl,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
@@ -1323,6 +1390,25 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   }
   printf("NOT FOUND\n"); return 1;
 }
+/* Decode --addresses (comma list) and/or --addresses-file (one per line) into a
+   sorted AddrSet for the bloom + cull. v1: all targets must share one script type
+   (one derivation purpose). Returns the shared purpose in *purpose_out. */
+static int build_addrset(const char*csv,const char*file,AddrSet*A,int*purpose_out){
+  char **addrs=0; long na=0,cap=0;
+  #define ADDR_PUSH(s) do{ if(na==cap){ cap=cap?cap*2:64; addrs=realloc(addrs,(size_t)cap*sizeof(char*)); } addrs[na++]=strdup(s); }while(0)
+  if(csv){ char*buf=strdup(csv); char*t=strtok(buf,","); while(t){ while(*t==' ')t++; if(*t) ADDR_PUSH(t); t=strtok(0,","); } free(buf); }
+  if(file){ FILE*f=fopen(file,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",file); return 2; }
+    char line[256]; while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
+      char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(*s) ADDR_PUSH(s); } fclose(f); }
+  if(na==0){ fprintf(stderr,"--addresses: no addresses given\n"); return 2; }
+  int proglen=-1,purpose=-1; uint8_t *progs=malloc((size_t)na*32);
+  for(long i=0;i<na;i++){ uint8_t pr[32]; int pl,pu; if(decode_address(addrs[i],pr,&pl,&pu)){ fprintf(stderr,"--addresses: bad address '%s'\n",addrs[i]); return 2; }
+    if(proglen<0){ proglen=pl; purpose=pu; } else if(pl!=proglen||pu!=purpose){ fprintf(stderr,"--addresses: all targets must share one script type (v1); '%s' differs\n",addrs[i]); return 2; }
+    memcpy(progs+(size_t)i*proglen,pr,(size_t)proglen); free(addrs[i]); }
+  free(addrs);
+  A->progs=progs; A->n=na; A->proglen=proglen; aset_sort(A); *purpose_out=purpose;
+  return 0;
+}
 /* Host-only: validate the blocked-bloom construction empirically -- build a
  * filter of N random uniform "programs", confirm zero false NEGATIVES, and
  * measure the false-POSITIVE rate across a sweep of bits/key. No GPU. */
@@ -1375,6 +1461,8 @@ static void usage(void){
    "\n"
    "TARGET (choose one):\n"
    "  --address ADDR          base58 (1../3..) or bech32 (bc1q p2wpkh / bc1p p2tr)\n"
+   "  --addresses A,B,..      a SET of target addresses (blocked bloom + host cull);\n"
+   "  --addresses-file PATH   ... or one per line. v1: all one script type. (--words)\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --target-chaincode HEX  32-byte account chain code directly\n"
    "  --purpose 44,49,84,86   BIP purpose(s) to try (default 84; auto from address)\n"
@@ -1426,6 +1514,7 @@ int main(int argc,char**argv){
   unsigned long long cstart=0,ccount=0;
   uint32_t purposes[8]={84}; int npurp=1,purpose_set=0;
   const char *mnemonic=0,*passphrase=0,*address=0,*decodearg=0,*templ=0,*patt=0; uint32_t a_changes=1,a_gap=1; int nthmode=-1; /* -1 auto, 1 force, 0 off */
+  const char *addresses=0,*addresses_file=0;   /* bloom target set */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
@@ -1457,6 +1546,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--mnemonic")&&i+1<argc) mnemonic=argv[++i];
     else if(!strcmp(argv[i],"--passphrase")&&i+1<argc) passphrase=argv[++i];
     else if(!strcmp(argv[i],"--address")&&i+1<argc) address=argv[++i];
+    else if(!strcmp(argv[i],"--addresses")&&i+1<argc) addresses=argv[++i];
+    else if(!strcmp(argv[i],"--addresses-file")&&i+1<argc) addresses_file=argv[++i];
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -1535,7 +1626,8 @@ int main(int argc,char**argv){
   if(g_warm){ build_module(cu); return 0; }
   /* Fan-out applies only to real crack jobs, not gate/util modes (which run once
      on a single device). */
-  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest);
+  int bloom_target = (addresses||addresses_file);   /* S1b: bloom crack runs in-process (no fan-out yet) */
+  int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest||bloom_target);
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
      CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
@@ -1589,10 +1681,14 @@ int main(int argc,char**argv){
   if(rankarg) return mode_rank(&W,rankarg);
   if(recon)   return mode_recon_gate(&W,recon_n,cu);
   if(dumpv)   return mode_dump_valid(&W,dumpv_n,cu);
+  if(addresses||addresses_file){ AddrSet A; int apu; if(build_addrset(addresses,addresses_file,&A,&apu)) return 2;
+    int purpose = purpose_set?(int)purposes[0]:apu;
+    int rc=mode_crack_addr(&W,A.progs,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,&A);
+    free(A.progs); return rc; }
   if(address){ uint8_t prog[32]; int aproglen,apurpose; if(decode_address(address,prog,&aproglen,&apurpose))return 2;
     int purpose = purpose_set?(int)purposes[0]:apurpose;
     if(g_worker) return run_worker_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cu);
-    return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu); }
+    return mode_crack_addr(&W,prog,purpose,a_changes,a_gap,require_ck,compact,cstart,ccount,cu,0); }
   if(g_worker){ fprintf(stderr,"--worker supports the --words/--address and --template/--address paths\n"); return 2; }
   uint8_t tcc[32];
   if(xpub){ if(xpub_chaincode(xpub,tcc)) return 2; }
