@@ -1230,32 +1230,80 @@ static int mode_addr_gate(const char*vecfile,const char*cu){
 }
 
 /* ----------------------- Regime A: passphrase crack --------------------- */
-/* parse "[0-9]{N}" -> N (decimal width). Returns -1 on unsupported grammar. */
-static int passphrase_width(const char*pat){
-  int w=0; if(sscanf(pat,"[0-9]{%d}",&w)==1 && w>0 && w<=18) return w; return -1;
+/* A fixed-length passphrase PATTERN as a sequence of per-position character
+   classes (mixed-radix). Grammar: a concatenation of elements, each a literal
+   char, an escaped char (\x), or a class [set] (chars + a-z style ranges),
+   optionally followed by {N} to repeat it N times. e.g. "[0-9]{4}", "[a-z]{6}",
+   "bike[0-9]{2}", "[A-Za-z0-9]{8}". The candidate index unranks over the classes
+   (last position least-significant). {m,n} variable length is not yet supported. */
+#define PP_MAXLEN 64
+typedef struct { int npos; int off[PP_MAXLEN+1]; unsigned char bytes[4096]; unsigned long long total; char src[256]; } PPat;
+/* returns 0 on success; <0: -1 syntax, -2 {m,n} variable len, -3 overflow, -4 too long/big. */
+static int pp_parse(const char*pat,PPat*P){
+  memset(P,0,sizeof *P); snprintf(P->src,sizeof P->src,"%s",pat);
+  int np=0,bp=0; unsigned long long total=1; const char*s=pat; P->off[0]=0;
+  while(*s){
+    unsigned char set[128]; int sn=0;
+    if(*s=='['){ s++;
+      while(*s && *s!=']'){
+        unsigned char c=(unsigned char)*s;
+        if(c=='\\' && s[1]){ c=(unsigned char)s[1]; s+=2; }
+        else if(s[1]=='-' && s[2] && s[2]!=']'){ unsigned char hi=(unsigned char)s[2];
+          if(hi<c) return -1;
+          for(int x=c;x<=hi && sn<128;x++){ int dup=0; for(int y=0;y<sn;y++) if(set[y]==(unsigned char)x)dup=1; if(!dup)set[sn++]=(unsigned char)x; }
+          s+=3; continue; }
+        else s++;
+        { int dup=0; for(int y=0;y<sn;y++) if(set[y]==c)dup=1; if(!dup && sn<128) set[sn++]=c; }
+      }
+      if(*s!=']') return -1;
+      s++;
+    } else if(*s=='\\' && s[1]){ set[sn++]=(unsigned char)s[1]; s+=2; }
+    else { set[sn++]=(unsigned char)*s; s++; }
+    if(sn==0) return -1;
+    int count=1;
+    if(*s=='{'){ char*e; long n=strtol(s+1,&e,10);
+      if(*e==',') return -2;                              /* {m,n} variable length */
+      if(*e!='}' || n<1 || n>PP_MAXLEN) return -1;
+      count=(int)n; s=e+1; }
+    for(int r=0;r<count;r++){
+      if(np>=PP_MAXLEN || bp+sn>(int)sizeof P->bytes) return -4;
+      if(sn>1 && total>(~0ULL)/(unsigned long long)sn) return -3;
+      total*=(unsigned long long)sn;
+      for(int k=0;k<sn;k++) P->bytes[bp++]=set[k];
+      P->off[np+1]=bp; np++;
+    }
+  }
+  if(np==0) return -1;
+  P->npos=np; P->total=total; return 0;
 }
-static unsigned long long pass_total(int pwidth){ unsigned long long t=1; for(int i=0;i<pwidth;i++) t*=10ULL; return t; }
-/* format the PIN digits for index j (fixed width, decimal). */
-static void pass_str(unsigned long long j,int pwidth,char*out){ for(int p=pwidth-1;p>=0;p--){ out[p]=(char)('0'+(int)(j%10)); j/=10; } out[pwidth]=0; }
+/* index -> passphrase string (mixed-radix, last position least-significant). */
+static void pp_decode(const PPat*P,unsigned long long j,char*out){
+  for(int p=P->npos-1;p>=0;p--){ int lo=P->off[p]; unsigned sz=(unsigned)(P->off[p+1]-lo);
+    out[p]=(char)P->bytes[lo+(int)(j%sz)]; j/=sz; }
+  out[P->npos]=0;
+}
 
 /* Regime A context: fixed mnemonic + passphrase [0-9]{pwidth}. Single-target or a
    bloom target SET (--addresses/--bloom). The fixed-mnemonic HMAC key is precomputed
    ONCE (the PBKDF2 password = the mnemonic, constant across every PIN). setup/sweep
    split so it joins the work-queue like the words/template modes. */
 typedef struct {
-  unsigned long long total; int pwidth, purpose; uint32_t pu, changes, gap; int grid, tpb;
+  unsigned long long total; int npos, purpose; uint32_t pu, changes, gap; int grid, tpb;
+  PPat pat; CUdeviceptr d_cls_off, d_cls_bytes;         /* passphrase pattern (mixed-radix) */
   CUdeviceptr dhctx;                                   /* precomputed HMAC key ctx */
   CUdeviceptr dtp, dhi, dfound, dhit_ci;               /* single-target */
   CUdeviceptr d_bloom, d_hits, d_hitcnt, d_purposes;   /* bloom SET */
   uint32_t bloom_mask, hitcap; int bnpurp; const AddrSet *aset;
 } PassCtx;
 
-static int crack_pass_setup(PassCtx*P,const char*mnemonic,int pwidth,const uint8_t tprog[32],
+static int crack_pass_setup(PassCtx*P,const char*mnemonic,const PPat*pp,const uint8_t tprog[32],
                             int purpose,uint32_t changes,uint32_t gap,const char*cu,const AddrSet*aset){
   memset(P,0,sizeof *P);
-  P->total=pass_total(pwidth); P->pwidth=pwidth; P->purpose=purpose; P->pu=(uint32_t)purpose;
+  P->pat=*pp; P->total=pp->total; P->npos=pp->npos; P->purpose=purpose; P->pu=(uint32_t)purpose;
   P->changes=changes; P->gap=gap; P->grid=1024; P->tpb=128;
   build_module(cu);
+  P->d_cls_off=up(P->pat.off,(size_t)(P->npos+1)*sizeof(int));
+  P->d_cls_bytes=up(P->pat.bytes,(size_t)P->pat.off[P->npos]);
   int mnlen=(int)strlen(mnemonic); CUdeviceptr dmn=up(mnemonic,mnlen);
   CU(cuMemAlloc(&P->dhctx,16*sizeof(unsigned long long)));
   { void*ia[]={&dmn,&mnlen,&P->dhctx}; CU(cuLaunchKernel(kern("g_hctx_init"),1,1,1,1,1,1,0,0,ia,0)); CU(cuCtxSynchronize()); }
@@ -1302,7 +1350,7 @@ static int crack_pass_sweep_bloom(PassCtx*P,unsigned long long start,unsigned lo
   for(unsigned long long cs=start; cs<start+count; ){
     unsigned long long cc=(start+count-cs<chunk)?(start+count-cs):chunk; double c0=now_s();
     unsigned int zc=0; CU(cuMemcpyHtoD(P->d_hitcnt,&zc,4));
-    void*args[]={&P->dhctx,&P->pwidth,&cs,&cc,&P->d_purposes,&P->bnpurp,&P->changes,&P->gap,
+    void*args[]={&P->dhctx,&P->npos,&P->d_cls_off,&P->d_cls_bytes,&cs,&cc,&P->d_purposes,&P->bnpurp,&P->changes,&P->gap,
                  &P->d_bloom,&P->bloom_mask,&P->d_hits,&P->d_hitcnt,&P->hitcap};
     CU(cuLaunchKernel(kern("g_crack_pass_bloom"),P->grid,1,1,P->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=cc; cs+=cc;
@@ -1339,7 +1387,7 @@ static int crack_pass_sweep(PassCtx*P,unsigned long long start,unsigned long lon
   int found=0; unsigned long long swept=0;
   for(unsigned long long cs=start; cs<start+count; ){
     unsigned long long cc=(start+count-cs<chunk)?(start+count-cs):chunk; double c0=now_s();
-    void*args[]={&P->dhctx,&P->pwidth,&cs,&cc,&P->pu,&P->changes,&P->gap,&P->dtp,&P->dhi,&P->dfound,&P->dhit_ci};
+    void*args[]={&P->dhctx,&P->npos,&P->d_cls_off,&P->d_cls_bytes,&cs,&cc,&P->pu,&P->changes,&P->gap,&P->dtp,&P->dhi,&P->dfound,&P->dhit_ci};
     CU(cuLaunchKernel(kern("g_crack_pass"),P->grid,1,1,P->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=cc; cs+=cc;
     if(cb) cb(ud,swept,swept);
@@ -1351,19 +1399,19 @@ static int crack_pass_sweep(PassCtx*P,unsigned long long start,unsigned long lon
   return found;
 }
 
-static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32],
+static int mode_crack_pass(const char*mnemonic,const PPat*pp,const uint8_t tprog[32],
                            int purpose,uint32_t changes,uint32_t gap,
                            unsigned long long ustart,unsigned long long ucount,const char*cu,const AddrSet*aset){
-  if(g_print_total){ printf("%llu\n",pass_total(pwidth)); return 0; }
-  PassCtx P; if(crack_pass_setup(&P,mnemonic,pwidth,tprog,purpose,changes,gap,cu,aset)) return 2;
+  if(g_print_total){ printf("%llu\n",pp->total); return 0; }
+  PassCtx P; if(crack_pass_setup(&P,mnemonic,pp,tprog,purpose,changes,gap,cu,aset)) return 2;
   unsigned long long start=ustart>P.total?P.total:ustart;
   unsigned long long count=ucount?ucount:(P.total-start); if(start+count>P.total) count=P.total-start;
   int reporting=(g_pflag||g_loginterval_ms);
   char path[64]; snprintf(path,sizeof path,"m/%d'/0'/0'/[0,%u)/[0,%u)",purpose,changes,gap);
   Prog PR; prog_init(&PR,count,g_pflag,g_p_secs,g_loginterval_ms,g_csv,g_csv_own);
   prog_hdr(&PR,"regime A (passphrase)",g_target_str,g_pattern_str,path,0,0);
-  fprintf(stderr,"regime A: fixed mnemonic, passphrase [0-9]{%d} = %llu candidates from %llu (purpose %d%s)...\n",
-          pwidth,count,start,purpose,P.d_bloom?", SET":"");
+  fprintf(stderr,"regime A: fixed mnemonic, passphrase '%s' (%d chars) = %llu candidates from %llu (purpose %d%s)...\n",
+          pp->src,pp->npos,count,start,purpose,P.d_bloom?", SET":"");
   double intv=prog_intv(&PR),tt0=now_s();
   unsigned long long hidx=0; uint32_t hci[2]={0,0}; char maddr[100]=""; int mpurpose=purpose;
   BMatchList ml={0}; BMatchList*mlp=(g_exhaustive && P.d_bloom)?&ml:0;
@@ -1374,12 +1422,12 @@ static int mode_crack_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32
           PR.swept,secs,secs>0?PR.swept/secs/1e6:0.0,(found&&!mlp&&PR.swept<count)?", early-exit":"");
   if(mlp){
     if(ml.n==0){ prog_finish(&PR,"NOT_FOUND",0,path); printf("NOT FOUND\n"); bml_free(&ml); return 1; }
-    for(int i=0;i<ml.n;i++) pass_str(ml.v[i].idx,pwidth,ml.v[i].secret);
+    for(int i=0;i<ml.n;i++) pp_decode(&P.pat,ml.v[i].idx,ml.v[i].secret);
     { char fp[80]; snprintf(fp,sizeof fp,"m/%d'/0'/0'/%u/%u",ml.v[0].purpose,ml.v[0].ci[0],ml.v[0].ci[1]); prog_finish(&PR,"FOUND",ml.v[0].secret,fp); }
     print_match_list(&ml,1); bml_free(&ml); return 0;
   }
   if(!found){ prog_finish(&PR,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
-  char pass[24]; pass_str(hidx,pwidth,pass);
+  char pass[PP_MAXLEN+1]; pp_decode(&P.pat,hidx,pass);
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/0'/%u/%u",mpurpose,hci[0],hci[1]);
   prog_finish(&PR,"FOUND",pass,fpath);
   printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : %s\n",hidx,pass,fpath);
@@ -1465,8 +1513,8 @@ static int wq_sweep_pass(void*c,unsigned long long s,unsigned long long n,double
                          unsigned long long*oi,uint32_t oc[2],char*mn,int mnsz,char*addr,int addrsz,int*opur,BMatchList*ml){
   PassCtx*P=c; uint32_t ci[2]; unsigned long long hidx=0;
   int f=crack_pass_sweep(P,s,n,intv,rep,cb,ud,&hidx,ci,addr,addrsz,opur,ml);
-  if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1]; char pass[24]; pass_str(hidx,P->pwidth,pass); snprintf(mn,mnsz,"%s",pass); }
-  if(ml) for(int i=0;i<ml->n;i++) pass_str(ml->v[i].idx,P->pwidth,ml->v[i].secret);
+  if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1]; char pass[PP_MAXLEN+1]; pp_decode(&P->pat,hidx,pass); snprintf(mn,mnsz,"%s",pass); }
+  if(ml) for(int i=0;i<ml->n;i++) pp_decode(&P->pat,ml->v[i].idx,ml->v[i].secret);
   return f;
 }
 static int run_worker(Sweeper*S){
@@ -1510,9 +1558,9 @@ static int run_worker_missing(const char*tpl,const uint8_t tprog[32],int purpose
   MissCtx M; if(crack_missing_setup(&M,tpl,tprog,purpose,changes,gap,nthmode,cu,aset)) return 2;
   Sweeper S={wq_sweep_missing,&M,M.total,purpose}; return run_worker(&S);
 }
-static int run_worker_pass(const char*mnemonic,int pwidth,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
+static int run_worker_pass(const char*mnemonic,const PPat*pp,const uint8_t tprog[32],int purpose,uint32_t changes,uint32_t gap,
                            const char*cu,const AddrSet*aset){
-  PassCtx P; if(crack_pass_setup(&P,mnemonic,pwidth,tprog,purpose,changes,gap,cu,aset)) return 2;
+  PassCtx P; if(crack_pass_setup(&P,mnemonic,pp,tprog,purpose,changes,gap,cu,aset)) return 2;
   Sweeper S={wq_sweep_pass,&P,P.total,purpose}; return run_worker(&S);
 }
 
@@ -2184,9 +2232,11 @@ static void usage(void){
    "                            \"w0 w1 [:bip39:] .. [:bip39:]\"  -> missing word(s)\n"
    "  --words \"w1 .. wN\"      N known distinct words, unknown order ({{N!}})\n"
    "  --template \"w .. [:bip39:] ..\"  known words + [:bip39:]/[:en:]/[:24th:] wildcards\n"
-   "  --mnemonic \"w .. w\" --passphrase [0-9]{N}   fixed mnemonic, unknown PIN\n"
-   "                          (works with any TARGET below -- a single --address OR a\n"
-   "                           --addresses/--bloom SET; fans out over GPUs; --exhaustive)\n"
+   "  --mnemonic \"w .. w\" --passphrase PATTERN   fixed mnemonic, unknown passphrase.\n"
+   "                          PATTERN = literals + char classes + {N}: [0-9]{4} (PIN),\n"
+   "                          [a-z]{6}, [A-Za-z0-9]{8}, bike[0-9]{2}. ({m,n} not yet;\n"
+   "                          use a fixed {N}.) Works with any TARGET below -- a single\n"
+   "                          --address OR a --addresses/--bloom SET; fans out; --exhaustive.\n"
    "  ([:Nth:] last-word checksum construction auto-applies; --nth/--no-nth to force)\n"
    "\n"
    "TARGET (choose one):\n"
@@ -2450,11 +2500,12 @@ int main(int argc,char**argv){
     if(aset) aset_free(&A);
     return rc;
   }
-  /* Regime A: fixed mnemonic + passphrase [0-9]{N}. Target = a single --address OR
-     a SET (--addresses/--bloom, multi-purpose bloom, works with --exhaustive). */
+  /* Regime A: fixed mnemonic + passphrase PATTERN (charsets/literals, mixed-radix).
+     Target = a single --address OR a SET (--addresses/--bloom, --exhaustive). */
   if(mnemonic && passphrase){
-    int w=passphrase_width(passphrase);
-    if(w<0){ fprintf(stderr,"v1 passphrase supports [0-9]{N} only, got '%s'\n",passphrase); return 2; }
+    PPat pp; int pe=pp_parse(passphrase,&pp);
+    if(pe==-2){ fprintf(stderr,"passphrase '%s': {m,n} variable length not yet supported; use a fixed {N}\n",passphrase); return 2; }
+    if(pe<0){ fprintf(stderr,"passphrase '%s': bad pattern (classes [..], literals, {N}); code %d\n",passphrase,pe); return 2; }
     uint8_t prog[32]={0}; int purpose; AddrSet A; const AddrSet*aset=0;
     if(addr_set){ int apu=84;
       if(bloom_file){ if(load_bloom_file(bloom_file,&A)) return 2; if(A.npurp) apu=(int)A.purposes[0]; }
@@ -2465,8 +2516,8 @@ int main(int argc,char**argv){
       purpose=purpose_set?(int)purposes[0]:apurpose; }
     else { fprintf(stderr,"regime A needs --address, or --addresses/--bloom for a set\n"); return 2; }
     int rc;
-    if(g_worker) rc=run_worker_pass(mnemonic,w,prog,purpose,a_changes,a_gap,cu,aset);
-    else rc=mode_crack_pass(mnemonic,w,prog,purpose,a_changes,a_gap,cstart,ccount,cu,aset);
+    if(g_worker) rc=run_worker_pass(mnemonic,&pp,prog,purpose,a_changes,a_gap,cu,aset);
+    else rc=mode_crack_pass(mnemonic,&pp,prog,purpose,a_changes,a_gap,cstart,ccount,cu,aset);
     if(aset) aset_free(&A);
     return rc;
   }
