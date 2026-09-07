@@ -26,30 +26,32 @@
  * so "any script type" = derive+probe under each. The seed (post-PBKDF2, the
  * bottleneck) is shared across purposes -> cheap. The hit's prog is zero-padded to
  * 32 so the host cull compares uniformly across 20B (h160) and 32B (taproot). */
-__device__ void derive_address_bloom(const u8 seed[64], const u32 *purposes, int npurp, u32 changes, u32 gap,
+__device__ void derive_address_bloom(const u8 seed[64], const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                      const u32 *bloom, u32 bmask, unsigned long long gidx,
                                      BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
   for(int pp=0; pp<npurp; pp++){
     u32 purpose=purposes[pp]; int tlen=(purpose==86)?32:20;
-    u32 hidx[3]={ purpose|HARD, HARD, HARD };
-    u8 ca[32],ka[32]; derive_hardened(seed,64,hidx,3,ca,ka);
-    for(u32 c=0;c<changes;c++){
-      u8 kch[32],cch[32]; for(int b=0;b<32;b++){ kch[b]=ka[b]; cch[b]=ca[b]; }
-      ckd_normal(kch,cch,c);
-      u8 pubc[33]; scalar_mul_G(kch,pubc);
-      HCTX h; hmac512_ctx(cch,32,&h);
-      for(u32 i=0;i<gap;i++){
-        u8 data[37]; for(int b=0;b<33;b++) data[b]=pubc[b];
-        data[33]=(i>>24)&255; data[34]=(i>>16)&255; data[35]=(i>>8)&255; data[36]=i&255;
-        u8 I[64]; hmac512_run(&h,data,37,I);
-        u8 IL[32]; for(int b=0;b<32;b++) IL[b]=I[b];
-        u8 ki[32]; modn_add(IL,kch,ki);
-        u8 pub[33]; scalar_mul_G(ki,pub);
-        u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
-        if(bloom_probe(bloom,prog,bmask)){
-          unsigned int slot=atomicAdd(hitcnt,1u);
-          if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i; r->purpose=purpose;
-            for(int b=0;b<tlen;b++) r->prog[b]=prog[b]; for(int b=tlen;b<32;b++) r->prog[b]=0; }
+    for(u32 acct=0; acct<accounts; acct++){
+      u32 hidx[3]={ purpose|HARD, HARD, acct|HARD };
+      u8 ca[32],ka[32]; derive_hardened(seed,64,hidx,3,ca,ka);
+      for(u32 c=0;c<changes;c++){
+        u8 kch[32],cch[32]; for(int b=0;b<32;b++){ kch[b]=ka[b]; cch[b]=ca[b]; }
+        ckd_normal(kch,cch,c);
+        u8 pubc[33]; scalar_mul_G(kch,pubc);
+        HCTX h; hmac512_ctx(cch,32,&h);
+        for(u32 i=0;i<gap;i++){
+          u8 data[37]; for(int b=0;b<33;b++) data[b]=pubc[b];
+          data[33]=(i>>24)&255; data[34]=(i>>16)&255; data[35]=(i>>8)&255; data[36]=i&255;
+          u8 I[64]; hmac512_run(&h,data,37,I);
+          u8 IL[32]; for(int b=0;b<32;b++) IL[b]=I[b];
+          u8 ki[32]; modn_add(IL,kch,ki);
+          u8 pub[33]; scalar_mul_G(ki,pub);
+          u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
+          if(bloom_probe(bloom,prog,bmask)){
+            unsigned int slot=atomicAdd(hitcnt,1u);
+            if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i; r->purpose=purpose; r->account=acct;
+              for(int b=0;b<tlen;b++) r->prog[b]=prog[b]; for(int b=tlen;b<32;b++) r->prog[b]=0; }
+          }
         }
       }
     }
@@ -153,7 +155,7 @@ extern "C" __global__ void g_crack_bloom(const u8 *bw_data, const int *bw_off, c
       u8 cc[32],kk[32]; derive_hardened(seed,64,idx3,3,cc,kk);
       if(bloom_probe(bloom,cc,bmask)){
         unsigned int slot=atomicAdd(hitcnt,1u);
-        if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=j; r->change=0; r->index=0; r->purpose=purposes[pp];
+        if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=j; r->change=0; r->index=0; r->account=0; r->purpose=purposes[pp];
           for(int b=0;b<32;b++) r->prog[b]=cc[b]; }
       }
     }
@@ -190,7 +192,7 @@ extern "C" __global__ void g_hctx_init(const u8 *mn, int mnlen, HCTX *out){
 }
 extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
                                         unsigned long long start, unsigned long long count,
-                                        u32 purpose, u32 changes, u32 gap,
+                                        u32 purpose, u32 accounts, u32 changes, u32 gap,
                                         const u8 *target_prog,
                                         unsigned long long *hit_index, int *hit_found, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
@@ -200,8 +202,8 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
     unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
     u32 slen=8+pwidth;
     u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
-    int oc,oi;
-    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+    int oa,oc,oi;
+    if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
   }
 }
 
@@ -212,7 +214,7 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int pwidth,
  * index j (maps directly to the digits). */
 extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int pwidth,
                                         unsigned long long start, unsigned long long count,
-                                        const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                        const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                         const u32 *bloom, u32 bmask,
                                         BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
@@ -222,7 +224,7 @@ extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int pwidth,
     unsigned long long q=j; for(int p=pwidth-1;p>=0;p--){ salt[8+p]=(u8)('0'+(int)(q%10)); q/=10; }
     u32 slen=8+pwidth;
     u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
-    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+    derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 
@@ -231,7 +233,7 @@ extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int pwidth,
 extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                         const u32 *bw_idx, int n, int size,
                                         unsigned long long start_lo, unsigned long long count,
-                                        u32 purpose, u32 changes, u32 gap,
+                                        u32 purpose, u32 accounts, u32 changes, u32 gap,
                                         const u8 *target_prog, int require_ck,
                                         unsigned long long *hit_index, int *hit_found,
                                         unsigned long long *hashed, u32 *hit_ci){
@@ -245,8 +247,8 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
     if(hashed) atomicAdd(hashed,1ULL);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    int oc,oi;
-    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+    int oa,oc,oi;
+    if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
   }
 }
 /* Bloom variant of g_pbkdf2_perm (compacted survivors): PBKDF2 -> derive -> probe
@@ -254,7 +256,7 @@ extern "C" __global__ void g_crack_addr(const u8 *bw_data, const int *bw_off, co
 extern "C" __global__ void g_pbkdf2_perm_bloom(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                          const u32 *bw_idx, int n, int size,
                                          const unsigned long long *surv, unsigned long long nsurv,
-                                         const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                         const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                          const u32 *bloom, u32 bmask,
                                          BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
@@ -265,7 +267,7 @@ extern "C" __global__ void g_pbkdf2_perm_bloom(const u8 *bw_data, const int *bw_
     int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+    derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 
@@ -275,7 +277,7 @@ extern "C" __global__ void g_pbkdf2_perm_bloom(const u8 *bw_data, const int *bw_
 extern "C" __global__ void g_crack_addr_bloom(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                         const u32 *bw_idx, int n, int size,
                                         unsigned long long start_lo, unsigned long long count,
-                                        const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                        const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                         const u32 *bloom, u32 bmask, int require_ck,
                                         BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
                                         unsigned long long *hashed){
@@ -289,7 +291,7 @@ extern "C" __global__ void g_crack_addr_bloom(const u8 *bw_data, const int *bw_o
     if(hashed) atomicAdd(hashed,1ULL);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+    derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 
@@ -326,7 +328,7 @@ __device__ int build_mnemonic_wl(const u8 *wl, const int *wloff, const int *wlle
 extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const int *wllen,
                                            const u32 *tmpl, int W, const int *upos, int U,
                                            unsigned long long start, unsigned long long count,
-                                           u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
+                                           u32 purpose, u32 accounts, u32 changes, u32 gap, const u8 *target_prog,
                                            unsigned long long *hit_index, int *hit_found, u32 *hit_g,
                                            unsigned long long *hashed, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
@@ -339,8 +341,8 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    int oc,oi;
-    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+    int oa,oc,oi;
+    if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
   }
 }
 /* [:Nth:] CONSTRUCTION: the LAST position (W-1) is the unknown checksum word.
@@ -352,7 +354,7 @@ extern "C" __global__ void g_crack_missing(const u8 *wl, const int *wloff, const
 extern "C" __global__ void g_crack_missing_bloom(const u8 *wl, const int *wloff, const int *wllen,
                                            const u32 *tmpl, int W, const int *upos, int U,
                                            unsigned long long start, unsigned long long count,
-                                           const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                           const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                            const u32 *bloom, u32 bmask,
                                            BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
                                            unsigned long long *hashed){
@@ -366,13 +368,13 @@ extern "C" __global__ void g_crack_missing_bloom(const u8 *wl, const int *wloff,
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+    derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int *wllen,
                                        const u32 *tmpl, int W, const int *upos, int U,
                                        unsigned long long start, unsigned long long count,
-                                       u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
+                                       u32 purpose, u32 accounts, u32 changes, u32 gap, const u8 *target_prog,
                                        unsigned long long *hit_index, int *hit_found, u32 *hit_g,
                                        unsigned long long *hashed, u32 *hit_ci){
   int total=W*11, ENT=total*32/33, CS=total-ENT;   // CS = W/3
@@ -395,8 +397,8 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    int oc,oi;
-    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+    int oa,oc,oi;
+    if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); for(int p=0;p<W;p++) hit_g[p]=g[p]; hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
   }
 }
 
@@ -404,7 +406,7 @@ extern "C" __global__ void g_crack_nth(const u8 *wl, const int *wloff, const int
 extern "C" __global__ void g_crack_nth_bloom(const u8 *wl, const int *wloff, const int *wllen,
                                        const u32 *tmpl, int W, const int *upos, int U,
                                        unsigned long long start, unsigned long long count,
-                                       const u32 *purposes, int npurp, u32 changes, u32 gap,
+                                       const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                        const u32 *bloom, u32 bmask,
                                        BloomHit *hits, unsigned int *hitcnt, unsigned int hitcap,
                                        unsigned long long *hashed){
@@ -425,7 +427,7 @@ extern "C" __global__ void g_crack_nth_bloom(const u8 *wl, const int *wloff, con
     u8 mn[MN_STRIDE]; int L=build_mnemonic_wl(wl,wloff,wllen,g,W,mn);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    derive_address_bloom(seed,purposes,npurp,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
+    derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
 }
 /* ---- unrank gates: decode index -> word vector (order must match librxe) ---- */
@@ -476,7 +478,7 @@ extern "C" __global__ void g_sieve_perm(const u8 *bw_data, const int *bw_off, co
 extern "C" __global__ void g_pbkdf2_perm(const u8 *bw_data, const int *bw_off, const int *bw_len,
                                          const u32 *bw_idx, int n, int size,
                                          const unsigned long long *surv, unsigned long long nsurv,
-                                         u32 purpose, u32 changes, u32 gap, const u8 *target_prog,
+                                         u32 purpose, u32 accounts, u32 changes, u32 gap, const u8 *target_prog,
                                          unsigned long long *hit_index, int *hit_found, u32 *hit_ci){
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long s=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; s<nsurv; s+=stride){
@@ -486,7 +488,7 @@ extern "C" __global__ void g_pbkdf2_perm(const u8 *bw_data, const int *bw_off, c
     int L=build_mnemonic(bw_data,bw_off,bw_len,bw_idx,dig,size,mn,g);
     u8 seed[64]; const u8 salt[8]={'m','n','e','m','o','n','i','c'};
     pbkdf2_seed(mn,(u32)L,salt,8,2048,seed);
-    int oc,oi;
-    if(derive_address_match(seed,purpose,changes,gap,target_prog,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; }
+    int oa,oc,oi;
+    if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
   }
 }
