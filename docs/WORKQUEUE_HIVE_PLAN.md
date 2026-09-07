@@ -97,6 +97,13 @@ re-queue path is transport-agnostic.
 - Assumes **passwordless key auth** and that the **tool + `.blf`/dict files already exist** on
   each box (per Kiko).
 - READY handshake carries `g_ptx_key` (kernels hash) already; version-match check in place.
+- **Bloom byte-identity check**: in bloom mode the READY handshake also carries `bloom=<hash>`
+  (a fast 4-lane FNV of the whole `.blf`, computed as it's mmap'd). The supervisor takes the
+  first worker's hash as the reference and **refuses** any worker whose `.blf` differs — a
+  different filter is a different address set, so its hits would be meaningless. Non-bloom modes
+  send `bloom=-` and skip the check. `--bloom FILE --bloom-key` prints the hash host-side (no
+  GPU) so you can confirm the filters match on every box *before* launching (an independent
+  `sha256sum` on each box proves the same thing; `--bloom-key` is what the hive actually enforces).
 - **Partition/crash recovery works over SSH**: a dead `ssh` (machine dropping off) EOFs its
   pipe → the same re-queue branch hands its in-flight shard to a survivor. Verified on loopback
   (kill one worker mid-run → throughput halves, still FOUND at the right rank).

@@ -175,8 +175,8 @@ set); `--nth` / `--no-nth`; `--no-compact` (compaction is on by default); shardi
 arrangement); `--resume LOG` (continue a killed run); multi-GPU `--device D`,
 `--devices 0,1` / `--gpus N`, `--print-total`; SSH hive `--hosts`, `--remote-bin`,
 `--ssh`; bloom tooling `--bloom-build`, `--bloom-stat`, `--bloom-sizes`,
-`--bloom-check`; `--kernel-key` (kernels-version hash, for checking hive hosts are in
-sync). `bip39rxcrack -h` lists them all.
+`--bloom-check`, `--bloom-key` (`.blf` content hash); `--kernel-key` (kernels-version
+hash — both let you check hive hosts are in sync). `bip39rxcrack -h` lists them all.
 
 **Multi-GPU work-queue.** For the `--words`+`--address` and `--template`+`--address`
 (missing-word / `[:Nth:]`) paths, the supervisor owns a queue of **fine shards** (~8M
@@ -204,6 +204,12 @@ binary runs with no `cuda/` dir — handy for the hive (copy just the binary to 
 The binary carries a kernels-version key (`--kernel-key`); the hive supervisor **refuses
 a worker whose kernels don't match** rather than letting a stale copy fail silently. (A
 `cuda/` dir on disk still wins for in-place kernel edits during development.)
+
+**Bloom byte-identity.** In bloom mode each worker also hashes its whole `.blf` and reports
+it in the READY handshake; the supervisor **refuses a worker whose filter differs** from the
+first one's — a mismatched filter is a different address set, so its hits would be worthless.
+Confirm the copies match *before* a run with **`--bloom FILE --bloom-key`** (prints the hash,
+no GPU) on each box, or independently with `sha256sum`.
 
 **Multi-GPU (other modes).** Crack jobs **fan out over all visible GPUs by default**
 (pin a single card with `--device D`; `CUDA_VISIBLE_DEVICES` is honoured). `--devices

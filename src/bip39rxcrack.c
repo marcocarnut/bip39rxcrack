@@ -127,6 +127,7 @@ static int g_worker=0;        /* --worker: persistent shard-servicing worker ove
 static int g_exhaustive=0;    /* --exhaustive: don't stop on first hit; report ALL matches (SET modes) */
 static int g_is_pass=0;       /* passphrase (regime A) run: label the recovered secret as a passphrase */
 static char g_ptx_key[128];   /* kernels/PTX hash, reported in the worker READY handshake */
+static char g_bloom_key[24];  /* hash of the loaded .blf; hive workers must all match (bloom mode) */
 #define WQ_PROTO "wq1"        /* work-queue line-protocol version */
 static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
@@ -1604,7 +1605,7 @@ static int wq_sweep_pass(void*c,unsigned long long s,unsigned long long n,double
   return f;
 }
 static int run_worker(Sweeper*S){
-  printf("READY %s dev%d kern=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,S->total); fflush(stdout);
+  printf("READY %s dev%d kern=%s bloom=%s total=%llu\n",WQ_PROTO,g_device,g_ptx_key,g_bloom_key[0]?g_bloom_key:"-",S->total); fflush(stdout);
   char line[512];
   WorkerProg wp={0};   /* cumulative across ALL this worker's shards (base) + in-flight (cur) */
   while(fgets(line,sizeof line,stdin)){
@@ -1871,6 +1872,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   else { for(int d=0; d<ndev && d<MAXW; d++){ memset(&ws[nspec],0,sizeof ws[nspec]); snprintf(ws[nspec].dest,sizeof ws[nspec].dest,"local"); ws[nspec].dev=devs[d]; ws[nspec].local=1; nspec++; } }
   for(int i=0;i<nspec;i++) if(ws[i].local) any_local=1;
   char sup_key[128]=""; kernel_source_key(g_cu,sup_key,sizeof sup_key);   /* our kernels-version; workers must match */
+  char ref_bloom[24]="";   /* bloom mode: first worker's .blf hash; all others must match it */
 
   /* 1) total (no-GPU child) + 2) warm the local PTX cache once (best-effort) */
   char*pt[]={"--print-total"}; char**ptv=child_argv(argc,argv,pt,1);
@@ -1949,10 +1951,17 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
       while((nl=strchr(ln,'\n'))){
         *nl=0;
         if(!strncmp(ln,"READY",5)){
-          char rkern[128]=""; { char*kp=strstr(ln,"kern="); if(kp) sscanf(kp+5,"%127s",rkern); }
-          if(sup_key[0] && rkern[0] && strcmp(rkern,sup_key)){   /* stale/mismatched kernels -> refuse loudly */
-            fprintf(stderr,"%s: worker [%s] REFUSED -- kernels version %s != supervisor %s; sync the binary + cuda/ on that box (or --remote-bin an updated build)\n",
-                    hosts?"hive":"workqueue",w->tag,rkern,sup_key);
+          char rkern[128]="",rbloom[24]=""; { char*kp=strstr(ln,"kern="); if(kp) sscanf(kp+5,"%127s",rkern);
+            char*bp=strstr(ln,"bloom="); if(bp) sscanf(bp+6,"%23s",rbloom); }
+          const char*refuse=0; char det[256];
+          if(sup_key[0] && rkern[0] && strcmp(rkern,sup_key)){ refuse="kernels";
+            snprintf(det,sizeof det,"kernels %s != supervisor %s; sync the binary + cuda/ on that box",rkern,sup_key); }
+          else if(rbloom[0] && strcmp(rbloom,"-")){   /* bloom mode: every box's .blf must be bit-identical */
+            if(!ref_bloom[0]) snprintf(ref_bloom,sizeof ref_bloom,"%s",rbloom);   /* first worker sets the reference */
+            else if(strcmp(rbloom,ref_bloom)){ refuse="bloom";
+              snprintf(det,sizeof det,"bloom file %s != %s; the .blf must be byte-identical on every box (re-copy it)",rbloom,ref_bloom); } }
+          if(refuse){
+            fprintf(stderr,"%s: worker [%s] REFUSED -- %s mismatch: %s\n",hosts?"hive":"workqueue",w->tag,refuse,det);
             dprintf(w->wfd,"STOP\n"); w->alive=0; close(w->rfd); close(w->wfd); w->shard=-1; break; }
           long s=NEXT_SHARD();
           if(s<0){ dprintf(w->wfd,"STOP\n"); }
@@ -2198,6 +2207,17 @@ static int load_bloom_file(const char*path,AddrSet*A){
   struct stat st; if(fstat(fd,&st)){ close(fd); return 2; } size_t sz=(size_t)st.st_size;
   void*base=mmap(0,sz,PROT_READ,MAP_SHARED,fd,0); close(fd);
   if(base==MAP_FAILED){ fprintf(stderr,"mmap %s failed\n",path); return 2; }
+  /* content hash of the whole file: hive workers in bloom mode must all match
+     bit-for-bit (a different .blf = a different address set = meaningless hits).
+     4 independent FNV lanes so it's memory-bound, not multiply-latency-bound. */
+  { const unsigned long long P=1099511628211ULL; unsigned long long h[4]={
+      1469598103934665603ULL,0x100000001b3ULL^sz,0xcbf29ce484222325ULL,0x9e3779b97f4a7c15ULL};
+    const unsigned long long*w=(const unsigned long long*)base; size_t nw=sz/8, i=0;
+    for(; i+4<=nw; i+=4){ h[0]=(h[0]^w[i])*P; h[1]=(h[1]^w[i+1])*P; h[2]=(h[2]^w[i+2])*P; h[3]=(h[3]^w[i+3])*P; }
+    for(; i<nw; i++) h[0]=(h[0]^w[i])*P;
+    const unsigned char*tb=(const unsigned char*)base+nw*8; for(size_t k=nw*8;k<sz;k++) h[0]=(h[0]^*tb++)*P;
+    unsigned long long hh=(h[0]^h[1])*P; hh=(hh^h[2])*P; hh=(hh^h[3])*P;
+    snprintf(g_bloom_key,sizeof g_bloom_key,"%llx",hh); }
   uint32_t magic=*(uint32_t*)base;
   memset(A,0,sizeof *A);
   if(magic==BLF3_MAGIC){
@@ -2434,6 +2454,9 @@ static void usage(void){
    "  --bloom FILE --bloom-stat   MEASURE a .blf's true per-filter + combined FPR (no GPU).\n"
    "                              ALWAYS run this after a build -- the sizing est is approximate.\n"
    "  --bloom FILE --bloom-check A[,B..]  probe address(es) through filter1/filter2 separately\n"
+   "  --bloom FILE --bloom-key    print the .blf content hash (no GPU); a hive refuses\n"
+   "                              workers whose bloom hash differs -- run it on each box\n"
+   "                              to confirm the filters are byte-identical before a run.\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --xpubs X,.. / --xpubs-file PATH  a SET of account xpubs (chaincode bloom,\n"
    "                          EC-free; tries purposes 44/49/84/86, --purpose overrides)\n"
@@ -2514,7 +2537,7 @@ int main(int argc,char**argv){
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
   const char *hosts=0;                                    /* --hosts: SSH hive worker spec */
-  int bloom_selftest=0; long bloom_selftest_n=0; int bloom_stat=0; const char*bloom_check=0;
+  int bloom_selftest=0; long bloom_selftest_n=0; int bloom_stat=0; const char*bloom_check=0; int bloom_key=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -2549,6 +2572,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--xpubs-file")&&i+1<argc) xpubs_file=argv[++i];
     else if(!strcmp(argv[i],"--bloom")&&i+1<argc) bloom_file=argv[++i];
     else if(!strcmp(argv[i],"--bloom-stat")) bloom_stat=1;
+    else if(!strcmp(argv[i],"--bloom-key")) bloom_key=1;
     else if(!strcmp(argv[i],"--bloom-check")&&i+1<argc) bloom_check=argv[++i];
     else if(!strcmp(argv[i],"--bloom-build")&&i+2<argc){ bbuild_in=argv[++i]; bbuild_out=argv[++i]; }
     else if(!strcmp(argv[i],"--bloom-n")&&i+1<argc) bloom_n=strtoull(argv[++i],0,10);
@@ -2646,6 +2670,8 @@ int main(int argc,char**argv){
   g_cu=cu;   /* so the hive supervisor can compute its kernels-version key for the worker check */
   if(kernel_key){ char k[128]; kernel_source_key(cu,k,sizeof k); printf("%s\n",k); return 0; }
   if(bloom_sizes_set) return mode_bloom_sizes(bloom_sizes,bloom_fpr,bloom_gib1,bloom_gib2);
+  if(bloom_key){ if(!bloom_file){ fprintf(stderr,"--bloom-key needs --bloom FILE\n"); return 2; }
+    AddrSet A; if(load_bloom_file(bloom_file,&A)) return 2; printf("%s\n",g_bloom_key); return 0; }
   if(bloom_stat||bloom_check){ if(!bloom_file){ fprintf(stderr,"--bloom-stat/--bloom-check need --bloom FILE\n"); return 2; }
     if(bloom_stat) return mode_bloom_stat(bloom_file);
     return mode_bloom_check(bloom_file,bloom_check); }
