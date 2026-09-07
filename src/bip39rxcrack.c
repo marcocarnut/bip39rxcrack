@@ -1882,8 +1882,9 @@ static uint32_t gib_to_nblocks(double gib){ if(gib<=0) return 0; double b=gib*33
    bloom: filter1 BLOCKED over the raw program (GPU prefilter); filter2 CLASSIC over
    sha256(program) (host cull -- no block-load variance, so ideal FPR). Streamed --
    no sort, no stored programs; only the two filters live in RAM. */
-static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2){
+static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2,const char*other_file){
   uint32_t nb1; int log2b2,k2;
+  FILE*of=0; if(other_file){ of=fopen(other_file,"w"); if(!of) fprintf(stderr,"warning: cannot write --bloom-other %s (continuing)\n",other_file); }
   if(gib1>0 && gib2>0){ nb1=gib_to_nblocks(gib1); log2b2=gib_to_log2bytes(gib2);
     k2=classic_optk((unsigned long long)1<<(log2b2+3), n_hint?n_hint:1500000000ULL); }
   else { if(!n_hint){ fprintf(stderr,"--bloom-build needs --bloom-n N (or --bloom-gib G1,G2 for explicit sizes)\n"); return 2; }
@@ -1903,7 +1904,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
     char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
     uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(s,pr,&pl,&pu)){
       /* expected & non-derivable: native-segwit script/other-witness (bc1... but not p2wpkh/p2tr) */
-      if(!strncmp(s,"bc1",3)) skip_wsh++; else { skip_other++; if(skip_other<=5) fprintf(stderr,"  skip: %s\n",s); }
+      if(!strncmp(s,"bc1",3)) skip_wsh++; else { skip_other++; if(skip_other<=5) fprintf(stderr,"  skip: %s\n",s); if(of) fprintf(of,"%s\n",s); }
       bad++; continue; }
     (void)pl;
     bloom_insert(f1,pr,nb1-1);
@@ -1913,6 +1914,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
     n++; if((n&0x3FFFFFF)==0) fprintf(stderr,"  ... %ld addresses\r",n); }
   if(f!=stdin) fclose(f);
   g_decode_quiet=0;
+  if(of){ fclose(of); if(skip_other) fprintf(stderr,"bloom-build: wrote %ld 'other' unparseable line(s) to %s\n",skip_other,other_file); }
   if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
   if(bad) fprintf(stderr,"bloom-build: skipped %ld (%ld native-segwit script / other-witness, not seed-derivable; %ld other)\n",bad,skip_wsh,skip_other);
   if(n_hint && (unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target\n",n,n_hint);
@@ -2154,6 +2156,7 @@ static void usage(void){
    "                          --bloom-n N  (required) approx address count, sizes the filters\n"
    "                          --fpr P      target combined false-positive rate (default 1e-12)\n"
    "                          --bloom-gib G1,G2  explicit filter1,filter2 sizes in GiB (with --bloom-n)\n"
+   "                          --bloom-other FILE  tee unparseable 'other' (non-bc1) lines to FILE\n"
    "  --bloom FILE --bloom-stat   MEASURE a .blf's true per-filter + combined FPR (no GPU).\n"
    "                              ALWAYS run this after a build -- the sizing est is approximate.\n"
    "  --bloom FILE --bloom-check A[,B..]  probe address(es) through filter1/filter2 separately\n"
@@ -2218,6 +2221,7 @@ int main(int argc,char**argv){
   const char *bloom_file=0,*bbuild_in=0,*bbuild_out=0;  /* prebuilt address bloom */
   unsigned long long bloom_n=0; double bloom_fpr=1e-12;   /* --bloom-build sizing */
   double bloom_gib1=0, bloom_gib2=0;                       /* --bloom-gib G1,G2 explicit sizes */
+  const char *bloom_other=0;                               /* --bloom-other FILE: dump 'other' skips */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
@@ -2261,6 +2265,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--bloom-n")&&i+1<argc) bloom_n=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--fpr")&&i+1<argc){ double v=atof(argv[++i]); if(v>0&&v<1) bloom_fpr=v; }
     else if(!strcmp(argv[i],"--bloom-gib")&&i+1<argc){ sscanf(argv[++i],"%lf,%lf",&bloom_gib1,&bloom_gib2); }
+    else if(!strcmp(argv[i],"--bloom-other")&&i+1<argc) bloom_other=argv[++i];
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -2371,7 +2376,7 @@ int main(int argc,char**argv){
   }
   /* gate/util modes need no pattern */
   if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
-  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2); }
+  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2,bloom_other); }
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);
