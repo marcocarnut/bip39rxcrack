@@ -63,15 +63,28 @@ was the test's bug, not the filter's):
 At the real target (1.5e9 keys, 4 GiB = ~23 bits/key) this interpolates to **FPR ~1e-4**,
 matching the estimate below; 6 GiB (~33 bits/key) buys ~1e-5.
 
-## Sizing & FPR — and why we have huge latitude
+## Sizing & FPR — and the blocked-bloom correction (IMPORTANT, learned the hard way)
 
-4 GiB = 2^35 bits, 2^27 blocks, n=1.5e9 -> ~23 bits/key, ~11 keys/block -> **FPR ~1e-4**
-(blocked imbalance included). 8 GiB -> ~1e-6. Either is fine, because:
-- **true positives ~1** (one wallet in a vast space), and
-- the **cull is cheap**: FPR x candidate-rate = 1e-4 x ~2e6/s = ~200/s. Nothing.
+**A blocked bloom's FPR is NOT `(avg fill)^k`.** A random query lands in a random block, and
+the fuller-than-average blocks (Poisson variance in keys/block) dominate — `E[blockfill^k] ≫
+(avg fill)^k`. The original estimator used `(avg fill)^16` and was **~2600× too optimistic**
+for filter 1 (it claimed 2.2e-9; the MEASURED FPR of the real 8 GiB / 1.5e9 filter is 5.7e-6).
+This is why a build that reported "combined FPR 6.1e-14" actually delivered ~1.5e-9, and a
+110M-candidate `--purpose 44` sweep produced a real false positive (`1GVcqyg…`) — ~0.17 expected,
+i.e. right on the nose. The lesson: **always MEASURE with `--bloom-stat`; never trust the formula.**
 
-So run the filter loose; the cull mops up. Trade memory for FPR freely (we use ~2 GiB of
-32; a 4-8 GiB filter is comfortable — each GPU/process holds its own copy).
+`blf_fpr` was rewritten to the 2nd-order-occupancy Poisson formula (matches measured to ~1× at
+high fill, ~3× optimistic at low fill — vs 2600× before), but the ground truth is the
+`--bloom-stat` Monte-Carlo. Consequences for design:
+- **Filter 1 (GPU, blocked) stays 8 GiB and does NOT need to grow.** It is a *prefilter*: at
+  5.7e-6 it passes ~1 in 175k candidates to the host — a trillion-candidate sweep hands the host
+  only ~6M checks. All the precision comes from the cull.
+- **Filter 2 (host cull) does the work, and it should be a CLASSIC (non-blocked) bloom.** The
+  blocked layout exists only for GPU cache-locality; the cull runs on the host on filter-1's rare
+  hits, so it can afford k≈32 scattered probes with NO block-load variance → *ideal* FPR `~0.5^k`.
+  Measured: a classic cull at 50% fill hits ~ideal (1.3e-7 at k=23, vs 2.7e-4 for a *blocked*
+  filter at the same fill — ~2000× better per bit). An 8 GiB classic cull (k=32) ≈ 2e-10, so
+  **combined ≈ 5.7e-6 × 2e-10 ≈ 1e-15 at only 16 GiB total** (8 GiB GPU + 8 GiB host).
 
 ## The cull (host-side)
 
@@ -163,26 +176,24 @@ more work than the naive one.
    culls and reports the matched xpub + its purpose (`BloomHit` now carries the derive purpose,
    which the address paths also use). Fans out via the contiguous supervisor like `--xpub`.
    Gate `gate/e2e_xpubs.js` (`make xpubs-e2e`).
-3. **`--bloom-build` + `--bloom`** — **DONE, DUAL-BLOOM** (the "any funded address" mode).
-   `.blf` v2 format `[BlfHeader][filter1 nblocks1*32B][filter2 nblocks2*32B]` (magic `BLF2`).
-   **No exact cull, no sort, no stored address list** — two *independent* blooms whose FPRs
-   multiply. Filter 1 slices the raw 32-byte program (the GPU prefilter); filter 2 slices
-   `sha256(program)` (host, probed only on filter 1's rare hits). A single k=16 filter can't
-   do better (the 20-byte program only feeds 16 lane bytes); two of them behave like k=32, so
-   the false-positive rate is `fpr1·fpr2` — ~5.7e-14 at 1.5e9. `--bloom-build IN OUT --bloom-n N
-   [--fpr P]`: `--bloom-n` (approx address count) sizes the pair to minimal total blocks with
-   combined FPR ≤ P (default 1e-12); it decodes each line to its program, stream-inserts into
-   both filters, records the distinct script types, writes OUT. `IN='-'` reads **stdin**, so the
-   indexer/full-node output pipes straight in — and, since nothing is stored but the two filters,
-   the source never needs to touch disk: `curl -s LIST | zcat | bip39rxcrack --bloom-build -
-   funded.blf --bloom-n 1500000000`. `--bloom FILE` **mmaps** it (filter1 → GPU, filter2 stays
-   paged on the host), works with `--words`/`--template`, fans out over GPUs like `--addresses`;
-   a hit re-encodes the matched program (base58check/bech32, host SHA-256). `k` and magic are
-   stamped and checked on load. Gate `gate/e2e_bloom_file.js` (`make bloom-e2e`).
-   **1.5e9 sizing**: 2^28 + 2^27 blocks = **12.00 GiB .blf** (8 GiB filter1 on the GPU, fits the
-   32 GiB card beside the ~2 GiB working set; 4 GiB filter2 mmap'd on the host), combined FPR
-   ~5.7e-14. Build peak RAM = the two filters (~12 GiB) — **no sort, no external merge, no extra
-   disk**; the 12 GiB output fits the 25 GB system disk (the +120 GB request is moot). OPEN: the
+3. **`--bloom-build` + `--bloom`** — **DONE; BLF3 = blocked filter1 + CLASSIC cull filter2**
+   (the "any funded address" mode). `.blf` **BLF3** format `[Blf3Header][filter1 nblocks1*32B]
+   [filter2 2^f2_log2bytes B]`: filter 1 is a blocked bloom over the raw program (GPU prefilter);
+   **filter 2 is a CLASSIC bloom over `sha256(program)` (k2 double-hashed probes) — the host cull**,
+   probed only on filter 1's rare hits. No exact set, no sort, no stored address list. Legacy
+   **BLF2** (blocked filter 2) still loads. `--bloom-build IN OUT --bloom-n N [--fpr P]
+   [--bloom-gib G1,G2]`: `--bloom-n` sizes filter 1 (capped 8 GiB, GPU) + the classic filter 2 to
+   the target; `--bloom-gib` overrides sizes explicitly. `IN='-'` reads **stdin**, nothing is
+   stored but the two filters, so the source never touches disk: `curl -s LIST | zcat |
+   bip39rxcrack --bloom-build - funded.blf --bloom-n 1500000000`. `--bloom FILE` **mmaps** it
+   (filter1 → GPU, filter2 paged on the host), works with `--words`/`--template`/`--passphrase`,
+   fans out over GPUs; a hit re-encodes the matched program. **ALWAYS verify a built filter with
+   `--bloom FILE --bloom-stat`** (measures the true per-filter + combined FPR); `--bloom-check
+   A[,B..]` probes given addresses through each filter. Gate `gate/e2e_bloom_file.js`.
+   **1.5e9 sizing**: `--bloom-n 1500000000` → 8 GiB blocked filter1 (measured 5.7e-6, the GPU
+   prefilter) + 8 GiB classic filter2 k=32 (~2e-10) = **16 GiB .blf, combined ~1e-15** — fits the
+   25 GB disk and the 32 GiB card. (History: the first build was BLF2 12 GiB and *reported*
+   5.7e-14 but the broken estimator hid a real ~1.5e-9 — see "Sizing & FPR" above.) OPEN: the
    *address data source* (full-node `dumptxoutset` vs an indexer like electrs).
 4. (Later) fold the prebuilt `--bloom` into the hive so each box loads/ships its own `.blf`.
 

@@ -681,14 +681,30 @@ typedef struct { uint8_t prog[32]; char *str; int purpose; } AEnt;
  * uploaded to the GPU as-is instead of being built. */
 typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp;
                  const uint32_t *host_filter; uint32_t host_filter_nblocks;
-                 const uint32_t *prefilter; uint32_t prefilter_nblocks; } AddrSet;
+                 const uint32_t *prefilter; uint32_t prefilter_nblocks;
+                 int f2_classic, f2_log2bytes, f2_k2; } AddrSet;  /* BLF3: filter2 is a CLASSIC bloom */
+/* classic (non-blocked) bloom over sha256(program): k2 bit positions by double-
+   hashing pos_i=(a+i*b) & (2^(log2bytes+3)-1). No block-load variance -> ideal
+   FPR. Host-only (filter 2), probed only on filter 1's rare hits. */
+static void classic_bits(const uint8_t*prog,unsigned long long*a,unsigned long long*b){
+  uint8_t h[32]; sha256_host(prog,32,h);
+  unsigned long long x=0,y=0; for(int i=0;i<8;i++){ x|=(unsigned long long)h[i]<<(8*i); y|=(unsigned long long)h[8+i]<<(8*i); }
+  *a=x; *b=y|1ULL; }
+static void classic_insert(uint8_t*f,const uint8_t*prog,int log2bytes,int k2){
+  unsigned long long a,b; classic_bits(prog,&a,&b); unsigned long long mask=((unsigned long long)1<<(log2bytes+3))-1;
+  for(int i=0;i<k2;i++){ unsigned long long p=(a+(unsigned long long)i*b)&mask; f[p>>3]|=(uint8_t)(1u<<(p&7)); } }
+static int classic_probe(const uint8_t*f,const uint8_t*prog,int log2bytes,int k2){
+  unsigned long long a,b; classic_bits(prog,&a,&b); unsigned long long mask=((unsigned long long)1<<(log2bytes+3))-1;
+  for(int i=0;i<k2;i++){ unsigned long long p=(a+(unsigned long long)i*b)&mask; if(!((f[p>>3]>>(p&7))&1)) return 0; } return 1; }
 static int aent_cmp(const void*a,const void*b){ return memcmp(((const AEnt*)a)->prog,((const AEnt*)b)->prog,32); }
 static void aset_sort(AddrSet*A){ qsort(A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
 static const AEnt* aset_lookup(const AddrSet*A,const uint8_t*prog){   /* only ent-backed carries strings */
   if(A->host_filter||!A->ent) return 0;
   AEnt key; memcpy(key.prog,prog,32); return (const AEnt*)bsearch(&key,A->ent,(size_t)A->n,sizeof(AEnt),aent_cmp); }
 static int aset_member(const AddrSet*A,const uint8_t*prog){
-  if(A->host_filter){ uint8_t h[32]; sha256_host(prog,32,h); return bloom_probe(A->host_filter,h,A->host_filter_nblocks-1); }
+  if(A->host_filter){
+    if(A->f2_classic) return classic_probe((const uint8_t*)A->host_filter,prog,A->f2_log2bytes,A->f2_k2);
+    uint8_t h[32]; sha256_host(prog,32,h); return bloom_probe(A->host_filter,h,A->host_filter_nblocks-1); }
   return aset_lookup(A,prog)!=0; }
 static void aset_free(AddrSet*A){ if(!A->ent) return; for(long i=0;i<A->n;i++) free(A->ent[i].str); free(A->ent); A->ent=0; }
 
@@ -1803,36 +1819,84 @@ static int build_xpubset(const char*csv,const char*file,AddrSet*A){
  * independent blooms multiply FPRs (behave like k=32), so no exact address list is
  * stored and there is no sort -- ~12 GiB gets FPR ~1e-13 at 1.5e9. The main program
  * mmaps it: filter1 -> GPU, filter2 stays paged on the host. */
-#define BLF_MAGIC 0x32464C42u   /* 'B','L','F','2' (dual bloom) */
+#define BLF_MAGIC  0x32464C42u   /* 'BLF2' legacy: filter2 is ALSO a blocked bloom */
+#define BLF3_MAGIC 0x33464C42u   /* 'BLF3' current: filter2 is a CLASSIC bloom (ideal FPR) */
 typedef struct { uint32_t magic,version,nblocks1,nblocks2,k,npurp; uint32_t purposes[8]; uint64_t n_addrs; } BlfHeader;
+/* BLF3: filter1 stays a blocked bloom (nblocks1 * 32 B, on the GPU); filter2 is a
+   CLASSIC bloom of 2^f2_log2bytes bytes with k2 hashes (host cull). */
+typedef struct { uint32_t magic,version,nblocks1,f2_log2bytes,k1,k2,npurp,rsv; uint32_t purposes[8]; uint64_t n_addrs; } Blf3Header;
+/* classic (non-blocked) bloom FPR and optimal k for `bits` bits, `n` keys. */
+static double classic_fpr(unsigned long long bits,unsigned long long n,int k){
+  if(!bits||!k) return 1.0;
+  return pow(1.0-exp(-(double)k*(double)n/(double)bits),(double)k); }
+static int classic_optk(unsigned long long bits,unsigned long long n){
+  if(!n) return 1;
+  int k=(int)lround(0.6931471805599453*(double)bits/(double)n); if(k<1)k=1; if(k>64)k=64; return k; }
 
-/* FPR of one k=16 blocked bloom of `nblocks` for `n` keys. */
+/* FPR of one k=16 blocked bloom of `nblocks` for `n` keys.
+   A BLOCKED bloom's FPR is NOT (avg fill)^k: a random query lands in a random
+   block, and the fuller-than-average blocks (Poisson variance in keys/block)
+   dominate. FPR = E_m[ E[(X/B)^k | m] ] over m~Poisson(lambda), where X = the
+   occupancy (distinct set bits) of km bit-sets in a B=256-bit block; the inner
+   term uses the 2nd-order occupancy moment. This matches the measured per-filter
+   FPR to ~1x at high fill and ~3x (optimistic) at low fill -- the OLD (avg
+   fill)^k was ~2600x optimistic and is why the reported combined FPR (6e-14) was
+   ~5 orders of magnitude better than reality (~1e-9). Always confirm a built
+   filter with `--bloom-stat`, which MEASURES the true rate. */
 static double blf_fpr(unsigned long long nblocks,unsigned long long n){
   if(!nblocks) return 1.0;
-  double lambda=(double)n/(double)nblocks, fill=1.0-pow(255.0/256.0,16.0*lambda);
-  return pow(fill,16.0);
+  const double B=256.0, k=16.0; double lambda=(double)n/(double)nblocks;
+  double s=0.0, pm=exp(-lambda);
+  for(int m=0;m<=1000;m++){
+    double km=k*(double)m;
+    if(km>0){
+      double a=pow(1.0-1.0/B,km), mu=B*(1.0-a);
+      double var=B*a + B*(B-1.0)*pow(1.0-2.0/B,km) - B*B*a*a; if(var<0)var=0;
+      double f=pow(mu/B,k)*(1.0+0.5*k*(k-1.0)*var/(mu*mu)); if(f>1.0)f=1.0;
+      s+=pm*f;
+    }
+    pm*=lambda/(m+1);
+    if(m>(int)lambda+80 && pm<1e-20) break;
+  }
+  return s;
 }
-/* pick two power-of-two filter sizes (nb1>=nb2) of minimal total blocks with
-   combined FPR <= target -- two independent blooms behave like k=32, so this beats
-   one filter (capped at k=16 by the 20-byte program). */
-static void blf_size(unsigned long long n,double target,uint32_t*nb1,uint32_t*nb2){
-  int bb1=28,bb2=28; unsigned long long best=~0ULL;
-  for(int b1=4;b1<=31;b1++) for(int b2=4;b2<=b1;b2++){
-    if(blf_fpr(1ULL<<b1,n)*blf_fpr(1ULL<<b2,n)<=target){
-      unsigned long long tot=(1ULL<<b1)+(1ULL<<b2); if(tot<best){ best=tot; bb1=b1; bb2=b2; } } }
-  *nb1=1u<<bb1; *nb2=1u<<bb2;
+/* Size a BLF3 pair for `n` keys and a target combined FPR:
+   filter1 = blocked bloom (GPU prefilter), capped at 2^28 blocks (8 GiB) so it
+   always fits the card; filter2 = classic bloom (host cull) sized to carry the
+   rest of the target. Returns nb1 (blocks), log2bytes2 + k2 (classic). */
+static void blf3_size(unsigned long long n,double target,uint32_t*nb1,int*log2bytes2,int*k2){
+  double pf=(target>1e-6)?target:1e-6;          /* filter1 need only be a good prefilter */
+  int b1; for(b1=4;b1<28;b1++){ if(blf_fpr(1ULL<<b1,n)<=pf) break; }   /* cap 2^28 = 8 GiB */
+  if(b1>28)b1=28;
+  *nb1=1u<<b1;
+  double fpr1=blf_fpr(*nb1,n);
+  double t2=target/fpr1; if(t2>0.5)t2=0.5; if(t2<1e-19)t2=1e-19;
+  int lb; for(lb=3;lb<=37;lb++){ unsigned long long bits=(unsigned long long)1<<(lb+3); int k=classic_optk(bits,n);
+    if(classic_fpr(bits,n,k)<=t2){ *log2bytes2=lb; *k2=k; return; } }
+  *log2bytes2=37; *k2=classic_optk((unsigned long long)1<<40,n);
 }
-/* Read addresses (one per line; IN='-' = stdin, so pipe curl|zcat) -> a dual-bloom
-   .blf: filter 1 over the raw program, filter 2 over sha256(program) (independent).
-   Streamed -- no sort, no stored programs; only the two filters live in RAM. */
-static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr){
-  if(!n_hint){ fprintf(stderr,"--bloom-build needs --bloom-n N (approx address count, to size the filters)\n"); return 2; }
-  uint32_t nb1,nb2; blf_size(n_hint,fpr,&nb1,&nb2);
-  size_t f1b=(size_t)nb1*32u, f2b=(size_t)nb2*32u;
-  uint32_t *f1=calloc(f1b,1), *f2=calloc(f2b,1);
+/* GiB -> log2(bytes) (power of two). */
+static int gib_to_log2bytes(double gib){ if(gib<=0) return 0; int e=(int)lround(log2(gib*1073741824.0)); if(e<3)e=3; if(e>40)e=40; return e; }
+static uint32_t gib_to_nblocks(double gib){ if(gib<=0) return 0; double b=gib*33554432.0; int e=(int)lround(log2(b)); if(e<4)e=4; if(e>30)e=30; return 1u<<e; }
+/* Read addresses (one per line; IN='-' = stdin, so pipe curl|zcat) -> a BLF3 dual
+   bloom: filter1 BLOCKED over the raw program (GPU prefilter); filter2 CLASSIC over
+   sha256(program) (host cull -- no block-load variance, so ideal FPR). Streamed --
+   no sort, no stored programs; only the two filters live in RAM. */
+static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2){
+  uint32_t nb1; int log2b2,k2;
+  if(gib1>0 && gib2>0){ nb1=gib_to_nblocks(gib1); log2b2=gib_to_log2bytes(gib2);
+    k2=classic_optk((unsigned long long)1<<(log2b2+3), n_hint?n_hint:1500000000ULL); }
+  else { if(!n_hint){ fprintf(stderr,"--bloom-build needs --bloom-n N (or --bloom-gib G1,G2 for explicit sizes)\n"); return 2; }
+    blf3_size(n_hint,fpr,&nb1,&log2b2,&k2); }
+  size_t f1b=(size_t)nb1*32u, f2b=(size_t)1<<log2b2;
+  uint32_t *f1=calloc(f1b,1); uint8_t *f2=calloc(f2b,1);
   if(!f1||!f2){ fprintf(stderr,"oom (filters %.2f GiB)\n",(double)(f1b+f2b)/1073741824.0); return 2; }
-  fprintf(stderr,"bloom-build: filters %u+%u blocks = %.2f GiB (target FPR %.0e), streaming...\n",nb1,nb2,(double)(f1b+f2b)/1073741824.0,fpr);
-  FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); return 2; }
+  if(n_hint){ double efpr0=blf_fpr(nb1,n_hint)*classic_fpr((unsigned long long)f2b*8,n_hint,k2);
+    fprintf(stderr,"bloom-build: filter1 %.2f GiB blocked (GPU) + filter2 %.2f GiB classic k=%d (host cull), est FPR ~%.1e (VERIFY with --bloom-stat), streaming...\n",
+            (double)f1b/1073741824.0,(double)f2b/1073741824.0,k2,efpr0); }
+  else fprintf(stderr,"bloom-build: filter1 %.2f GiB blocked (GPU) + filter2 %.2f GiB classic k=%d (host cull), streaming...\n",
+            (double)f1b/1073741824.0,(double)f2b/1073741824.0,k2);
+  FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); free(f1); free(f2); return 2; }
   long n=0,bad=0,skip_wsh=0,skip_other=0; uint32_t purposes[8]; int npurp=0; char line[256];
   g_decode_quiet=1;   /* silence per-line errors; we count + categorize instead */
   while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
@@ -1843,7 +1907,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
       bad++; continue; }
     (void)pl;
     bloom_insert(f1,pr,nb1-1);
-    uint8_t hh[32]; sha256_host(pr,32,hh); bloom_insert(f2,hh,nb2-1);   /* filter 2 = independent */
+    classic_insert(f2,pr,log2b2,k2);         /* filter 2 = classic over sha256(program) */
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
     n++; if((n&0x3FFFFFF)==0) fprintf(stderr,"  ... %ld addresses\r",n); }
@@ -1851,38 +1915,119 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   g_decode_quiet=0;
   if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
   if(bad) fprintf(stderr,"bloom-build: skipped %ld (%ld native-segwit script / other-witness, not seed-derivable; %ld other)\n",bad,skip_wsh,skip_other);
-  if((unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target (rebuild with a larger --bloom-n)\n",n,n_hint);
-  double efpr=blf_fpr(nb1,(uint64_t)n)*blf_fpr(nb2,(uint64_t)n);
+  if(n_hint && (unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target\n",n,n_hint);
+  double efpr=blf_fpr(nb1,(uint64_t)n)*classic_fpr((unsigned long long)f2b*8,(uint64_t)n,k2);
   FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
-  BlfHeader h; memset(&h,0,sizeof h); h.magic=BLF_MAGIC; h.version=2; h.nblocks1=nb1; h.nblocks2=nb2; h.k=BLOOM_K; h.npurp=(uint32_t)npurp;
+  Blf3Header h; memset(&h,0,sizeof h); h.magic=BLF3_MAGIC; h.version=3; h.nblocks1=nb1; h.f2_log2bytes=(uint32_t)log2b2;
+  h.k1=BLOOM_K; h.k2=(uint32_t)k2; h.npurp=(uint32_t)npurp;
   for(int i=0;i<npurp;i++) h.purposes[i]=purposes[i];
   h.n_addrs=(uint64_t)n;
   fwrite(&h,sizeof h,1,o); fwrite(f1,f1b,1,o); fwrite(f2,f2b,1,o);
   if(fclose(o)){ fprintf(stderr,"write error %s\n",outfile); return 2; }
   free(f1); free(f2);
-  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), dual bloom %u+%u blocks = %.2f GiB, %d purpose(s), combined FPR ~%.1e -> %s\n",
-          n,bad,nb1,nb2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
+  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), filter1 %.2f GiB blocked + filter2 %.2f GiB classic k=%d = %.2f GiB, %d purpose(s), est combined FPR ~%.1e -> %s\n",
+          n,bad,(double)f1b/1073741824.0,(double)f2b/1073741824.0,k2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
+  fprintf(stderr,"bloom-build: run `--bloom %s --bloom-stat` to MEASURE the true FPR before trusting it.\n",outfile);
   return 0;
 }
-/* mmap a .blf: filter 1 -> GPU (prefilter), filter 2 -> host (the cull). */
+/* mmap a .blf: filter1 -> GPU (prefilter); filter2 -> host cull (BLF3=classic,
+   BLF2=blocked, both supported). */
 static int load_bloom_file(const char*path,AddrSet*A){
   int fd=open(path,O_RDONLY); if(fd<0){ fprintf(stderr,"cannot open %s\n",path); return 2; }
   struct stat st; if(fstat(fd,&st)){ close(fd); return 2; } size_t sz=(size_t)st.st_size;
   void*base=mmap(0,sz,PROT_READ,MAP_SHARED,fd,0); close(fd);
   if(base==MAP_FAILED){ fprintf(stderr,"mmap %s failed\n",path); return 2; }
-  BlfHeader*h=(BlfHeader*)base;
-  if(h->magic!=BLF_MAGIC){ fprintf(stderr,"%s: not a v2 .blf (rebuild with --bloom-build)\n",path); return 2; }
-  if(h->k!=BLOOM_K){ fprintf(stderr,"%s: k=%u != build k=%d (rebuild)\n",path,h->k,BLOOM_K); return 2; }
-  size_t f1b=(size_t)h->nblocks1*32u;
+  uint32_t magic=*(uint32_t*)base;
   memset(A,0,sizeof *A);
-  A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)); A->prefilter_nblocks=h->nblocks1;
-  A->host_filter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)+f1b); A->host_filter_nblocks=h->nblocks2;
-  A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
-  if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
-  double efpr=blf_fpr(h->nblocks1,h->n_addrs)*blf_fpr(h->nblocks2,h->n_addrs);
-  fprintf(stderr,"bloom: loaded %s -- %llu addresses, dual %u+%u blocks (%.2f GiB), combined FPR ~%.1e, %d purpose(s)\n",
-          path,(unsigned long long)h->n_addrs,h->nblocks1,h->nblocks2,(double)(f1b+(size_t)h->nblocks2*32u)/1073741824.0,efpr,A->npurp);
+  if(magic==BLF3_MAGIC){
+    Blf3Header*h=(Blf3Header*)base; if(h->k1!=BLOOM_K){ fprintf(stderr,"%s: k1=%u != %d (rebuild)\n",path,h->k1,BLOOM_K); return 2; }
+    size_t f1b=(size_t)h->nblocks1*32u, f2b=(size_t)1<<h->f2_log2bytes;
+    A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(Blf3Header)); A->prefilter_nblocks=h->nblocks1;
+    A->host_filter=(const uint32_t*)((uint8_t*)base+sizeof(Blf3Header)+f1b);
+    A->f2_classic=1; A->f2_log2bytes=(int)h->f2_log2bytes; A->f2_k2=(int)h->k2;
+    A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
+    if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
+    double efpr=blf_fpr(h->nblocks1,h->n_addrs)*classic_fpr(f2b*8,h->n_addrs,(int)h->k2);
+    fprintf(stderr,"bloom: loaded %s (BLF3) -- %llu addresses, filter1 %.2f GiB blocked + filter2 %.2f GiB classic k=%u, est FPR ~%.1e, %d purpose(s)\n",
+            path,(unsigned long long)h->n_addrs,(double)f1b/1073741824.0,(double)f2b/1073741824.0,h->k2,efpr,A->npurp);
+    return 0;
+  }
+  if(magic==BLF_MAGIC){   /* legacy blocked-filter2 */
+    BlfHeader*h=(BlfHeader*)base; if(h->k!=BLOOM_K){ fprintf(stderr,"%s: k=%u != %d (rebuild)\n",path,h->k,BLOOM_K); return 2; }
+    size_t f1b=(size_t)h->nblocks1*32u;
+    A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)); A->prefilter_nblocks=h->nblocks1;
+    A->host_filter=(const uint32_t*)((uint8_t*)base+sizeof(BlfHeader)+f1b); A->host_filter_nblocks=h->nblocks2; A->f2_classic=0;
+    A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
+    if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
+    double efpr=blf_fpr(h->nblocks1,h->n_addrs)*blf_fpr(h->nblocks2,h->n_addrs);
+    fprintf(stderr,"bloom: loaded %s (BLF2, legacy blocked cull) -- %llu addresses, dual %u+%u blocks (%.2f GiB), est FPR ~%.1e, %d purpose(s)\n",
+            path,(unsigned long long)h->n_addrs,h->nblocks1,h->nblocks2,(double)(f1b+(size_t)h->nblocks2*32u)/1073741824.0,efpr,A->npurp);
+    return 0;
+  }
+  fprintf(stderr,"%s: not a .blf (bad magic; rebuild with --bloom-build)\n",path); return 2;
+}
+/* count set bits over a filter's raw block array (nblocks*32 bytes). */
+static double bloom_fill(const uint32_t*f,uint32_t nblocks){
+  const unsigned long long*p=(const unsigned long long*)f; size_t nq=(size_t)nblocks*4; /* 32B block = 4 u64 */
+  unsigned long long set=0; for(size_t i=0;i<nq;i++) set+=(unsigned long long)__builtin_popcountll(p[i]);
+  return (double)set/((double)nblocks*256.0);
+}
+/* --bloom-stat FILE: exact bit-fill of each filter + a Monte-Carlo of the REAL
+   per-filter and combined false-positive rate over random 20-byte programs. This
+   is the ground truth: if filter 2's measured FPR is ~its fill^16, the cull works;
+   if it's ~1, filter 2 is not gating (which would explain a long-run false hit). */
+static int mode_bloom_stat(const char*file){
+  AddrSet A; if(load_bloom_file(file,&A)) return 2;
+  double fill1=bloom_fill(A.prefilter,A.prefilter_nblocks);
+  fprintf(stderr,"filter 1 (GPU, blocked): %u blocks, fill %.4f (%.2f%% bits set)\n",A.prefilter_nblocks,fill1,100*fill1);
+  double fill2;
+  if(A.f2_classic){ size_t f2b=(size_t)1<<A.f2_log2bytes;
+    const unsigned long long*p=(const unsigned long long*)A.host_filter; size_t nq=f2b/8; unsigned long long set=0;
+    for(size_t i=0;i<nq;i++) set+=(unsigned long long)__builtin_popcountll(p[i]);
+    fill2=(double)set/((double)f2b*8.0);
+    fprintf(stderr,"filter 2 (host, CLASSIC k=%d): %.2f GiB, fill %.4f (%.2f%% bits set)\n",A.f2_k2,(double)f2b/1073741824.0,fill2,100*fill2); }
+  else { fill2=bloom_fill(A.host_filter,A.host_filter_nblocks);
+    fprintf(stderr,"filter 2 (host, blocked): %u blocks, fill %.4f (%.2f%% bits set)\n",A.host_filter_nblocks,fill2,100*fill2); }
+  /* Monte-Carlo: random 20-byte programs (uniform, like real hash160s) */
+  unsigned long long R1 = 200000000ULL;   /* filter-2 FPR needs ~1e8; filter-1 fill is exact from popcount */
+  unsigned long long s=0x9e3779b97f4a7c15ULL; unsigned long long f1=0,f2only=0,both=0;
+  uint32_t m1=A.prefilter_nblocks-1,m2=A.host_filter_nblocks-1;
+  const uint8_t*f2bytes=(const uint8_t*)A.host_filter;
+  fprintf(stderr,"monte-carlo: probing %llu random programs (measures the TRUE combined FPR)...\n",R1);
+  for(unsigned long long i=0;i<R1;i++){
+    uint8_t pr[32]; memset(pr,0,32);
+    for(int b=0;b<20;b+=8){ s+=0x9e3779b97f4a7c15ULL; unsigned long long z=s; z=(z^(z>>30))*0xbf58476d1ce4e5b9ULL; z=(z^(z>>27))*0x94d049bb133111ebULL; z^=z>>31;
+      for(int q=0;q<8&&b+q<20;q++) pr[b+q]=(uint8_t)(z>>(8*q)); }
+    int h1=bloom_probe(A.prefilter,pr,m1);
+    int h2; if(A.f2_classic) h2=classic_probe(f2bytes,pr,A.f2_log2bytes,A.f2_k2);
+    else { uint8_t sh[32]; sha256_host(pr,32,sh); h2=bloom_probe(A.host_filter,sh,m2); }
+    if(h1) f1++;
+    if(h2) f2only++;
+    if(h1&&h2) both++;
+    if((i&0x3FFFFFFF)==0x3FFFFFFF) fprintf(stderr,"  ... %llu probed (f1=%llu f2=%llu both=%llu)\r",i+1,f1,f2only,both);
+  }
+  fprintf(stderr,"\n");
+  fprintf(stderr,"MEASURED over %llu random programs (this is the ground truth):\n",R1);
+  fprintf(stderr,"  filter 1 FPR = %llu/%llu = %.3e\n",f1,R1,(double)f1/R1);
+  fprintf(stderr,"  filter 2 FPR = %llu/%llu = %.3e\n",f2only,R1,(double)f2only/R1);
+  fprintf(stderr,"  COMBINED FPR = %llu/%llu = %.3e",both,R1,(double)both/R1);
+  if(both==0) fprintf(stderr,"  (0 hits -> combined FPR < %.1e at 95%%; product of singles = %.2e)\n",3.0/R1,(double)f1/R1*(double)f2only/R1);
+  else fprintf(stderr,"  (product of singles = %.2e)\n",(double)f1/R1*(double)f2only/R1);
   return 0;
+}
+/* --bloom-check: probe specific address(es) through each filter separately. */
+static int mode_bloom_check(const char*file,const char*addrs){
+  AddrSet A; if(load_bloom_file(file,&A)) return 2;
+  char *dup=strdup(addrs),*save=0;
+  for(char*a=strtok_r(dup,",",&save); a; a=strtok_r(0,",",&save)){
+    uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(a,pr,&pl,&pu)){ fprintf(stderr,"%s: bad address\n",a); continue; }
+    int h1=bloom_probe(A.prefilter,pr,A.prefilter_nblocks-1);
+    int h2; if(A.f2_classic) h2=classic_probe((const uint8_t*)A.host_filter,pr,A.f2_log2bytes,A.f2_k2);
+    else { uint8_t sh[32]; sha256_host(pr,32,sh); h2=bloom_probe(A.host_filter,sh,A.host_filter_nblocks-1); }
+    printf("%s  purpose=%d  filter1=%s  filter2=%s  => %s\n",a,pu,h1?"HIT":"miss",h2?"HIT":"miss",
+           (h1&&h2)?"MEMBER (both)":"not a member");
+  }
+  free(dup); return 0;
 }
 /* xpub SET (words, EC-free): a blocked bloom of account chaincodes; multi-purpose
    derive; host cull; reports the matched xpub + its purpose. Fans out over GPUs via
@@ -2003,11 +2148,15 @@ static void usage(void){
    "                          set). Works with --words and --template; fans out over GPUs.\n"
    "  --bloom FILE.blf        load a PREBUILT address bloom (any funded address); like\n"
    "                          --addresses but from a file (reports the matched hash160)\n"
-   "  --bloom-build IN OUT    build a .blf from an address list IN (one per line) -> OUT.\n"
-   "                          IN='-' reads stdin, e.g.  curl -s LIST | zcat | \\\n"
-   "                            ... --bloom-build - f.blf --bloom-n 1500000000 --fpr 1e-12\n"
+   "  --bloom-build IN OUT    build a .blf (BLF3: blocked GPU filter + CLASSIC host cull) from\n"
+   "                          an address list IN (one per line) -> OUT. IN='-' reads stdin:\n"
+   "                            curl -s LIST | zcat | ... --bloom-build - f.blf --bloom-n 1500000000\n"
    "                          --bloom-n N  (required) approx address count, sizes the filters\n"
    "                          --fpr P      target combined false-positive rate (default 1e-12)\n"
+   "                          --bloom-gib G1,G2  explicit filter1,filter2 sizes in GiB (with --bloom-n)\n"
+   "  --bloom FILE --bloom-stat   MEASURE a .blf's true per-filter + combined FPR (no GPU).\n"
+   "                              ALWAYS run this after a build -- the sizing est is approximate.\n"
+   "  --bloom FILE --bloom-check A[,B..]  probe address(es) through filter1/filter2 separately\n"
    "  --xpub XPUB             account extended pubkey (EC-free chaincode compare)\n"
    "  --xpubs X,.. / --xpubs-file PATH  a SET of account xpubs (chaincode bloom,\n"
    "                          EC-free; tries purposes 44/49/84/86, --purpose overrides)\n"
@@ -2068,10 +2217,11 @@ int main(int argc,char**argv){
   const char *xpubs=0,*xpubs_file=0;            /* xpub (chaincode) bloom set */
   const char *bloom_file=0,*bbuild_in=0,*bbuild_out=0;  /* prebuilt address bloom */
   unsigned long long bloom_n=0; double bloom_fpr=1e-12;   /* --bloom-build sizing */
+  double bloom_gib1=0, bloom_gib2=0;                       /* --bloom-gib G1,G2 explicit sizes */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
-  int bloom_selftest=0; long bloom_selftest_n=0;
+  int bloom_selftest=0; long bloom_selftest_n=0; int bloom_stat=0; const char*bloom_check=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
     else if(!strcmp(argv[i],"--xpub")&&i+1<argc) xpub=argv[++i];
@@ -2105,9 +2255,12 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--xpubs")&&i+1<argc) xpubs=argv[++i];
     else if(!strcmp(argv[i],"--xpubs-file")&&i+1<argc) xpubs_file=argv[++i];
     else if(!strcmp(argv[i],"--bloom")&&i+1<argc) bloom_file=argv[++i];
+    else if(!strcmp(argv[i],"--bloom-stat")) bloom_stat=1;
+    else if(!strcmp(argv[i],"--bloom-check")&&i+1<argc) bloom_check=argv[++i];
     else if(!strcmp(argv[i],"--bloom-build")&&i+2<argc){ bbuild_in=argv[++i]; bbuild_out=argv[++i]; }
     else if(!strcmp(argv[i],"--bloom-n")&&i+1<argc) bloom_n=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--fpr")&&i+1<argc){ double v=atof(argv[++i]); if(v>0&&v<1) bloom_fpr=v; }
+    else if(!strcmp(argv[i],"--bloom-gib")&&i+1<argc){ sscanf(argv[++i],"%lf,%lf",&bloom_gib1,&bloom_gib2); }
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -2189,6 +2342,9 @@ int main(int argc,char**argv){
   int addr_set = (addresses||addresses_file||bloom_file);   /* a bloom target SET */
   g_is_pass = (mnemonic && passphrase) ? 1 : 0;             /* label the recovered secret / route regime A */
   if(g_exhaustive && templ) fprintf(stderr,"note: --exhaustive is not yet wired for --template; reporting the first match only\n");
+  if(bloom_stat||bloom_check){ if(!bloom_file){ fprintf(stderr,"--bloom-stat/--bloom-check need --bloom FILE\n"); return 2; }
+    if(bloom_stat) return mode_bloom_stat(bloom_file);
+    return mode_bloom_check(bloom_file,bloom_check); }
   int crackjob = !(profile||ecgate||addrgate||missgate||decodearg||rankarg||recon||dumpv||g_print_total||g_worker||bloom_selftest||bbuild_out);
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
@@ -2215,7 +2371,7 @@ int main(int argc,char**argv){
   }
   /* gate/util modes need no pattern */
   if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
-  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr); }
+  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2); }
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);
