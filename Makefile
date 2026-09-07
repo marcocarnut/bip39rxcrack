@@ -114,9 +114,15 @@ build: $(BIN)
 $(BIN): gate/gate.c cuda/gate_kernels.cu
 	$(CC) $(CFLAGS) $(INC) -o $(BIN) gate/gate.c $(LIBS)
 
+# Embed the kernel source into the binary (self-contained; a copied binary needs
+# no cuda/ dir, and its g_ptx_key matches every copy of the same binary).
+KERNEL_SRCS = cuda/crack_kernels.cu cuda/bip39_device.cuh cuda/secp256k1_device.cuh cuda/bloom_common.h
+cuda/kernels_embed.h: $(KERNEL_SRCS) cuda/gen_embed.py
+	python3 cuda/gen_embed.py $(KERNEL_SRCS) > $@
+
 # Phase-2 self-enumerate cracker (links librxe as the canonical enumerator).
 cracker: $(CRACK)
-$(CRACK): src/bip39rxcrack.c cuda/crack_kernels.cu cuda/bip39_device.cuh cuda/secp256k1_device.cuh $(LIBRXE)
+$(CRACK): src/bip39rxcrack.c cuda/kernels_embed.h $(KERNEL_SRCS) $(LIBRXE)
 	$(CC) $(CFLAGS) $(INC) -o $(CRACK) src/bip39rxcrack.c $(RXELIBS) $(LIBS)
 
 # EC / seed->address correctness gate (secp256k1 + hash160 + programs vs oracle).

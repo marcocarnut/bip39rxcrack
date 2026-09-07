@@ -7,3 +7,4 @@ phase1gate
 # generated test vectors (regenerated from the reseed39 oracle via `make vectors`)
 vectors/*.txt
 log.txt
+cuda/kernels_embed.h

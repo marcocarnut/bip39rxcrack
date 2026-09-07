@@ -35,9 +35,21 @@ than limited by how fast a host can feed it.
 - **Targets:** an account **xpub** (EC-free — a chain-code compare, no secp256k1)
   or an **address** — p2pkh (BIP44, `1…`), p2sh-p2wpkh (BIP49, `3…`), p2wpkh
   (BIP84, `bc1q…`), p2tr (BIP86, `bc1p…`, TapTweak). Both base58 and bech32/bech32m.
-  The script type and derivation purpose are read from the address.
-- **Unknown passphrase:** fixed mnemonic, passphrase pattern varies (e.g. a
-  forgotten numeric PIN, `[0-9]{N}`).
+  The script type and derivation purpose are read from the address. A **set** of
+  targets works too: `--addresses a,b,…` / `--addresses-file`, `--xpubs`, or a
+  prebuilt **`--bloom` filter of every funded address** (see *Any funded address*).
+- **Unknown passphrase:** fixed mnemonic, unknown BIP39 passphrase whose *shape*
+  you know — a `--passphrase PATTERN` of literals, char classes (`[0-9]`, `[a-z]`),
+  POSIX classes (`[:digit:]`, `[:alnum:]`, …), inline alternation `(spring|summer)`,
+  and external dictionaries `[:name:]` (a `name.dict`, one word/line, via `-D DIR`).
+  e.g. `[0-9]{4}` (a PIN), `bike[0-9]{2}`, `(spring|summer)[0-9]{2}`, `prefix[:words:]`.
+  See `docs/PASSPHRASE_PATTERNS.md`.
+- **Unknown account / gap / index:** scan `--account N`, `--change N`, `--gap N`
+  over `m/purpose'/0'/account'/change/index`. With a bloom of your funded addresses
+  you rarely need a wide `--gap` (any funded address in a small range matches), but
+  accounts are independent hardened subtrees — scan them with `--account`.
+- **All matches, not just the first:** `--exhaustive` reports every hit in a set
+  (e.g. several PINs that each derive one of your funded addresses).
 - **Unknown word order:** all permutations of a known word set (`{{N!}}`), with the
   BIP39 checksum sieving the ~15/16 (12-word) invalid orderings on-GPU.
 - **Missing words:** known words plus `K` unknown `[:bip39-en:]` positions. When the
@@ -66,6 +78,48 @@ bip39rxcrack --mnemonic "laundry very receive soldier town age monkey already se
 bip39rxcrack --words "slow edge build grunt acid rich garment address open health voyage frozen" \
              --address 144uEF4Yc4TuWFSBttRYDXDFD44BCDi7Hc
 #   → slow grunt garment health edge acid address voyage build rich open frozen,  m/44'/0'/0'/0/0
+
+# Missing words, ANY funded address — no target address needed, hit any address
+# that ever transacted (a prebuilt bloom of the whole chain; see below)
+bip39rxcrack --pattern "trial [:bip39:] gloom dragon … receive [:bip39:] [:bip39:] [:bip39:]" \
+             --bloom ../data/alladdrs.blf --purpose 44
+
+# Every funded passphrase under one mnemonic (the PIN-confusion case)
+bip39rxcrack --mnemonic "laundry very receive … vocal split" \
+             --passphrase '[0-9]{4}' --bloom ../data/alladdrs.blf --exhaustive
+
+# SSH hive — split the sweep across machines (2 local GPUs + a rented box)
+bip39rxcrack --words "…" --address 1Ap… \
+             --hosts 'local/2,root@box.example.com:48851/1' \
+             --remote-bin /root/bip39rxcrack-cli/bip39rxcrack
+```
+
+## Any funded address (bloom filter)
+
+For "I lost words/passphrase **and** don't know which address held the funds", build
+a membership filter of **every address that ever transacted** and match against it —
+no target address needed. `--bloom-build IN OUT --bloom-n N` streams an address list
+(one per line; `IN='-'` reads stdin, so pipe a full-node/indexer dump straight in,
+nothing hits disk but the filter) into a **dual bloom**: filter 1 is a *blocked*
+bloom over the raw program (the GPU prefilter, one cache-line per probe); filter 2 is
+a *classic* bloom over `sha256(program)` (the host cull, k≈32). The two are
+independent, so their false-positive rates multiply. At the whole-chain scale
+(~1.5e9 addresses) that's **8 GiB + 8 GiB = 16 GiB** with a **combined FPR ~1e-15** —
+effectively zero spurious hits across a trillion-candidate sweep. `--bloom FILE` mmaps
+it (filter 1 → each GPU, filter 2 paged on the host), derives each candidate under a
+purpose list (mixed script types), and reports the matched address + full path.
+
+**Always `--bloom FILE --bloom-stat` after building** — it *measures* the true
+per-filter and combined FPR (a blocked bloom's real rate is far above the naive
+`fill^k`; the estimator was wrong once, and `--bloom-stat` is the ground truth).
+`--bloom-sizes N` dry-runs the sizing; `--bloom-check ADDR` probes one address through
+each filter. Details + the FPR analysis: `docs/BLOOM_PLAN.md`.
+
+```sh
+# build the filter from a streamed address dump, then verify it
+curl -s https://…/all_addresses.txt.gz | zcat \
+  | bip39rxcrack --bloom-build - ../data/alladdrs.blf --bloom-n 1500000000
+bip39rxcrack --bloom ../data/alladdrs.blf --bloom-stat     # measure the real FPR
 ```
 
 ## Correctness
@@ -112,12 +166,17 @@ node gate/e2e.js  # xpub end-to-end: plant → crack → assert index / mnemonic
 node gate/e2e_multigpu.js  # multi-GPU: plant → fan out → assert one GPU FOUND at global rank
 ```
 
-Flags: `--words` | `--mnemonic` + `--passphrase`; target `--address` | `--xpub` |
-`--target-chaincode`; `--purpose --change --index --no-checksum`; `--nth` /
-`--no-nth`; `--no-compact` (compaction is on by default); sharding
-`--start --count --limit`; `--rank` (librxe index of an arrangement);
-`--resume LOG` (continue a killed run from its progress log); multi-GPU
-`--device D`, `--devices 0,1` / `--gpus N`, `--print-total`.
+Flags: `--words` | `--mnemonic` + `--passphrase PATTERN` (`-D DIR` for `[:dict:]`s) |
+`--template`/`--pattern`; target `--address` | `--addresses`/`--addresses-file` |
+`--xpub`/`--xpubs` | `--bloom FILE` | `--target-chaincode`; derivation scan
+`--purpose --account --change --gap --no-checksum`; `--exhaustive` (all matches in a
+set); `--nth` / `--no-nth`; `--no-compact` (compaction is on by default); sharding
+`--start --count --limit --shards N --order`; `--rank` (librxe index of an
+arrangement); `--resume LOG` (continue a killed run); multi-GPU `--device D`,
+`--devices 0,1` / `--gpus N`, `--print-total`; SSH hive `--hosts`, `--remote-bin`,
+`--ssh`; bloom tooling `--bloom-build`, `--bloom-stat`, `--bloom-sizes`,
+`--bloom-check`; `--kernel-key` (kernels-version hash, for checking hive hosts are in
+sync). `bip39rxcrack -h` lists them all.
 
 **Multi-GPU work-queue.** For the `--words`+`--address` and `--template`+`--address`
 (missing-word / `[:Nth:]`) paths, the supervisor owns a queue of **fine shards** (~8M
@@ -125,9 +184,26 @@ candidates each, or `--shards N`) handed to persistent per-GPU workers over a li
 protocol, and shows **one consolidated live line** summing all GPUs. `--order first|ends|center|random[:seed]` sets the sweep order so you can
 exploit a prior on where the key is (a work queue with no prior has the same *expected*
 time as contiguous halves, but ordering wins when the key isn't uniform). A worker that
-dies has its in-flight shard **re-queued** to a survivor, so the run tolerates a GPU
-falling over — the groundwork for an SSH hive (same protocol over `ssh host --worker`).
-Design: `docs/WORKQUEUE_HIVE_PLAN.md`. Gate: `make workqueue-gate`.
+dies has its in-flight shard **re-queued** to a survivor, so the run tolerates a GPU —
+or a whole machine — falling over. Design: `docs/WORKQUEUE_HIVE_PLAN.md`. Gate: `make workqueue-gate`.
+
+**SSH hive.** The *same* protocol runs over SSH: **`--hosts SPEC`** spreads workers
+across machines, where `SPEC` is a comma list of `[user@]host[:port][/ngpu]` (host
+`local` = in-process). Each remote GPU is a peer worker in the one shard queue,
+reached as `ssh dest --remote-bin … --worker`. `--remote-bin PATH` (absolute → also
+the remote working dir, so relative `--bloom`/`-D` paths resolve there); `--ssh "CMD"`
+for jump hosts / ports / keys. Assumes passwordless key auth and that the tool + any
+`.blf`/dict files already exist on each box. Scaling is linear across the network
+(coarse shards + rate-limited progress make the SSH hop negligible against
+PBKDF2-bound compute — measured **1.5× for +50% GPUs** across two rented boxes). A
+machine dropping off mid-run has its shards re-queued to survivors. Gate: `make hive-e2e`
+(loopback; skips without passwordless `ssh localhost`).
+
+**Self-contained binary.** The kernel source is **embedded in the binary**, so a copied
+binary runs with no `cuda/` dir — handy for the hive (copy just the binary to each box).
+The binary carries a kernels-version key (`--kernel-key`); the hive supervisor **refuses
+a worker whose kernels don't match** rather than letting a stale copy fail silently. (A
+`cuda/` dir on disk still wins for in-place kernel edits during development.)
 
 **Multi-GPU (other modes).** Crack jobs **fan out over all visible GPUs by default**
 (pin a single card with `--device D`; `CUDA_VISIBLE_DEVICES` is honoured). `--devices
@@ -223,19 +299,31 @@ cuda/bip39_device.cuh      SHA-512/256, HMAC (ipad/opad midstate), PBKDF2,
 cuda/secp256k1_device.cuh  field mod-p, Jacobian ops, k·G, RIPEMD-160, hash160,
                            address programs, non-hardened ckd, BIP86 taproot
 cuda/gate_kernels.cu       crypto gate kernels
-cuda/crack_kernels.cu      crack + sieve/compaction + gate kernels
-src/bip39rxcrack.c         host: enumerate, decode target, launch, report
+cuda/crack_kernels.cu      crack + sieve/compaction + bloom + passphrase kernels
+cuda/gen_embed.py          bakes the 4 kernel files into cuda/kernels_embed.h (make)
+src/bip39rxcrack.c         host: enumerate, bloom, patterns, work-queue, hive, report
 gate/gen_*.js, gate.c,     oracle-driven vector generators + gate harnesses
   e2e.js, *_gate.js
 ```
+
+## More docs
+
+- `docs/BLOOM_PLAN.md` — the "any funded address" dual-bloom (blocked GPU prefilter +
+  classic host cull), the FPR analysis, and `--bloom-*` tooling.
+- `docs/PASSPHRASE_PATTERNS.md` — the passphrase pattern grammar (classes / POSIX /
+  alternation / dictionaries) and the mixed-radix on-GPU unranking.
+- `docs/WORKQUEUE_HIVE_PLAN.md` — the fine-shard work-queue and the SSH hive.
+- `docs/MULTIGPU_PLAN.md` — the contiguous multi-GPU fan-out (other modes).
 
 ## Roadmap
 
 - **EC / occupancy tuning.** secp256k1 is correctness-only (double-and-add `k·G` +
   Fermat inverse); a fixed-base comb, batch inversion and occupancy work are the
   levers for the EC-heavier paths.
-- **Multi-GPU** fork/exec — the range-shard machinery (`--start/--count`) is
-  already in place.
+- **Passphrase:** `{m,n}` variable length; nested alternation; and a generic
+  streaming-`rxe` fallback for patterns no closed-form unranker can express.
+- **Hive:** two-level machine chunking (one SSH connection per box, not per GPU);
+  bounded per-host reconnect; `--account` scan for the xpub path.
 - **Electrum** seeds; full reseed39 job-file (`--job`/`--link`) parity.
 
 The `{{N!?}}` keyed-shuffle is intentionally **not** implemented: a full-space

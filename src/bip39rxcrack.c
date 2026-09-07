@@ -49,6 +49,19 @@
 static char *slurp(const char *p){ FILE*f=fopen(p,"rb"); if(!f){fprintf(stderr,"open %s\n",p);exit(2);}
   fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); char*b=malloc(n+1);
   if(fread(b,1,n,f)!=(size_t)n){fprintf(stderr,"read %s\n",p);exit(2);} b[n]=0; fclose(f); return b; }
+#include "../cuda/kernels_embed.h"   /* g_embed_kernels[]: the kernel source, baked in */
+static const char* embed_lookup(const char*path){
+  const char*b=strrchr(path,'/'); b=b?b+1:path;
+  for(int i=0;g_embed_kernels[i].name;i++) if(!strcmp(g_embed_kernels[i].name,b)) return g_embed_kernels[i].src;
+  return 0; }
+/* kernel source: prefer the file on disk (dev: edit a .cu and rerun), else fall back
+   to the embedded copy so a binary copied WITHOUT its cuda/ dir still runs. */
+static char *k_slurp(const char *p){
+  FILE*f=fopen(p,"rb");
+  if(!f){ const char*e=embed_lookup(p); if(e){ size_t n=strlen(e); char*b=malloc(n+1); memcpy(b,e,n+1); return b; }
+    fprintf(stderr,"open %s (and no embedded copy)\n",p); exit(2); }
+  fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); char*b=malloc(n+1);
+  if(fread(b,1,n,f)!=(size_t)n){fprintf(stderr,"read %s\n",p);exit(2);} b[n]=0; fclose(f); return b; }
 static int hexnib(int c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1;}
 static int hex2bin(const char*s,uint8_t*o,int max){ int n=0; while(s[0]&&s[1]&&n<max){int hi=hexnib(s[0]),lo=hexnib(s[1]); if(hi<0||lo<0)break; o[n++]=(hi<<4)|lo; s+=2;} return n; }
 static void tohex_(const uint8_t*b,int n,char*o){ static const char*hx="0123456789abcdef"; for(int i=0;i<n;i++){o[i*2]=hx[b[i]>>4];o[i*2+1]=hx[b[i]&15];} o[n*2]=0; }
@@ -119,19 +132,26 @@ static char *inline_includes(char *src,const char *cu){
   const char*tag="#include \""; char*p=strstr(src,tag); if(!p) return src;
   char dir[512]; snprintf(dir,sizeof dir,"%s",cu); char*sl=strrchr(dir,'/'); if(sl)*sl=0; else strcpy(dir,".");
   char*q=p+strlen(tag),*e=strchr(q,'"'); if(!e) return src; char h[512]; int hn=(int)(e-q); if(hn>500)hn=500; memcpy(h,q,hn); h[hn]=0;
-  char full[1100]; snprintf(full,sizeof full,"%s/%s",dir,h); char*inc=slurp(full);
+  char full[1100]; snprintf(full,sizeof full,"%s/%s",dir,h); char*inc=k_slurp(full);
   char*le=strchr(e,'\n'); if(!le) le=e+1; else le++; size_t pre=p-src,post=strlen(le),il=strlen(inc);
   char*out=malloc(pre+il+post+2); memcpy(out,src,pre); memcpy(out+pre,inc,il); out[pre+il]='\n'; memcpy(out+pre+il+1,le,post+1);
   free(inc); free(src); return inline_includes(out,cu);
 }
 /* FNV-1a of a string (PTX cache key). */
 static unsigned long long fnv1a(const char*s){ unsigned long long h=1469598103934665603ULL; for(;*s;s++){ h^=(unsigned char)*s; h*=1099511628211ULL; } return h; }
+/* the kernels-version key (== g_ptx_key) computed host-side, NO GPU: assemble the
+   source (file or embedded) + arch/defs and hash it. Same value as build_module,
+   so the supervisor can compare it to each worker's READY kern= handshake. */
+static void kernel_source_key(const char*cu_path,char*out,size_t outn){
+  const char *arch="--gpu-architecture=compute_120"; const char*def=getenv("CRACK_DEF");
+  char *src=inline_includes(k_slurp(cu_path),cu_path);
+  snprintf(out,outn,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0)); free(src); }
 static void build_module(const char *cu_path){
   if(g_mod) return;   /* idempotent: a persistent worker builds its context once */
   const char *arch="--gpu-architecture=compute_120";
   const char*mr=getenv("CRACK_MAXREG");
   const char*def=getenv("CRACK_DEF");   /* e.g. -DSHA512_UNROLL16 for A/B experiments */
-  char *src=inline_includes(slurp(cu_path),cu_path);
+  char *src=inline_includes(k_slurp(cu_path),cu_path);
   /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
      cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
   char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0));
@@ -1640,6 +1660,7 @@ extern char **environ;
 static volatile sig_atomic_t g_sup_pgid=0;
 /* SSH hive: reach remote workers as `<ssh> <host> <remote_bin> <args> --worker --device D`.
    A host named localhost/local is spawned in-process (no ssh). */
+static const char *g_cu="cuda/crack_kernels.cu";  /* kernels path (for the supervisor's version check) */
 static const char *g_ssh_cmd="ssh";          /* --ssh "ssh -p 2222 -i key" (space-split) */
 static const char *g_remote_bin="bip39rxcrack"; /* --remote-bin PATH (must exist on each box) */
 #define MAXW 64                              /* max total workers (GPUs across all machines) */
@@ -1849,6 +1870,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   if(hosts){ nspec=parse_hosts(hosts,ws,MAXW); if(nspec<1){ fprintf(stderr,"workqueue: bad --hosts '%s'\n",hosts); return 2; } }
   else { for(int d=0; d<ndev && d<MAXW; d++){ memset(&ws[nspec],0,sizeof ws[nspec]); snprintf(ws[nspec].dest,sizeof ws[nspec].dest,"local"); ws[nspec].dev=devs[d]; ws[nspec].local=1; nspec++; } }
   for(int i=0;i<nspec;i++) if(ws[i].local) any_local=1;
+  char sup_key[128]=""; kernel_source_key(g_cu,sup_key,sizeof sup_key);   /* our kernels-version; workers must match */
 
   /* 1) total (no-GPU child) + 2) warm the local PTX cache once (best-effort) */
   char*pt[]={"--print-total"}; char**ptv=child_argv(argc,argv,pt,1);
@@ -1926,7 +1948,13 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
       char*ln=w->buf, *nl;
       while((nl=strchr(ln,'\n'))){
         *nl=0;
-        if(!strncmp(ln,"READY",5)){ long s=NEXT_SHARD();
+        if(!strncmp(ln,"READY",5)){
+          char rkern[128]=""; { char*kp=strstr(ln,"kern="); if(kp) sscanf(kp+5,"%127s",rkern); }
+          if(sup_key[0] && rkern[0] && strcmp(rkern,sup_key)){   /* stale/mismatched kernels -> refuse loudly */
+            fprintf(stderr,"%s: worker [%s] REFUSED -- kernels version %s != supervisor %s; sync the binary + cuda/ on that box (or --remote-bin an updated build)\n",
+                    hosts?"hive":"workqueue",w->tag,rkern,sup_key);
+            dprintf(w->wfd,"STOP\n"); w->alive=0; close(w->rfd); close(w->wfd); w->shard=-1; break; }
+          long s=NEXT_SHARD();
           if(s<0){ dprintf(w->wfd,"STOP\n"); }
           else { w->shard=s; unsigned long long st=ostart+(unsigned long long)s*ss, cc=(st+ss>ostart+owin)?(ostart+owin-st):ss;
             dprintf(w->wfd,"SHARD %ld %llu %llu\n",s,st,cc); } }
@@ -2469,7 +2497,7 @@ int main(int argc,char**argv){
   { const char *nl="/usr/local/cuda-13.2/lib64"; const char *cur=getenv("LD_LIBRARY_PATH");
     if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
-  const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu";
+  const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu"; int kernel_key=0;
   int recon=0,recon_n=512,dumpv=0,dumpv_n=0,require_ck=1,compact=1; const char*ecgate=0,*addrgate=0;
   int missgate=0,missgate_n=64,profile=0;
   unsigned long long cstart=0,ccount=0;
@@ -2538,6 +2566,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--account")&&i+1<argc){ a_accounts=(uint32_t)strtoul(argv[++i],0,10); if(a_accounts<1) a_accounts=1; }
     else if(!strcmp(argv[i],"-D")&&i+1<argc){ if(g_ndict_dirs<16) g_dict_dirs[g_ndict_dirs++]=argv[++i]; else i++; }
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
+    else if(!strcmp(argv[i],"--kernel-key")) kernel_key=1;
     else if(!strcmp(argv[i],"--resume")&&i+1<argc) resumearg=argv[++i];
     else if(!strcmp(argv[i],"--device")&&i+1<argc){ g_device=atoi(argv[++i]); device_set=1; }
     else if(!strcmp(argv[i],"--devices")&&i+1<argc){ ndev=0; char*s=strtok(argv[++i],","); while(s&&ndev<16){ devs[ndev++]=atoi(s); s=strtok(0,","); } }
@@ -2614,6 +2643,8 @@ int main(int argc,char**argv){
   int addr_set = (addresses||addresses_file||bloom_file);   /* a bloom target SET */
   g_is_pass = (mnemonic && passphrase) ? 1 : 0;             /* label the recovered secret / route regime A */
   if(g_exhaustive && templ) fprintf(stderr,"note: --exhaustive is not yet wired for --template; reporting the first match only\n");
+  g_cu=cu;   /* so the hive supervisor can compute its kernels-version key for the worker check */
+  if(kernel_key){ char k[128]; kernel_source_key(cu,k,sizeof k); printf("%s\n",k); return 0; }
   if(bloom_sizes_set) return mode_bloom_sizes(bloom_sizes,bloom_fpr,bloom_gib1,bloom_gib2);
   if(bloom_stat||bloom_check){ if(!bloom_file){ fprintf(stderr,"--bloom-stat/--bloom-check need --bloom FILE\n"); return 2; }
     if(bloom_stat) return mode_bloom_stat(bloom_file);
