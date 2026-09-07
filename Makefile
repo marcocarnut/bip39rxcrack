@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e pass-alt-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -87,6 +87,10 @@ account-e2e: $(CRACK)
 # generic passphrase patterns: charsets/literals/mixed-radix ([a-z]{4}, pass[0-9]{2}, ...)
 pass-pattern-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_pass_pattern.js
+
+# passphrase alternation (a|b|c), POSIX [:digit:], and external [:dict:] files via -D
+pass-alt-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_pass_alternation.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a

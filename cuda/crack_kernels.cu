@@ -195,16 +195,24 @@ extern "C" __global__ void g_hctx_init(const u8 *mn, int mnlen, HCTX *out){
  * alphabet is cls_bytes[cls_off[p] .. cls_off[p+1]); last position is the least
  * significant digit (so [0-9]{4}: 0->"0000", 1->"0001", ...). Generalizes the old
  * base-10-only path to arbitrary charsets/literals: e.g. [a-z]{6}, bike[0-9]{2}. */
-#define PP_MAXLEN 64
-__device__ __forceinline__ u32 pp_salt(const int *cls_off, const u8 *cls_bytes, int npos,
+#define PP_MAXPOS  64    /* max passphrase positions (mixed-radix digits) */
+#define PP_MAXSALT 256   /* max passphrase bytes (salt = "mnemonic" + passphrase) */
+/* Mixed-radix decode of index j into a passphrase salt over a STRING-set table:
+ * each position p offers (pos_stroff[p+1]-pos_stroff[p]) alternatives; alternative
+ * a is the string str_bytes[str_off[s]..str_off[s+1]) with s=pos_stroff[p]+a. A
+ * char class is the degenerate case (1-char strings); alternation/dictionaries add
+ * multi-char, variable-length alternatives (last position least-significant). */
+__device__ __forceinline__ u32 pp_salt(const int *pos_stroff, const int *str_off, const u8 *str_bytes, int npos,
                                         unsigned long long j, u8 *salt){
   salt[0]='m';salt[1]='n';salt[2]='e';salt[3]='m';salt[4]='o';salt[5]='n';salt[6]='i';salt[7]='c';
-  unsigned long long q=j;
-  for(int p=npos-1;p>=0;p--){ int lo=cls_off[p]; unsigned sz=(unsigned)(cls_off[p+1]-lo);
-    unsigned d=(unsigned)(q%sz); q/=sz; salt[8+p]=cls_bytes[lo+(int)d]; }
-  return (u32)(8+npos);
+  int choice[PP_MAXPOS]; unsigned long long q=j;
+  for(int p=npos-1;p>=0;p--){ unsigned cnt=(unsigned)(pos_stroff[p+1]-pos_stroff[p]); choice[p]=(int)(q%cnt); q/=cnt; }
+  int L=8;
+  for(int p=0;p<npos;p++){ int s=pos_stroff[p]+choice[p]; int a=str_off[s],b=str_off[s+1];
+    for(int k=a;k<b;k++) salt[L++]=str_bytes[k]; }
+  return (u32)L;
 }
-extern "C" __global__ void g_crack_pass(const HCTX *hkey, int npos, const int *cls_off, const u8 *cls_bytes,
+extern "C" __global__ void g_crack_pass(const HCTX *hkey, int npos, const int *pos_stroff, const int *str_off, const u8 *str_bytes,
                                         unsigned long long start, unsigned long long count,
                                         u32 purpose, u32 accounts, u32 changes, u32 gap,
                                         const u8 *target_prog,
@@ -212,7 +220,7 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int npos, const int *c
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
-    u8 salt[8+PP_MAXLEN]; u32 slen=pp_salt(cls_off,cls_bytes,npos,j,salt);
+    u8 salt[8+PP_MAXSALT]; u32 slen=pp_salt(pos_stroff,str_off,str_bytes,npos,j,salt);
     u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
     int oa,oc,oi;
     if(derive_address_match(seed,purpose,accounts,changes,gap,target_prog,&oa,&oc,&oi)){ atomicMin(hit_index,j); atomicExch(hit_found,1); hit_ci[0]=(u32)oc; hit_ci[1]=(u32)oi; hit_ci[2]=(u32)oa; }
@@ -223,7 +231,7 @@ extern "C" __global__ void g_crack_pass(const HCTX *hkey, int npos, const int *c
  * precomputed-HMAC-key seed as g_crack_pass, but derive+probe under a PURPOSE
  * LIST against the blocked bloom and APPEND every hit for the host cull. gidx = the
  * passphrase index j (maps back to the string via the same charset table). */
-extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int npos, const int *cls_off, const u8 *cls_bytes,
+extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int npos, const int *pos_stroff, const int *str_off, const u8 *str_bytes,
                                         unsigned long long start, unsigned long long count,
                                         const u32 *purposes, int npurp, u32 accounts, u32 changes, u32 gap,
                                         const u32 *bloom, u32 bmask,
@@ -231,7 +239,7 @@ extern "C" __global__ void g_crack_pass_bloom(const HCTX *hkey, int npos, const 
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long t=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; t<count; t+=stride){
     unsigned long long j=start+t;
-    u8 salt[8+PP_MAXLEN]; u32 slen=pp_salt(cls_off,cls_bytes,npos,j,salt);
+    u8 salt[8+PP_MAXSALT]; u32 slen=pp_salt(pos_stroff,str_off,str_bytes,npos,j,salt);
     u8 seed[64]; pbkdf2_seed_ctx(hkey,salt,slen,2048,seed);
     derive_address_bloom(seed,purposes,npurp,accounts,changes,gap,bloom,bmask,j,hits,hitcnt,hitcap);
   }
