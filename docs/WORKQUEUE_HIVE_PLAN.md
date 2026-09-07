@@ -84,14 +84,30 @@ one-machine case. Machine-level chunks are themselves re-queueable if a whole bo
    index==J==librxe rank; kill a worker mid-shard and assert the shard is re-queued and the
    run still finds it (recovery test).
 
-### Stage 2 — SSH transport + hive (later, additive)
-- `--hosts user@h1,user@h2` / hostfile; transport = `ssh host bin --worker` instead of a
-  local pipe (same protocol).
-- Two-level machine chunking + sub-supervisor.
-- `READY` handshake version/kernels-hash check; refuse mismatched workers.
-- Machine-level re-queue on partition; bounded reconnect.
-- Prereq checks: key auth, binary present at a known path, reseed39 wordlist present, same
-  binhash. Report clearly which hosts joined.
+### Stage 2 — SSH transport + hive — **DONE (flat model)**
+Shipped as the **flat hive**: every GPU across every machine is a peer worker in the one
+shard queue, reached over `ssh`. It reuses the Stage-1 supervisor loop verbatim — only the
+worker *spawn* changed (local `posix_spawn` vs `ssh dest …`); the poll/shard/PROG/DONE/FOUND/
+re-queue path is transport-agnostic.
+- `--hosts SPEC` — comma list of `[user@]host[:port][/ngpu]` (ngpu default 1; host `local`
+  runs in-process). One worker per host×GPU. `--remote-bin PATH` (the binary on the remotes;
+  an absolute path also sets the remote cwd so relative `cuda/…`, `--bloom ../data/…`, `-D dict/`
+  resolve as locally). `--ssh "CMD"` (default `ssh`; space-split, so `-J`/`-p`/`-i` work).
+  Args are shell-quoted for the remote; the remote command is `cd <dir> && exec <bin> <args>`.
+- Assumes **passwordless key auth** and that the **tool + `.blf`/dict files already exist** on
+  each box (per Kiko).
+- READY handshake carries `g_ptx_key` (kernels hash) already; version-match check in place.
+- **Partition/crash recovery works over SSH**: a dead `ssh` (machine dropping off) EOFs its
+  pipe → the same re-queue branch hands its in-flight shard to a survivor. Verified on loopback
+  (kill one worker mid-run → throughput halves, still FOUND at the right rank).
+- Gate `gate/e2e_hive.js` (`make hive-e2e`): loopback `--hosts localhost/2` and
+  `localhost/1,localhost/1`; SKIPs if passwordless `ssh localhost` is unavailable.
+
+**Deferred (not needed for the flat model, revisit for very large hives):**
+- Two-level machine chunking + a per-machine sub-supervisor (the flat model uses N ssh
+  connections per host — one per GPU; fine for a handful of GPUs/box, chatty for dozens).
+- Bounded reconnect (today a dropped machine's work is re-queued to survivors, not retried on
+  that host). Prereq auto-checks (binary/blf presence) beyond the natural first-shard failure.
 
 ## Risks / notes
 - **Byte-exact refactor** is the crux of Stage 1 — gate after every mode split.

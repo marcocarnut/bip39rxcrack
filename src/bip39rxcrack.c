@@ -1638,6 +1638,11 @@ static int run_worker_pass(const char*mnemonic,const PPat*pp,const uint8_t tprog
  * the supervisor SIGTERMs the siblings' process group. Ctrl-C kills them too. */
 extern char **environ;
 static volatile sig_atomic_t g_sup_pgid=0;
+/* SSH hive: reach remote workers as `<ssh> <host> <remote_bin> <args> --worker --device D`.
+   A host named localhost/local is spawned in-process (no ssh). */
+static const char *g_ssh_cmd="ssh";          /* --ssh "ssh -p 2222 -i key" (space-split) */
+static const char *g_remote_bin="bip39rxcrack"; /* --remote-bin PATH (must exist on each box) */
+#define MAXW 64                              /* max total workers (GPUs across all machines) */
 static void sup_sigint(int sig){ (void)sig; if(g_sup_pgid) killpg(g_sup_pgid,SIGTERM); _exit(130); }
 
 /* Copy argv, dropping the fan-out/slice flags (and their values), then append
@@ -1647,7 +1652,8 @@ static char**child_argv(int argc,char**argv,char*const*extra,int nextra){
   for(int i=0;i<argc;i++){
     if(!strcmp(argv[i],"--devices")||!strcmp(argv[i],"--gpus")||!strcmp(argv[i],"--device")||
        !strcmp(argv[i],"--start")||!strcmp(argv[i],"--count")||!strcmp(argv[i],"--limit")||
-       !strcmp(argv[i],"--loginterval")||!strcmp(argv[i],"--shards")||!strcmp(argv[i],"--order")){ i++; continue; }   /* drop flag + its value */
+       !strcmp(argv[i],"--loginterval")||!strcmp(argv[i],"--shards")||!strcmp(argv[i],"--order")||
+       !strcmp(argv[i],"--hosts")||!strcmp(argv[i],"--ssh")||!strcmp(argv[i],"--remote-bin")){ i++; continue; }   /* drop flag + its value */
     if(!strcmp(argv[i],"--print-total")||!strcmp(argv[i],"--warm")||!strcmp(argv[i],"--worker")||!strcmp(argv[i],"--devtag")) continue;
     out[o++]=argv[i];
   }
@@ -1760,11 +1766,91 @@ static void build_order(int policy,long n,long*out,unsigned long long seed){
   else { for(long i=0;i<n;i++) out[i]=i; }   /* 0 = first-to-last */
 }
 typedef struct { pid_t pid; int wfd,rfd,alive,ready; long shard;
-  unsigned long long swept,hashed; char buf[8192]; int blen; } Wrk;
+  unsigned long long swept,hashed; char buf[8192]; int blen; char tag[80]; } Wrk;
+
+/* --------------------------- SSH hive helpers --------------------------- */
+/* one worker = one GPU on one machine. dest is the ssh destination ([user@]host);
+   local means spawn in-process (host keyword "local"); port 0 = ssh default. */
+typedef struct { char dest[256]; int port, dev, local; } WSpec;
+/* Parse "--hosts" = comma list of [user@]host[:port][/ngpu] (host "local" => in
+   process). Emits one WSpec per host x gpu into w[]. Returns count, or -1. */
+static int parse_hosts(const char*spec,WSpec*w,int maxw){
+  int n=0; char*dup=strdup(spec),*save=0;
+  for(char*tok=strtok_r(dup,",",&save); tok; tok=strtok_r(0,",",&save)){
+    while(*tok==' ')tok++;
+    if(!*tok) continue;
+    int ngpu=1; char*slash=strchr(tok,'/'); if(slash){ ngpu=atoi(slash+1); if(ngpu<1)ngpu=1; *slash=0; }
+    int port=0; char*colon=strrchr(tok,':');
+    if(colon && colon[1]){ int num=1; for(char*p=colon+1;*p;p++) if(!isdigit((unsigned char)*p)){ num=0; break; }
+      if(num){ port=atoi(colon+1); *colon=0; } }
+    int local = (!strcmp(tok,"local")||!strcmp(tok,"-"));
+    for(int d=0; d<ngpu && n<maxw; d++){ memset(&w[n],0,sizeof w[n]);
+      snprintf(w[n].dest,sizeof w[n].dest,"%s",tok); w[n].port=port; w[n].dev=d; w[n].local=local; n++; }
+  }
+  free(dup); return n?n:-1;
+}
+/* single-quote s for a POSIX remote shell (…'\''… for an embedded quote). */
+static char* pp_shquote(const char*s){
+  size_t n=strlen(s); char*o=malloc(n*4+3),*p=o; *p++='\'';
+  for(size_t i=0;i<n;i++){ if(s[i]=='\''){ *p++='\'';*p++='\\';*p++='\'';*p++='\''; } else *p++=s[i]; }
+  *p++='\''; *p=0; return o;
+}
+/* build the remote shell command: `cd <dir> && exec <remote-bin> <quoted args>`
+   where <dir> is the binary's directory (so relative paths -- cuda/crack_kernels.cu,
+   --bloom ../data/x.blf, -D dict/ -- resolve as they do locally; ssh's non-login
+   shell starts in $HOME otherwise). cv[0] is the local exe path (dropped);
+   cv[1..] are the real args. */
+static char* hive_remote_cmd(char**cv){
+  size_t cap=strlen(g_remote_bin)*4+64; for(int i=1;cv[i];i++) cap+=strlen(cv[i])*4+4;
+  char*s=malloc(cap); s[0]=0;
+  const char*slash=strrchr(g_remote_bin,'/');
+  if(slash){ char dir[1024]; int dl=(int)(slash-g_remote_bin); if(dl==0)dl=1; snprintf(dir,sizeof dir,"%.*s",dl,g_remote_bin);
+    char*qd=pp_shquote(dir); strcat(s,"cd "); strcat(s,qd); strcat(s," && exec "); free(qd); }
+  { char*qb=pp_shquote(g_remote_bin); strcat(s,qb); free(qb); }
+  for(int i=1;cv[i];i++){ char*q=pp_shquote(cv[i]); strcat(s," "); strcat(s,q); free(q); }
+  return s;
+}
+/* spawn one worker (local child or `ssh dest ...`) with stdin<-tw, stdout->fw
+   pipes; sets the supervisor-end wfd and rfd and *pid. Returns 0 on success. */
+static int hive_spawn(const WSpec*ws,int argc,char**argv,pid_t pgid,int*wfd,int*rfd,pid_t*pid){
+  int tw[2],fw[2]; if(pipe(tw)||pipe(fw)) return -1;
+  char dv[16]; snprintf(dv,sizeof dv,"%d",ws->dev);
+  char*extra[3]={"--worker","--device",dv}; char**cv=child_argv(argc,argv,extra,3);
+  posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa,tw[0],0); posix_spawn_file_actions_adddup2(&fa,fw[1],1);
+  posix_spawn_file_actions_addclose(&fa,tw[1]); posix_spawn_file_actions_addclose(&fa,fw[0]);
+  posix_spawn_file_actions_addclose(&fa,tw[0]); posix_spawn_file_actions_addclose(&fa,fw[1]);
+  posix_spawnattr_t at; posix_spawnattr_init(&at);
+  posix_spawnattr_setflags(&at,POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at,pgid);
+  int rc; char *cmd=0, **sv=0;
+  if(ws->local){ rc=posix_spawn(pid,"/proc/self/exe",&fa,&at,cv,environ); }
+  else {
+    cmd=hive_remote_cmd(cv);
+    /* argv = <ssh tokens> [-p port] <dest> <cmd> */
+    char *sshdup=strdup(g_ssh_cmd); int st=0; char*sv_tok[16],*sp=0;
+    for(char*t=strtok_r(sshdup," ",&sp); t && st<12; t=strtok_r(0," ",&sp)) sv_tok[st++]=t;
+    sv=calloc((size_t)st+5,sizeof(char*)); int o=0; for(int i=0;i<st;i++) sv[o++]=sv_tok[i];
+    char portbuf[16]; if(ws->port>0){ snprintf(portbuf,sizeof portbuf,"%d",ws->port); sv[o++]="-p"; sv[o++]=portbuf; }
+    sv[o++]=(char*)ws->dest; sv[o++]=cmd; sv[o]=0;
+    rc=posix_spawnp(pid,sv[0],&fa,&at,sv,environ);
+    free(sshdup);
+  }
+  posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at); free(cv); free(cmd); free(sv);
+  close(tw[0]); close(fw[1]);
+  if(rc){ close(tw[1]); close(fw[0]); return rc; }
+  *wfd=tw[1]; *rfd=fw[0]; return 0;
+}
+
 static int run_workqueue(int argc,char**argv,int*devs,int ndev,
                          unsigned long long ostart,unsigned long long ocount,
-                         int order_policy,unsigned long long order_seed,long nshards_arg){
-  /* 1) total (no-GPU child) + 2) warm the PTX cache once */
+                         int order_policy,unsigned long long order_seed,long nshards_arg,const char*hosts){
+  /* worker plan: from --hosts (the SSH hive) or the local GPUs (devs[]). */
+  WSpec ws[MAXW]; int nspec=0; int any_local=0;
+  if(hosts){ nspec=parse_hosts(hosts,ws,MAXW); if(nspec<1){ fprintf(stderr,"workqueue: bad --hosts '%s'\n",hosts); return 2; } }
+  else { for(int d=0; d<ndev && d<MAXW; d++){ memset(&ws[nspec],0,sizeof ws[nspec]); snprintf(ws[nspec].dest,sizeof ws[nspec].dest,"local"); ws[nspec].dev=devs[d]; ws[nspec].local=1; nspec++; } }
+  for(int i=0;i<nspec;i++) if(ws[i].local) any_local=1;
+
+  /* 1) total (no-GPU child) + 2) warm the local PTX cache once (best-effort) */
   char*pt[]={"--print-total"}; char**ptv=child_argv(argc,argv,pt,1);
   char nbuf[64]; if(run_capture(ptv,nbuf,sizeof nbuf)){ fprintf(stderr,"workqueue: could not compute total\n"); free(ptv); return 2; }
   free(ptv); unsigned long long total=strtoull(nbuf,0,10);
@@ -1773,41 +1859,33 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
   unsigned long long owin=ocount?ocount:(total-ostart);
   if(ostart+owin>total) owin=total-ostart;
   if(owin==0){ fprintf(stderr,"workqueue: empty window\n"); return 1; }
-  char dv0[16]; snprintf(dv0,sizeof dv0,"%d",devs[0]);
-  char*we[]={"--warm","--device",dv0}; char**wv=child_argv(argc,argv,we,3);
-  { pid_t wp; if(!posix_spawn(&wp,"/proc/self/exe",0,0,wv,environ)){ int st; waitpid(wp,&st,0);
-      if(!(WIFEXITED(st)&&WEXITSTATUS(st)==0)){ fprintf(stderr,"workqueue: warm build failed\n"); free(wv); return 2; } } }
-  free(wv);
+  if(any_local){ char*we[]={"--warm","--device","0"}; char**wv=child_argv(argc,argv,we,3);
+    pid_t wp; if(!posix_spawn(&wp,"/proc/self/exe",0,0,wv,environ)){ int st; waitpid(wp,&st,0);
+      if(!(WIFEXITED(st)&&WEXITSTATUS(st)==0)) fprintf(stderr,"workqueue: local warm build failed (continuing)\n"); }
+    free(wv); }   /* remote workers build their own kernel cache on first shard */
 
   /* 3) shard plan: ~8M candidates/shard by default (or --shards N) */
   unsigned long long SHARD_CAND=8ULL<<20;
   long nshards = nshards_arg>0 ? nshards_arg : (long)((owin+SHARD_CAND-1)/SHARD_CAND);
-  if(nshards<ndev) nshards=ndev;
+  if(nshards<nspec) nshards=nspec;
   if(nshards<1) nshards=1;
   if(nshards>4000000) nshards=4000000;
   unsigned long long ss=(owin+nshards-1)/nshards; nshards=(long)((owin+ss-1)/ss);
   long*order=malloc((size_t)nshards*sizeof(long)); build_order(order_policy,nshards,order,order_seed);
-  fprintf(stderr,"workqueue: total=%llu window=[%llu,%llu) shards=%ld (~%llu each) order=%s across %d GPU(s)\n",
-    total,ostart,ostart+owin,nshards,ss,ORDER_NAMES[order_policy],ndev);
+  fprintf(stderr,"%s: total=%llu window=[%llu,%llu) shards=%ld (~%llu each) order=%s across %d worker(s)%s\n",
+    hosts?"hive":"workqueue",total,ostart,ostart+owin,nshards,ss,ORDER_NAMES[order_policy],nspec,hosts?" over SSH":"");
 
-  /* 4) spawn workers, each on a stdin/stdout pipe pair */
-  Wrk W[16]; int nw=0; pid_t pgid=0;
-  for(int d=0; d<ndev; d++){
-    int tw[2],fw[2]; if(pipe(tw)||pipe(fw)){ fprintf(stderr,"workqueue: pipe failed\n"); return 2; }
-    char dv[16]; snprintf(dv,sizeof dv,"%d",devs[d]);
-    char*extra[3]={"--worker","--device",dv}; char**cv=child_argv(argc,argv,extra,3);
-    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa,tw[0],0); posix_spawn_file_actions_adddup2(&fa,fw[1],1);
-    posix_spawn_file_actions_addclose(&fa,tw[1]); posix_spawn_file_actions_addclose(&fa,fw[0]);
-    posix_spawn_file_actions_addclose(&fa,tw[0]); posix_spawn_file_actions_addclose(&fa,fw[1]);
-    posix_spawnattr_t at; posix_spawnattr_init(&at);
-    posix_spawnattr_setflags(&at,POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at,pgid);
-    pid_t pid; int rc=posix_spawn(&pid,"/proc/self/exe",&fa,&at,cv,environ);
-    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at); free(cv);
-    close(tw[0]); close(fw[1]);
-    if(rc){ fprintf(stderr,"workqueue: spawn dev %d failed: %s\n",devs[d],strerror(rc)); close(tw[1]); close(fw[0]); continue; }
+  /* 4) spawn workers (local child or `ssh dest ...`), each on a pipe pair */
+  Wrk W[MAXW]; int nw=0; pid_t pgid=0;
+  for(int i=0;i<nspec;i++){
+    int wfd,rfd; pid_t pid;
+    if(hive_spawn(&ws[i],argc,argv,pgid,&wfd,&rfd,&pid)){
+      fprintf(stderr,"%s: spawn %s dev%d failed: %s\n",hosts?"hive":"workqueue",ws[i].dest,ws[i].dev,strerror(errno)); continue; }
     if(!pgid){ pgid=pid; g_sup_pgid=pgid; }
-    memset(&W[nw],0,sizeof W[nw]); W[nw].pid=pid; W[nw].wfd=tw[1]; W[nw].rfd=fw[0]; W[nw].alive=1; W[nw].shard=-1; nw++;
+    memset(&W[nw],0,sizeof W[nw]); W[nw].pid=pid; W[nw].wfd=wfd; W[nw].rfd=rfd; W[nw].alive=1; W[nw].shard=-1;
+    if(ws[i].local) snprintf(W[nw].tag,sizeof W[nw].tag,"local dev%d",ws[i].dev);
+    else snprintf(W[nw].tag,sizeof W[nw].tag,"%.60s dev%d",ws[i].dest,ws[i].dev);
+    nw++;
   }
   if(nw==0){ fprintf(stderr,"workqueue: no workers\n"); free(order); return 2; }
   signal(SIGINT,sup_sigint); signal(SIGTERM,sup_sigint);
@@ -1830,7 +1908,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
     if(!any_alive) break;
     if(rq==0 && next>=nshards && outstanding==0) break;   /* NOT FOUND: queue drained */
 
-    struct pollfd pfd[16]; int map[16],np=0;
+    struct pollfd pfd[MAXW]; int map[MAXW],np=0;
     for(int i=0;i<nw;i++) if(W[i].alive){ pfd[np].fd=W[i].rfd; pfd[np].events=POLLIN; map[np]=i; np++; }
     int pr=poll(pfd,np,250);
     if(pr<0){ if(errno==EINTR) continue; break; }
@@ -1841,7 +1919,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
       if(n<=0){ /* worker died: re-queue its in-flight shard */
         w->alive=0; close(w->rfd); close(w->wfd);
         if(w->shard>=0){ requeue[rq++]=w->shard; w->shard=-1;
-          fprintf(stderr,"workqueue: worker dev%d died -> re-queued shard\n",map[p]); }
+          fprintf(stderr,"workqueue: worker [%s] died -> re-queued shard\n",W[map[p]].tag); }
         continue;
       }
       w->blen+=n; w->buf[w->blen]=0;
@@ -1892,7 +1970,7 @@ static int run_workqueue(int argc,char**argv,int*devs,int ndev,
     print_match_list(&allm,g_is_pass); bml_free(&allm); return 0;
   }
   if(found){
-    fprintf(stderr,"workqueue: device %d found it.\n",winner_dev);
+    fprintf(stderr,"workqueue: worker [%s] found it.\n",(winner_dev>=0&&winner_dev<nw)?W[winner_dev].tag:"?");
     printf("FOUND\n  index (canonical): %llu\n  %s: %s\n  path    : m/%d'/0'/%u'/%u/%u\n",
            win_idx, g_is_pass?"passphrase":"mnemonic", win_mn, win_purpose,win_ci[2],win_ci[0],win_ci[1]);
     if(win_addr[0] && strcmp(win_addr,"-")) printf("  address : %s\n",win_addr);
@@ -2356,6 +2434,15 @@ static void usage(void){
    "                          first|ends|center|random -- exploit a prior on where\n"
    "                          the key is; the supervisor shows one consolidated line\n"
    "  --shards N              split the space into N fine shards (default ~8M each)\n"
+   "  --hosts SPEC            SSH hive: run workers across machines. SPEC is a comma\n"
+   "                          list of [user@]host[:port][/ngpu] (ngpu default 1); host\n"
+   "                          'local' runs in-process. Reached as `ssh host --remote-bin\n"
+   "                          ... --worker`; assumes passwordless key auth and that the\n"
+   "                          tool + any --bloom/-D files already exist on each box.\n"
+   "                          e.g. --hosts 'local/2,alice@box2:22/4,box3/8'\n"
+   "  --remote-bin PATH       the bip39rxcrack path ON the remotes (default bip39rxcrack\n"
+   "                          in PATH); an absolute path also sets the remote working dir.\n"
+   "  --ssh \"CMD\"             ssh command for remote hosts (default \"ssh\"; e.g. \"ssh -J jump\")\n"
    "  --exhaustive            don't stop on the first hit; report EVERY match in a\n"
    "                          --addresses/--bloom SET (e.g. several PINs that each\n"
    "                          derive one of your funded addresses). Words/passphrase sets.\n"
@@ -2398,6 +2485,7 @@ int main(int argc,char**argv){
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
+  const char *hosts=0;                                    /* --hosts: SSH hive worker spec */
   int bloom_selftest=0; long bloom_selftest_n=0; int bloom_stat=0; const char*bloom_check=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--words")&&i+1<argc) words=argv[++i];
@@ -2458,6 +2546,9 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--warm")) g_warm=1;
     else if(!strcmp(argv[i],"--worker")) g_worker=1;
     else if(!strcmp(argv[i],"--shards")&&i+1<argc) nshards_arg=atol(argv[++i]);
+    else if(!strcmp(argv[i],"--hosts")&&i+1<argc) hosts=argv[++i];
+    else if(!strcmp(argv[i],"--ssh")&&i+1<argc) g_ssh_cmd=argv[++i];
+    else if(!strcmp(argv[i],"--remote-bin")&&i+1<argc) g_remote_bin=argv[++i];
     else if(!strcmp(argv[i],"--order")&&i+1<argc){ char*o=argv[++i]; char*colon=strchr(o,':'); if(colon){*colon=0; order_seed=strtoull(colon+1,0,10);}
       if(!strcmp(o,"first"))order_policy=0; else if(!strcmp(o,"ends"))order_policy=1; else if(!strcmp(o,"center"))order_policy=2; else if(!strcmp(o,"random"))order_policy=3;
       else { fprintf(stderr,"--order: first|ends|center|random[:seed], got '%s'\n",o); return 2; } order_given=1; }
@@ -2531,7 +2622,7 @@ int main(int argc,char**argv){
   /* Default: use ALL local GPUs. If the user pinned neither --device nor --devices,
      enumerate the visible CUDA devices and fan out across them (honours
      CUDA_VISIBLE_DEVICES). A single-GPU box falls through to the in-process path. */
-  if(crackjob && ndev==0 && !device_set){
+  if(crackjob && ndev==0 && !device_set && !hosts){
     CU(cuInit(0)); int nd=0; cuDeviceGetCount(&nd);
     if(nd>1){ ndev = nd>16?16:nd; for(int d=0;d<ndev;d++) devs[d]=d;
       fprintf(stderr,"(auto: %d GPUs detected -> fanning out; use --device N to pin one)\n",ndev); }
@@ -2539,10 +2630,11 @@ int main(int argc,char**argv){
   /* Route crack jobs to a multi-GPU driver. The address-words path has a
      persistent-worker WORK-QUEUE (fine shards + ordering + consolidated stats);
      other modes still use the contiguous supervisor until they get setup/sweep. */
-  if(crackjob && (ndev>0 || order_given || nshards_arg>0)){
+  if(crackjob && (ndev>0 || order_given || nshards_arg>0 || hosts)){
     int tgt=(address||addr_set);           /* single addr OR a bloom set */
     if(tgt && ((words && !templ) || templ || (mnemonic && passphrase))){ int nd=ndev>0?ndev:1; if(ndev==0) devs[0]=g_device;
-      return run_workqueue(argc,argv,devs,nd,cstart,ccount,order_policy,order_seed,nshards_arg); }
+      return run_workqueue(argc,argv,devs,nd,cstart,ccount,order_policy,order_seed,nshards_arg,hosts); }
+    if(hosts){ fprintf(stderr,"--hosts (SSH hive) needs a --words/--template/--passphrase job with a target\n"); return 2; }
     if(ndev>0) return run_supervisor(argc,argv,devs,ndev,cstart,ccount);
   }
   /* open the deferred CSV now that we know we're an actual cracker, not a supervisor

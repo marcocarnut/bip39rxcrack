@@ -33,7 +33,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e pass-alt-e2e
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e pass-alt-e2e hive-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -91,6 +91,12 @@ pass-pattern-e2e: $(CRACK)
 # passphrase alternation (a|b|c), POSIX [:digit:], and external [:dict:] files via -D
 pass-alt-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_pass_alternation.js
+
+# SSH hive over loopback: workers reached via `ssh host --worker`; found at the
+# global rank through --hosts localhost/2 and localhost/1,localhost/1. SKIPs if
+# passwordless `ssh localhost` isn't available.
+hive-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_hive.js
 
 $(LIBRXE):
 	$(MAKE) -C $(RXE_DIR) librxe.a
