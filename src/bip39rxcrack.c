@@ -1230,57 +1230,122 @@ static int mode_addr_gate(const char*vecfile,const char*cu){
 }
 
 /* ----------------------- Regime A: passphrase crack --------------------- */
-/* A fixed-length passphrase PATTERN as a sequence of per-position character
-   classes (mixed-radix). Grammar: a concatenation of elements, each a literal
-   char, an escaped char (\x), or a class [set] (chars + a-z style ranges),
-   optionally followed by {N} to repeat it N times. e.g. "[0-9]{4}", "[a-z]{6}",
-   "bike[0-9]{2}", "[A-Za-z0-9]{8}". The candidate index unranks over the classes
-   (last position least-significant). {m,n} variable length is not yet supported. */
-#define PP_MAXLEN 64
-typedef struct { int npos; int off[PP_MAXLEN+1]; unsigned char bytes[4096]; unsigned long long total; char src[256]; } PPat;
-/* returns 0 on success; <0: -1 syntax, -2 {m,n} variable len, -3 overflow, -4 too long/big. */
-static int pp_parse(const char*pat,PPat*P){
-  memset(P,0,sizeof *P); snprintf(P->src,sizeof P->src,"%s",pat);
-  int np=0,bp=0; unsigned long long total=1; const char*s=pat; P->off[0]=0;
-  while(*s){
-    unsigned char set[128]; int sn=0;
-    if(*s=='['){ s++;
-      while(*s && *s!=']'){
-        unsigned char c=(unsigned char)*s;
-        if(c=='\\' && s[1]){ c=(unsigned char)s[1]; s+=2; }
-        else if(s[1]=='-' && s[2] && s[2]!=']'){ unsigned char hi=(unsigned char)s[2];
-          if(hi<c) return -1;
-          for(int x=c;x<=hi && sn<128;x++){ int dup=0; for(int y=0;y<sn;y++) if(set[y]==(unsigned char)x)dup=1; if(!dup)set[sn++]=(unsigned char)x; }
-          s+=3; continue; }
-        else s++;
-        { int dup=0; for(int y=0;y<sn;y++) if(set[y]==c)dup=1; if(!dup && sn<128) set[sn++]=c; }
-      }
-      if(*s!=']') return -1;
-      s++;
-    } else if(*s=='\\' && s[1]){ set[sn++]=(unsigned char)s[1]; s+=2; }
-    else { set[sn++]=(unsigned char)*s; s++; }
-    if(sn==0) return -1;
-    int count=1;
-    if(*s=='{'){ char*e; long n=strtol(s+1,&e,10);
-      if(*e==',') return -2;                              /* {m,n} variable length */
-      if(*e!='}' || n<1 || n>PP_MAXLEN) return -1;
-      count=(int)n; s=e+1; }
-    for(int r=0;r<count;r++){
-      if(np>=PP_MAXLEN || bp+sn>(int)sizeof P->bytes) return -4;
-      if(sn>1 && total>(~0ULL)/(unsigned long long)sn) return -3;
-      total*=(unsigned long long)sn;
-      for(int k=0;k<sn;k++) P->bytes[bp++]=set[k];
-      P->off[np+1]=bp; np++;
-    }
+/* A fixed-length passphrase PATTERN, mixed-radix over a STRING-SET table: a
+   concatenation of elements, each optionally repeated {N}. An element is:
+     literal char / \x            one radix-1 string
+     [set]                        a char class (chars + a-z ranges) -> 1-char strings
+     [:name:]                     a POSIX class (alpha/digit/alnum/upper/lower/xdigit/
+                                  space/blank/punct/graph/print) OR a dictionary file
+                                  <name>.dict (one word/line) found via -D dirs
+     (a|b|c)                      alternation of literal strings (variable length ok)
+   Each position offers a set of alternatives; the candidate index unranks over them
+   (last position least-significant). e.g. [0-9]{4}, [a-z]{6}, bike[0-9]{2},
+   prefix(spring|summer|winter)[0-9]{2}, [:words:]{2}. {m,n} not yet supported. */
+#define PP_MAXPOS  128   /* must match the kernel's PP_MAXPOS */
+#define PP_MAXSALT 256   /* max passphrase byte length (kernel PP_MAXSALT) */
+typedef struct { int npos, nstr; int *pos_stroff; int *str_off; unsigned char *strbytes;
+                 int nbytes, cappos, capstr, capbytes; unsigned long long total; int maxlen; char src[256]; } PPat;
+static const char *g_dict_dirs[16]; static int g_ndict_dirs=0;   /* -D search dirs for [:name:].dict */
+static void pp_free(PPat*P){ free(P->pos_stroff); free(P->str_off); free(P->strbytes); memset(P,0,sizeof *P); }
+/* append one position whose alternatives are the k NUL-terminated strings strs[].
+   returns 0, or <0 on overflow/limit. */
+static int pp_add_position(PPat*P,char**strs,int k){
+  if(k<1) return -1;
+  if(P->npos+1>P->cappos){ P->cappos=P->cappos?P->cappos*2:16; P->pos_stroff=realloc(P->pos_stroff,(size_t)(P->cappos+1)*sizeof(int)); if(P->npos==0)P->pos_stroff[0]=0; }
+  int mx=0;
+  for(int i=0;i<k;i++){ int l=(int)strlen(strs[i]); if(l>mx)mx=l;
+    if(P->nstr+1>P->capstr){ P->capstr=P->capstr?P->capstr*2:1024; P->str_off=realloc(P->str_off,(size_t)(P->capstr+1)*sizeof(int)); if(P->nstr==0)P->str_off[0]=0; }
+    if(P->nbytes+l>P->capbytes){ while(P->nbytes+l>P->capbytes) P->capbytes=P->capbytes?P->capbytes*2:4096; P->strbytes=realloc(P->strbytes,(size_t)P->capbytes); }
+    memcpy(P->strbytes+P->nbytes,strs[i],l); P->nbytes+=l; P->str_off[P->nstr+1]=P->nbytes; P->nstr++; }
+  P->pos_stroff[P->npos+1]=P->nstr; P->npos++;
+  if(k>1 && P->total>(~0ULL)/(unsigned long long)k) return -3;
+  P->total*=(unsigned long long)k; P->maxlen+=mx;
+  if(P->npos>PP_MAXPOS || P->maxlen>PP_MAXSALT) return -4;
+  return 0;
+}
+/* expand a char-class body ("0-9A-F", ranges + literals) into distinct chars. */
+static int pp_charset(const char*body,int len,char**out,int*outn){
+  int n=0; static char pool[512][2];   /* enough for one class */
+  for(int i=0;i<len && n<256;){
+    unsigned char c=(unsigned char)body[i];
+    if(c=='\\' && i+1<len){ c=(unsigned char)body[i+1]; i+=2; }
+    else if(i+2<len && body[i+1]=='-' && body[i+2]!=0){ unsigned char hi=(unsigned char)body[i+2];
+      if(hi<c) return -1;
+      for(int x=c;x<=hi && n<256;x++){ int dup=0; for(int y=0;y<n;y++) if((unsigned char)pool[y][0]==(unsigned char)x)dup=1; if(!dup){ pool[n][0]=(char)x; pool[n][1]=0; n++; } }
+      i+=3; continue; }
+    else i++;
+    { int dup=0; for(int y=0;y<n;y++) if((unsigned char)pool[y][0]==c)dup=1; if(!dup){ pool[n][0]=(char)c; pool[n][1]=0; n++; } }
   }
-  if(np==0) return -1;
-  P->npos=np; P->total=total; return 0;
+  for(int y=0;y<n;y++) out[y]=pool[y];
+  *outn=n; return n?0:-1;
+}
+/* POSIX class body, matching rxe's dict.c (returns NULL if not a POSIX name). */
+static const char* pp_posix(const char*name){
+  static const struct{const char*n,*b;} T[]={{"alpha","A-Za-z"},{"digit","0-9"},{"alnum","0-9A-Za-z"},
+    {"upper","A-Z"},{"lower","a-z"},{"xdigit","0-9A-Fa-f"},{"space","\t\n\v\f\r "},{"blank","\t "},
+    {"punct","!-/:-@[-`{-~"},{"graph","!-~"},{"print"," -~"},{0,0}};
+  for(int i=0;T[i].n;i++) if(!strcmp(T[i].n,name)) return T[i].b;
+  return 0;
+}
+/* load <name>.dict (one word/line) from the -D dirs, then "."; returns words or <0. */
+static int pp_load_dict(const char*name,char***out,long*count){
+  FILE*fp=0; char path[1024];
+  for(int d=0; d<=g_ndict_dirs && !fp; d++){ const char*dir=(d<g_ndict_dirs)?g_dict_dirs[d]:".";
+    snprintf(path,sizeof path,"%s/%s.dict",dir,name); fp=fopen(path,"rb"); }
+  if(!fp) return -1;
+  char**w=0; long n=0,cap=0; char line[4096];
+  while(fgets(line,sizeof line,fp)){ int L=(int)strlen(line); while(L>0 && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
+    if(L==0) continue;
+    if(n==cap){ cap=cap?cap*2:1024; w=realloc(w,(size_t)cap*sizeof(char*)); }
+    w[n]=malloc((size_t)L+1); memcpy(w[n],line,(size_t)L+1); n++; }
+  fclose(fp); if(n==0){ free(w); return -2; }
+  *out=w; *count=n; return 0;
+}
+/* returns 0 on success; <0: -1 syntax, -2 {m,n}, -3 overflow, -4 too long, -5 bad dict. */
+static int pp_parse(const char*pat,PPat*P){
+  memset(P,0,sizeof *P); snprintf(P->src,sizeof P->src,"%s",pat); P->total=1;
+  const char*s=pat;
+  while(*s){
+    char *wheel[512]; int wn=0; char one[2]={0,0}; char **strs=wheel;   /* the element's alternatives */
+    char **dictw=0; long dictn=0;
+    if(s[0]=='[' && s[1]==':'){                            /* [:name:] POSIX class or dict */
+      const char*b=s+2; const char*e=strstr(b,":]"); if(!e) return -1;
+      char name[64]; int nl=(int)(e-b); if(nl<=0||nl>=64) return -1; memcpy(name,b,nl); name[nl]=0; s=e+2;
+      const char*body=pp_posix(name);
+      if(body){ if(pp_charset(body,(int)strlen(body),wheel,&wn)) return -1; }
+      else { int rc=pp_load_dict(name,&dictw,&dictn); if(rc) return -5; strs=dictw; wn=(dictn>2000000000L)?2000000000:(int)dictn; }
+    } else if(*s=='['){                                    /* [set] char class */
+      const char*b=s+1; const char*e=b; while(*e && *e!=']'){ if(*e=='\\'&&e[1])e+=2; else e++; }
+      if(*e!=']') return -1;
+      if(pp_charset(b,(int)(e-b),wheel,&wn)) return -1;
+      s=e+1;
+    } else if(*s=='('){                                    /* (a|b|c) alternation of literal strings */
+      s++; static char alt[512][PP_MAXSALT]; int an=0; int al=0;
+      while(*s && *s!=')'){ if(*s=='\\'&&s[1]){ if(al<PP_MAXSALT-1)alt[an][al++]=s[1]; s+=2; }
+        else if(*s=='|'){ alt[an][al]=0; an++; al=0; if(an>=512) return -4; s++; }
+        else { if(al<PP_MAXSALT-1)alt[an][al++]=*s; s++; } }
+      if(*s!=')') return -1;
+      s++; alt[an][al]=0; an++;
+      for(int i=0;i<an;i++) wheel[i]=alt[i];
+      wn=an;
+    } else if(*s=='\\' && s[1]){ one[0]=s[1]; wheel[0]=one; wn=1; s+=2; }
+    else { one[0]=*s; wheel[0]=one; wn=1; s++; }
+    int count=1;
+    if(*s=='{'){ char*ep; long n=strtol(s+1,&ep,10); if(*ep==',') return -2; if(*ep!='}'||n<1||n>PP_MAXPOS) return -1; count=(int)n; s=ep+1; }
+    int rc=0; for(int r=0;r<count && rc==0;r++) rc=pp_add_position(P,strs,wn);
+    if(dictw){ for(long i=0;i<dictn;i++) free(dictw[i]); free(dictw); }
+    if(rc) return rc;
+  }
+  if(P->npos==0) return -1;
+  return 0;
 }
 /* index -> passphrase string (mixed-radix, last position least-significant). */
 static void pp_decode(const PPat*P,unsigned long long j,char*out){
-  for(int p=P->npos-1;p>=0;p--){ int lo=P->off[p]; unsigned sz=(unsigned)(P->off[p+1]-lo);
-    out[p]=(char)P->bytes[lo+(int)(j%sz)]; j/=sz; }
-  out[P->npos]=0;
+  int ch[PP_MAXPOS]; unsigned long long q=j;
+  for(int p=P->npos-1;p>=0;p--){ unsigned cnt=(unsigned)(P->pos_stroff[p+1]-P->pos_stroff[p]); ch[p]=(int)(q%cnt); q/=cnt; }
+  int L=0;
+  for(int p=0;p<P->npos;p++){ int st=P->pos_stroff[p]+ch[p]; int a=P->str_off[st],b=P->str_off[st+1]; for(int k=a;k<b;k++) out[L++]=(char)P->strbytes[k]; }
+  out[L]=0;
 }
 
 /* Regime A context: fixed mnemonic + passphrase [0-9]{pwidth}. Single-target or a
@@ -1289,7 +1354,7 @@ static void pp_decode(const PPat*P,unsigned long long j,char*out){
    split so it joins the work-queue like the words/template modes. */
 typedef struct {
   unsigned long long total; int npos, purpose; uint32_t pu, naccounts, changes, gap; int grid, tpb;
-  PPat pat; CUdeviceptr d_cls_off, d_cls_bytes;         /* passphrase pattern (mixed-radix) */
+  PPat pat; CUdeviceptr d_pos_stroff, d_str_off, d_str_bytes;   /* passphrase pattern (string-set mixed-radix) */
   CUdeviceptr dhctx;                                   /* precomputed HMAC key ctx */
   CUdeviceptr dtp, dhi, dfound, dhit_ci;               /* single-target */
   CUdeviceptr d_bloom, d_hits, d_hitcnt, d_purposes;   /* bloom SET */
@@ -1302,8 +1367,9 @@ static int crack_pass_setup(PassCtx*P,const char*mnemonic,const PPat*pp,const ui
   P->pat=*pp; P->total=pp->total; P->npos=pp->npos; P->purpose=purpose; P->pu=(uint32_t)purpose;
   P->changes=changes; P->gap=gap; P->naccounts=accounts; P->grid=1024; P->tpb=128;
   build_module(cu);
-  P->d_cls_off=up(P->pat.off,(size_t)(P->npos+1)*sizeof(int));
-  P->d_cls_bytes=up(P->pat.bytes,(size_t)P->pat.off[P->npos]);
+  P->d_pos_stroff=up(P->pat.pos_stroff,(size_t)(P->npos+1)*sizeof(int));
+  P->d_str_off=up(P->pat.str_off,(size_t)(P->pat.nstr+1)*sizeof(int));
+  P->d_str_bytes=up(P->pat.strbytes,(size_t)P->pat.nbytes);
   int mnlen=(int)strlen(mnemonic); CUdeviceptr dmn=up(mnemonic,mnlen);
   CU(cuMemAlloc(&P->dhctx,16*sizeof(unsigned long long)));
   { void*ia[]={&dmn,&mnlen,&P->dhctx}; CU(cuLaunchKernel(kern("g_hctx_init"),1,1,1,1,1,1,0,0,ia,0)); CU(cuCtxSynchronize()); }
@@ -1350,7 +1416,7 @@ static int crack_pass_sweep_bloom(PassCtx*P,unsigned long long start,unsigned lo
   for(unsigned long long cs=start; cs<start+count; ){
     unsigned long long cc=(start+count-cs<chunk)?(start+count-cs):chunk; double c0=now_s();
     unsigned int zc=0; CU(cuMemcpyHtoD(P->d_hitcnt,&zc,4));
-    void*args[]={&P->dhctx,&P->npos,&P->d_cls_off,&P->d_cls_bytes,&cs,&cc,&P->d_purposes,&P->bnpurp,&P->naccounts,&P->changes,&P->gap,
+    void*args[]={&P->dhctx,&P->npos,&P->d_pos_stroff,&P->d_str_off,&P->d_str_bytes,&cs,&cc,&P->d_purposes,&P->bnpurp,&P->naccounts,&P->changes,&P->gap,
                  &P->d_bloom,&P->bloom_mask,&P->d_hits,&P->d_hitcnt,&P->hitcap};
     CU(cuLaunchKernel(kern("g_crack_pass_bloom"),P->grid,1,1,P->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=cc; cs+=cc;
@@ -1387,7 +1453,7 @@ static int crack_pass_sweep(PassCtx*P,unsigned long long start,unsigned long lon
   int found=0; unsigned long long swept=0;
   for(unsigned long long cs=start; cs<start+count; ){
     unsigned long long cc=(start+count-cs<chunk)?(start+count-cs):chunk; double c0=now_s();
-    void*args[]={&P->dhctx,&P->npos,&P->d_cls_off,&P->d_cls_bytes,&cs,&cc,&P->pu,&P->naccounts,&P->changes,&P->gap,&P->dtp,&P->dhi,&P->dfound,&P->dhit_ci};
+    void*args[]={&P->dhctx,&P->npos,&P->d_pos_stroff,&P->d_str_off,&P->d_str_bytes,&cs,&cc,&P->pu,&P->naccounts,&P->changes,&P->gap,&P->dtp,&P->dhi,&P->dfound,&P->dhit_ci};
     CU(cuLaunchKernel(kern("g_crack_pass"),P->grid,1,1,P->tpb,1,1,0,0,args,0)); CU(cuCtxSynchronize());
     double csecs=now_s()-c0; swept+=cc; cs+=cc;
     if(cb) cb(ud,swept,swept);
@@ -1427,7 +1493,7 @@ static int mode_crack_pass(const char*mnemonic,const PPat*pp,const uint8_t tprog
     print_match_list(&ml,1); bml_free(&ml); return 0;
   }
   if(!found){ prog_finish(&PR,"NOT_FOUND",0,path); printf("NOT FOUND\n"); return 1; }
-  char pass[PP_MAXLEN+1]; pp_decode(&P.pat,hidx,pass);
+  char pass[PP_MAXSALT+1]; pp_decode(&P.pat,hidx,pass);
   char fpath[80]; snprintf(fpath,sizeof fpath,"m/%d'/0'/%u'/%u/%u",mpurpose,hci[2],hci[0],hci[1]);
   prog_finish(&PR,"FOUND",pass,fpath);
   printf("FOUND\n  index      : %llu\n  passphrase : %s\n  path       : %s\n",hidx,pass,fpath);
@@ -1513,7 +1579,7 @@ static int wq_sweep_pass(void*c,unsigned long long s,unsigned long long n,double
                          unsigned long long*oi,uint32_t oc[3],char*mn,int mnsz,char*addr,int addrsz,int*opur,BMatchList*ml){
   PassCtx*P=c; uint32_t ci[3]; unsigned long long hidx=0;
   int f=crack_pass_sweep(P,s,n,intv,rep,cb,ud,&hidx,ci,addr,addrsz,opur,ml);
-  if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1]; oc[2]=ci[2]; char pass[PP_MAXLEN+1]; pp_decode(&P->pat,hidx,pass); snprintf(mn,mnsz,"%s",pass); }
+  if(f>0){ *oi=hidx; oc[0]=ci[0]; oc[1]=ci[1]; oc[2]=ci[2]; char pass[PP_MAXSALT+1]; pp_decode(&P->pat,hidx,pass); snprintf(mn,mnsz,"%s",pass); }
   if(ml) for(int i=0;i<ml->n;i++) pp_decode(&P->pat,ml->v[i].idx,ml->v[i].secret);
   return f;
 }
@@ -2233,10 +2299,15 @@ static void usage(void){
    "  --words \"w1 .. wN\"      N known distinct words, unknown order ({{N!}})\n"
    "  --template \"w .. [:bip39:] ..\"  known words + [:bip39:]/[:en:]/[:24th:] wildcards\n"
    "  --mnemonic \"w .. w\" --passphrase PATTERN   fixed mnemonic, unknown passphrase.\n"
-   "                          PATTERN = literals + char classes + {N}: [0-9]{4} (PIN),\n"
-   "                          [a-z]{6}, [A-Za-z0-9]{8}, bike[0-9]{2}. ({m,n} not yet;\n"
-   "                          use a fixed {N}.) Works with any TARGET below -- a single\n"
-   "                          --address OR a --addresses/--bloom SET; fans out; --exhaustive.\n"
+   "                          PATTERN = literals + {N}, char classes [0-9]/[a-z], POSIX\n"
+   "                          [:digit:]/[:alpha:]/[:alnum:]/..., alternation (a|b|c), and\n"
+   "                          dictionaries [:name:] (name.dict via -D). e.g. [0-9]{4},\n"
+   "                          bike[0-9]{2}, (spring|summer)[0-9]{2}, prefix[:words:].\n"
+   "                          ({m,n} not yet -- use a fixed {N}.) Works with any TARGET\n"
+   "                          below -- a single --address OR a --addresses/--bloom SET;\n"
+   "                          fans out over GPUs; --exhaustive.\n"
+   "  -D DIR                  add DIR to the search path for [:name:] dictionaries\n"
+   "                          (a name.dict file, one word per line); repeatable.\n"
    "  ([:Nth:] last-word checksum construction auto-applies; --nth/--no-nth to force)\n"
    "\n"
    "TARGET (choose one):\n"
@@ -2377,6 +2448,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--change")&&i+1<argc) a_changes=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--gap")&&i+1<argc) a_gap=(uint32_t)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--account")&&i+1<argc){ a_accounts=(uint32_t)strtoul(argv[++i],0,10); if(a_accounts<1) a_accounts=1; }
+    else if(!strcmp(argv[i],"-D")&&i+1<argc){ if(g_ndict_dirs<16) g_dict_dirs[g_ndict_dirs++]=argv[++i]; else i++; }
     else if(!strcmp(argv[i],"--kernels")&&i+1<argc) cu=argv[++i];
     else if(!strcmp(argv[i],"--resume")&&i+1<argc) resumearg=argv[++i];
     else if(!strcmp(argv[i],"--device")&&i+1<argc){ g_device=atoi(argv[++i]); device_set=1; }
@@ -2510,7 +2582,8 @@ int main(int argc,char**argv){
   if(mnemonic && passphrase){
     PPat pp; int pe=pp_parse(passphrase,&pp);
     if(pe==-2){ fprintf(stderr,"passphrase '%s': {m,n} variable length not yet supported; use a fixed {N}\n",passphrase); return 2; }
-    if(pe<0){ fprintf(stderr,"passphrase '%s': bad pattern (classes [..], literals, {N}); code %d\n",passphrase,pe); return 2; }
+    if(pe==-5){ fprintf(stderr,"passphrase '%s': unknown/empty [:dict:] -- give -D <dir> holding <name>.dict\n",passphrase); return 2; }
+    if(pe<0){ fprintf(stderr,"passphrase '%s': bad pattern (literals, [set], [:posix:]/[:dict:], (a|b|c), {N}); code %d\n",passphrase,pe); return 2; }
     uint8_t prog[32]={0}; int purpose; AddrSet A; const AddrSet*aset=0;
     if(addr_set){ int apu=84;
       if(bloom_file){ if(load_bloom_file(bloom_file,&A)) return 2; if(A.npurp) apu=(int)A.purposes[0]; }
@@ -2524,6 +2597,7 @@ int main(int argc,char**argv){
     if(g_worker) rc=run_worker_pass(mnemonic,&pp,prog,purpose,a_changes,a_gap,a_accounts,cu,aset);
     else rc=mode_crack_pass(mnemonic,&pp,prog,purpose,a_changes,a_gap,a_accounts,cstart,ccount,cu,aset);
     if(aset) aset_free(&A);
+    pp_free(&pp);
     return rc;
   }
   if(!words){ usage(); return 2; }
