@@ -355,26 +355,28 @@ __device__ void derive_address(const u8 seed[64], u32 purpose, u32 change, u32 i
  * node and its parent pubkey/HMAC context are computed ONCE per change and
  * reused across the gap indices (only the final k_i*G is per-index). On the
  * first match sets *oc,*oi and returns 1; else 0. proglen inferred from purpose. */
-__device__ int derive_address_match(const u8 seed[64], u32 purpose, u32 changes, u32 gap,
-                                    const u8 *target_prog, int *oc, int *oi){
+__device__ int derive_address_match(const u8 seed[64], u32 purpose, u32 accounts, u32 changes, u32 gap,
+                                    const u8 *target_prog, int *oa, int *oc, int *oi){
   int tlen = (purpose==86)?32:20;
-  u32 hidx[3]={ purpose|0x80000000u, 0x80000000u, 0x80000000u };
-  u8 ca[32],ka[32]; derive_hardened(seed,64,hidx,3,ca,ka);   // account node m/purpose'/0'/0'
-  for(u32 c=0;c<changes;c++){
-    u8 kch[32],cch[32]; for(int b=0;b<32;b++){ kch[b]=ka[b]; cch[b]=ca[b]; }
-    ckd_normal(kch,cch,c);                                    // change node
-    u8 pubc[33]; scalar_mul_G(kch,pubc);                      // parent pub (fixed over gap)
-    HCTX h; hmac512_ctx(cch,32,&h);                           // HMAC ctx over change chaincode (once)
-    for(u32 i=0;i<gap;i++){
-      u8 data[37]; for(int b=0;b<33;b++) data[b]=pubc[b];
-      data[33]=(i>>24)&255; data[34]=(i>>16)&255; data[35]=(i>>8)&255; data[36]=i&255;
-      u8 I[64]; hmac512_run(&h,data,37,I);
-      u8 IL[32]; for(int b=0;b<32;b++) IL[b]=I[b];
-      u8 ki[32]; modn_add(IL,kch,ki);
-      u8 pub[33]; scalar_mul_G(ki,pub);
-      u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
-      int eq=1; for(int b=0;b<tlen;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
-      if(eq){ *oc=(int)c; *oi=(int)i; return 1; }
+  for(u32 acct=0; acct<accounts; acct++){
+    u32 hidx[3]={ purpose|0x80000000u, 0x80000000u, acct|0x80000000u };
+    u8 ca[32],ka[32]; derive_hardened(seed,64,hidx,3,ca,ka);   // account node m/purpose'/0'/acct'
+    for(u32 c=0;c<changes;c++){
+      u8 kch[32],cch[32]; for(int b=0;b<32;b++){ kch[b]=ka[b]; cch[b]=ca[b]; }
+      ckd_normal(kch,cch,c);                                    // change node
+      u8 pubc[33]; scalar_mul_G(kch,pubc);                      // parent pub (fixed over gap)
+      HCTX h; hmac512_ctx(cch,32,&h);                           // HMAC ctx over change chaincode (once)
+      for(u32 i=0;i<gap;i++){
+        u8 data[37]; for(int b=0;b<33;b++) data[b]=pubc[b];
+        data[33]=(i>>24)&255; data[34]=(i>>16)&255; data[35]=(i>>8)&255; data[36]=i&255;
+        u8 I[64]; hmac512_run(&h,data,37,I);
+        u8 IL[32]; for(int b=0;b<32;b++) IL[b]=I[b];
+        u8 ki[32]; modn_add(IL,kch,ki);
+        u8 pub[33]; scalar_mul_G(ki,pub);
+        u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
+        int eq=1; for(int b=0;b<tlen;b++) if(prog[b]!=target_prog[b]){ eq=0; break; }
+        if(eq){ *oa=(int)acct; *oc=(int)c; *oi=(int)i; return 1; }
+      }
     }
   }
   return 0;
