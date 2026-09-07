@@ -787,9 +787,14 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
     X->d_hitcnt=up(&z0,4);
     X->bnpurp=aset->npurp; X->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
-    if(aset->prefilter)
-      fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
-              (double)fbytes/1048576.0, nb, aset->host_filter_nblocks, aset->npurp);
+    if(aset->prefilter){
+      if(aset->f2_classic)
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull %.1f GiB classic k=%d, %d purpose(s)\n",
+                (double)fbytes/1048576.0, nb, (double)((size_t)1<<aset->f2_log2bytes)/1073741824.0, aset->f2_k2, aset->npurp);
+      else
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
+                (double)fbytes/1048576.0, nb, aset->host_filter_nblocks, aset->npurp);
+    }
     else
       fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
               ntgt, (double)fbytes/1048576.0, nb, ntgt?(double)nb*256.0/(double)ntgt:0.0, aset->npurp);
@@ -1033,9 +1038,14 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
     M->bloom_mask=nb-1;
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
     M->bnpurp=aset->npurp; M->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
-    if(aset->prefilter)
-      fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
-              (double)fbytes/1048576.0,nb,aset->host_filter_nblocks,aset->npurp);
+    if(aset->prefilter){
+      if(aset->f2_classic)
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull %.1f GiB classic k=%d, %d purpose(s)\n",
+                (double)fbytes/1048576.0,nb,(double)((size_t)1<<aset->f2_log2bytes)/1073741824.0,aset->f2_k2,aset->npurp);
+      else
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
+                (double)fbytes/1048576.0,nb,aset->host_filter_nblocks,aset->npurp);
+    }
     else
       fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks, %.1f bits/key), %d purpose(s), cull on host\n",
               ntgt,(double)fbytes/1048576.0,nb,ntgt?(double)nb*256.0/(double)ntgt:0.0,aset->npurp);
@@ -1261,9 +1271,14 @@ static int crack_pass_setup(PassCtx*P,const char*mnemonic,int pwidth,const uint8
     P->bloom_mask=nb-1; P->hitcap=1u<<18;
     CU(cuMemAlloc(&P->d_hits,(size_t)P->hitcap*sizeof(BloomHit))); P->d_hitcnt=up(&z0,4);
     P->bnpurp=aset->npurp; P->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
-    if(aset->prefilter)
-      fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
-              (double)fbytes/1048576.0,nb,aset->host_filter_nblocks,aset->npurp);
+    if(aset->prefilter){
+      if(aset->f2_classic)
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull %.1f GiB classic k=%d, %d purpose(s)\n",
+                (double)fbytes/1048576.0,nb,(double)((size_t)1<<aset->f2_log2bytes)/1073741824.0,aset->f2_k2,aset->npurp);
+      else
+        fprintf(stderr,"bloom: prebuilt GPU filter %.1f MiB (%u blocks), host cull filter %u blocks, %d purpose(s)\n",
+                (double)fbytes/1048576.0,nb,aset->host_filter_nblocks,aset->npurp);
+    }
     else
       fprintf(stderr,"bloom: %ld target(s), filter %.1f MiB (%u blocks), %d purpose(s), cull on host\n",
               ntgt,(double)fbytes/1048576.0,nb,aset->npurp);
