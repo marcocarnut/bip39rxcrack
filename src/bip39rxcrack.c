@@ -2033,12 +2033,20 @@ static int mode_bloom_stat(const char*file){
     if((i&0x3FFFFFFF)==0x3FFFFFFF) fprintf(stderr,"  ... %llu probed (f1=%llu f2=%llu both=%llu)\r",i+1,f1,f2only,both);
   }
   fprintf(stderr,"\n");
+  double p1=(double)f1/R1, p2meas=(double)f2only/R1;
+  /* a classic bloom's FPR is fill^k (no block-load variance), which is exact even
+     when the filter is far too good to see a single hit at this sample size. */
+  double p2=(A.f2_classic && f2only==0)?pow(fill2,(double)A.f2_k2):p2meas;
+  double comb=p1*p2;
   fprintf(stderr,"MEASURED over %llu random programs (this is the ground truth):\n",R1);
-  fprintf(stderr,"  filter 1 FPR = %llu/%llu = %.3e\n",f1,R1,(double)f1/R1);
-  fprintf(stderr,"  filter 2 FPR = %llu/%llu = %.3e\n",f2only,R1,(double)f2only/R1);
-  fprintf(stderr,"  COMBINED FPR = %llu/%llu = %.3e",both,R1,(double)both/R1);
-  if(both==0) fprintf(stderr,"  (0 hits -> combined FPR < %.1e at 95%%; product of singles = %.2e)\n",3.0/R1,(double)f1/R1*(double)f2only/R1);
-  else fprintf(stderr,"  (product of singles = %.2e)\n",(double)f1/R1*(double)f2only/R1);
+  fprintf(stderr,"  filter 1 FPR = %llu/%llu = %.3e\n",f1,R1,p1);
+  if(A.f2_classic && f2only==0)
+    fprintf(stderr,"  filter 2 FPR = 0/%llu (too rare to see here) -> from fill: %.4f^%d = %.2e\n",R1,fill2,A.f2_k2,p2);
+  else
+    fprintf(stderr,"  filter 2 FPR = %llu/%llu = %.3e\n",f2only,R1,p2meas);
+  fprintf(stderr,"  COMBINED FPR ~ %.2e  (filter1 x filter2%s)\n",comb, (both>0)?"; measured combined hits>0!":"");
+  fprintf(stderr,"  => ~%.2g false positive(s) expected over a 1e12-candidate sweep. %s\n",
+          comb*1e12, comb*1e12<0.1?"Effectively zero -- good.":"NOTE: not negligible on huge sweeps; enlarge filter2.");
   return 0;
 }
 /* --bloom-check: probe specific address(es) through each filter separately. */
