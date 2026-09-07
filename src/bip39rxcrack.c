@@ -1846,7 +1846,16 @@ static int classic_optk(unsigned long long bits,unsigned long long n){
 static double blf_fpr(unsigned long long nblocks,unsigned long long n){
   if(!nblocks) return 1.0;
   const double B=256.0, k=16.0; double lambda=(double)n/(double)nblocks;
-  double s=0.0, pm=exp(-lambda);
+  double p0=exp(-lambda);
+  if(p0<=0.0){   /* lambda so large that exp(-lambda) underflows -> block saturated;
+                    the Poisson mass sits at m~=lambda where fill~=1, so evaluate the
+                    occupancy estimate deterministically at the mean (-> ~1.0). */
+    double km=k*lambda, a=pow(1.0-1.0/B,km), mu=B*(1.0-a);
+    if(mu<=0.0) return 1.0;
+    double var=B*a+B*(B-1.0)*pow(1.0-2.0/B,km)-B*B*a*a; if(var<0)var=0;
+    double f=pow(mu/B,k)*(1.0+0.5*k*(k-1.0)*var/(mu*mu)); return f>1.0?1.0:f;
+  }
+  double s=0.0, pm=p0;
   for(int m=0;m<=1000;m++){
     double km=k*(double)m;
     if(km>0){
@@ -1878,6 +1887,21 @@ static void blf3_size(unsigned long long n,double target,uint32_t*nb1,int*log2by
 /* GiB -> log2(bytes) (power of two). */
 static int gib_to_log2bytes(double gib){ if(gib<=0) return 0; int e=(int)lround(log2(gib*1073741824.0)); if(e<3)e=3; if(e>40)e=40; return e; }
 static uint32_t gib_to_nblocks(double gib){ if(gib<=0) return 0; double b=gib*33554432.0; int e=(int)lround(log2(b)); if(e<4)e=4; if(e>30)e=30; return 1u<<e; }
+/* --bloom-sizes N: print what a build WOULD produce (no GPU, no data) so a 72-min
+   full build can be sanity-checked first. Honours --fpr and --bloom-gib. */
+static int mode_bloom_sizes(unsigned long long n,double fpr,double gib1,double gib2){
+  uint32_t nb1; int log2b2,k2;
+  if(gib1>0 && gib2>0){ nb1=gib_to_nblocks(gib1); log2b2=gib_to_log2bytes(gib2); k2=classic_optk((unsigned long long)1<<(log2b2+3),n?n:1500000000ULL); }
+  else { if(!n){ fprintf(stderr,"--bloom-sizes needs N (or --bloom-gib G1,G2)\n"); return 2; } blf3_size(n,fpr,&nb1,&log2b2,&k2); }
+  double f1b=(double)nb1*32.0, f2b=(double)((unsigned long long)1<<log2b2);
+  double fpr1=blf_fpr(nb1,n?n:1500000000ULL), fpr2=classic_fpr((unsigned long long)f2b*8,n?n:1500000000ULL,k2);
+  printf("for n=%llu addresses, target FPR %.0e:\n",n,fpr);
+  printf("  filter1 (GPU, blocked): %.2f GiB (2^%d blocks), est FPR %.2e\n",f1b/1073741824.0,(int)lround(log2((double)nb1)),fpr1);
+  printf("  filter2 (host, classic): %.2f GiB, k=%d, est FPR %.2e\n",f2b/1073741824.0,k2,fpr2);
+  printf("  total .blf %.2f GiB; est combined FPR %.2e (formula ~3x optimistic -- MEASURE with --bloom-stat)\n",
+         (f1b+f2b)/1073741824.0,fpr1*fpr2);
+  return 0;
+}
 /* Read addresses (one per line; IN='-' = stdin, so pipe curl|zcat) -> a BLF3 dual
    bloom: filter1 BLOCKED over the raw program (GPU prefilter); filter2 CLASSIC over
    sha256(program) (host cull -- no block-load variance, so ideal FPR). Streamed --
@@ -2222,6 +2246,7 @@ int main(int argc,char**argv){
   unsigned long long bloom_n=0; double bloom_fpr=1e-12;   /* --bloom-build sizing */
   double bloom_gib1=0, bloom_gib2=0;                       /* --bloom-gib G1,G2 explicit sizes */
   const char *bloom_other=0;                               /* --bloom-other FILE: dump 'other' skips */
+  unsigned long long bloom_sizes=0; int bloom_sizes_set=0;  /* --bloom-sizes N: dry-run sizing */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
   int order_policy=0, order_given=0; unsigned long long order_seed=0; long nshards_arg=0;  /* work-queue */
@@ -2266,6 +2291,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--fpr")&&i+1<argc){ double v=atof(argv[++i]); if(v>0&&v<1) bloom_fpr=v; }
     else if(!strcmp(argv[i],"--bloom-gib")&&i+1<argc){ sscanf(argv[++i],"%lf,%lf",&bloom_gib1,&bloom_gib2); }
     else if(!strcmp(argv[i],"--bloom-other")&&i+1<argc) bloom_other=argv[++i];
+    else if(!strcmp(argv[i],"--bloom-sizes")&&i+1<argc){ bloom_sizes=strtoull(argv[++i],0,10); bloom_sizes_set=1; }
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
     else if(!strcmp(argv[i],"--nth")) nthmode=1;
@@ -2347,6 +2373,7 @@ int main(int argc,char**argv){
   int addr_set = (addresses||addresses_file||bloom_file);   /* a bloom target SET */
   g_is_pass = (mnemonic && passphrase) ? 1 : 0;             /* label the recovered secret / route regime A */
   if(g_exhaustive && templ) fprintf(stderr,"note: --exhaustive is not yet wired for --template; reporting the first match only\n");
+  if(bloom_sizes_set) return mode_bloom_sizes(bloom_sizes,bloom_fpr,bloom_gib1,bloom_gib2);
   if(bloom_stat||bloom_check){ if(!bloom_file){ fprintf(stderr,"--bloom-stat/--bloom-check need --bloom FILE\n"); return 2; }
     if(bloom_stat) return mode_bloom_stat(bloom_file);
     return mode_bloom_check(bloom_file,bloom_check); }
