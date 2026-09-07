@@ -320,17 +320,16 @@ gate/gen_*.js, gate.c,     oracle-driven vector generators + gate harnesses
   alternation / dictionaries) and the mixed-radix on-GPU unranking.
 - `docs/WORKQUEUE_HIVE_PLAN.md` — the fine-shard work-queue and the SSH hive.
 - `docs/MULTIGPU_PLAN.md` — the contiguous multi-GPU fan-out (other modes).
+- `docs/BACKLOG.md` — everything deliberately deferred (with why), in one place.
 
 ## Roadmap
 
-- **EC / occupancy tuning.** secp256k1 is correctness-only (double-and-add `k·G` +
-  Fermat inverse); a fixed-base comb, batch inversion and occupancy work are the
-  levers for the EC-heavier paths.
-- **Passphrase:** `{m,n}` variable length; nested alternation; and a generic
-  streaming-`rxe` fallback for patterns no closed-form unranker can express.
-- **Hive:** two-level machine chunking (one SSH connection per box, not per GPU);
-  bounded per-host reconnect; `--account` scan for the xpub path.
-- **Electrum** seeds; full reseed39 job-file (`--job`/`--link`) parity.
+The core feature roadmap is shipped. What remains is deliberately deferred and lives in
+one place — **`docs/BACKLOG.md`** — grouped as features (generic streaming-`rxe`
+passphrases, multicoin), smaller gaps (`{m,n}`, nested alternation, xpub account-scan,
+Electrum, reseed39 job-file parity), rough edges (a hive preflight `--hive-check`, bounded
+per-host reconnect, two-level hive fan-out), EC/occupancy tuning, and the address-data
+source for bloom rebuilds. Each entry says why it's deferred.
 
 The `{{N!?}}` keyed-shuffle is intentionally **not** implemented: a full-space
 recovery is order-independent, the reported index already matches reseed39's
