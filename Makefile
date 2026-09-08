@@ -2,8 +2,9 @@
 #
 # Correctness authority: the byte-exact browser reference in reseed39
 # (estimator/bip39crypto.js, estimator/bip39.js) + published BIP vectors.
-# Kernels are NVRTC-compiled at runtime to native compute_120 (Blackwell/sm_120)
-# using the CUDA 12.8+/13 NVRTC toolkit; the driver JITs the PTX to the GPU.
+# Kernels are NVRTC-compiled at runtime to the DEVICE's own compute capability
+# (auto-detected: compute_86 on a 3060 Ti, compute_120 on a 5090); the driver JITs
+# the PTX to the GPU. NVRTC_HOME just needs to be new enough for your GPU.
 #
 #   make          # build the gate harness + the cracker
 #   make gate     # generate oracle vectors + run the crypto gates
@@ -15,18 +16,21 @@
 
 CC        ?= cc
 CFLAGS    ?= -O2 -Wall -Wextra -Wno-unused-parameter
-# CUDA_HOME: 11.8, for the driver-API header cuda.h (stable API).
-CUDA_HOME ?= /usr/local/cuda
-# NVRTC_HOME: 13.2, native sm_120 codegen (compute_120) -- kills the 11.8 JIT-miscompile class.
-NVRTC_HOME ?= /usr/local/cuda-13.2
-# DRIVER_LIB: libcuda.so from driver 595.
+# CUDA_HOME: for the driver-API header cuda.h (stable API). Point at the versioned
+# toolkit dir (the generic /usr/local/cuda symlink only exists with the full toolkit).
+CUDA_HOME ?= /usr/local/cuda-12.5
+# NVRTC_HOME: the NVRTC toolkit for runtime codegen. Arch is auto-detected from the
+# device, so this only needs to be new enough for your GPU (12.5 covers Ampere/sm_86;
+# a 5090/sm_120 needs 12.8+). Override on the command line for a different toolkit.
+NVRTC_HOME ?= /usr/local/cuda-12.5
+# DRIVER_LIB: libcuda.so from the installed NVIDIA driver.
 DRIVER_LIB ?= /usr/lib/x86_64-linux-gnu
 RESEED39_DIR ?= /root/bip39rxcrack
 RXE_DIR   ?= ../rxe
 LIBRXE     = $(RXE_DIR)/librxe.a
 
-INC  = -I$(CUDA_HOME)/include -I$(NVRTC_HOME)/include -I$(RXE_DIR)
-# libnvrtc from CUDA 13.2 (rpath so libnvrtc.so.13 resolves at runtime); libcuda from driver.
+INC  = -I$(CUDA_HOME)/include -I$(NVRTC_HOME)/include -I$(RXE_DIR) -DNVRTC_LIBDIR='"$(NVRTC_HOME)/lib64"'
+# libnvrtc from NVRTC_HOME (rpath so libnvrtc.so.N resolves at runtime); libcuda from driver.
 LIBS = -L$(NVRTC_HOME)/lib64 -lnvrtc -Wl,-rpath,$(NVRTC_HOME)/lib64 -L$(DRIVER_LIB) -lcuda
 RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 

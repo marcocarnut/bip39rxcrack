@@ -39,6 +39,12 @@
 #include "rxe.h"
 #include "../cuda/bloom_common.h"
 
+/* NVRTC lib dir (for LD_LIBRARY_PATH so libnvrtc-builtins resolves); the Makefile
+   passes -DNVRTC_LIBDIR="$(NVRTC_HOME)/lib64". Falls back to the cuda symlink. */
+#ifndef NVRTC_LIBDIR
+#define NVRTC_LIBDIR "/usr/local/cuda/lib64"
+#endif
+
 #define CU(x)  do{ CUresult r=(x); if(r!=CUDA_SUCCESS){ const char*s=0; cuGetErrorString(r,&s); \
                    fprintf(stderr,"CUDA error %d (%s) at %s:%d\n",r,s?s:"?",__FILE__,__LINE__); exit(2);} }while(0)
 #define NVR(x) do{ nvrtcResult r=(x); if(r!=NVRTC_SUCCESS){ \
@@ -144,19 +150,29 @@ static unsigned long long fnv1a(const char*s){ unsigned long long h=146959810393
    source (file or embedded) + arch/defs and hash it. Same value as build_module,
    so the supervisor can compare it to each worker's READY kern= handshake. */
 static void kernel_source_key(const char*cu_path,char*out,size_t outn){
-  const char *arch="--gpu-architecture=compute_120"; const char*def=getenv("CRACK_DEF");
+  const char*def=getenv("CRACK_DEF");   /* arch-INDEPENDENT: matches build_module's g_ptx_key */
   char *src=inline_includes(k_slurp(cu_path),cu_path);
-  snprintf(out,outn,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0)); free(src); }
+  snprintf(out,outn,"%llx",fnv1a(src)^(def?fnv1a(def):0)); free(src); }
 static void build_module(const char *cu_path){
   if(g_mod) return;   /* idempotent: a persistent worker builds its context once */
-  const char *arch="--gpu-architecture=compute_120";
+  /* Target the ACTUAL device's compute capability (portable across GPUs: compute_86
+     on a 3060 Ti, compute_120 on a 5090) instead of a hardcoded arch. NVRTC emits PTX
+     for this virtual arch; the driver JITs it to the matching native sm. */
+  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,g_device)); g_dev=dev;
+  char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
+  cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
+  cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
+  char arch[48]; snprintf(arch,sizeof arch,"--gpu-architecture=compute_%d%d",M,m);
   const char*mr=getenv("CRACK_MAXREG");
   const char*def=getenv("CRACK_DEF");   /* e.g. -DSHA512_UNROLL16 for A/B experiments */
   char *src=inline_includes(k_slurp(cu_path),cu_path);
   /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
      cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
   char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0));
-  snprintf(g_ptx_key,sizeof g_ptx_key,"%s",key);   /* kernels-hash for the worker handshake */
+  /* handshake key is arch-INDEPENDENT (source only): a mixed-GPU hive runs the same
+     source to the same canonical ranks, so it must not self-refuse on differing arch.
+     The PTX cache filename (key, above) keeps arch so different-arch PTX never collide. */
+  snprintf(g_ptx_key,sizeof g_ptx_key,"%llx",fnv1a(src)^(def?fnv1a(def):0));
   char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_ptx_%s.ptx",key);
   char *ptx=0; FILE*cf=fopen(cpath,"rb");
   if(cf && !getenv("CRACK_NOCACHE")){
@@ -179,11 +195,7 @@ static void build_module(const char *cu_path){
     char tpath[300]; snprintf(tpath,sizeof tpath,"%s.tmp.%d",cpath,(int)getpid());
     FILE*wf=fopen(tpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); if(rename(tpath,cpath)) unlink(tpath); }
   }
-  CUdevice dev; CU(cuInit(0)); CU(cuDeviceGet(&dev,g_device)); g_dev=dev;
-  char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
-  cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
-  cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
-  CU(cuCtxCreate(&g_ctx,0,dev));
+  CU(cuCtxCreate(&g_ctx,0,dev));   /* dev/name/M/m already queried above for the arch */
   { CUjit_option jopt[1]; void*jval[1]; int njit=0;
     if(mr){ jopt[njit]=CU_JIT_MAX_REGISTERS; jval[njit]=(void*)(size_t)atoi(mr); njit++;
       fprintf(stderr,"(JIT max registers = %s)\n",mr); }
@@ -195,7 +207,7 @@ static void build_module(const char *cu_path){
       void*a[]={&tbl}; CU(cuLaunchKernel(gi,1,1,1,1,1,1,0,0,a,0)); CU(cuCtxSynchronize());
       CUdeviceptr sym; size_t sz; if(cuModuleGetGlobal(&sym,&sz,g_mod,"d_comb")==CUDA_SUCCESS) CU(cuMemcpyHtoD(sym,&tbl,sizeof tbl));
     } }
-  fprintf(stderr,"device %d: %s (sm_%d%d), NVRTC13->compute_120 PTX->sm_120\n",g_device,name,M,m);
+  fprintf(stderr,"device %d: %s (sm_%d%d), NVRTC->compute_%d%d PTX->sm_%d%d\n",g_device,name,M,m,M,m,M,m);
   if(getenv("KERN_INFO")){
     const char*ks[]={"g_crack_pass","g_crack_addr","g_crack"};
     for(int i=0;i<3;i++){ CUfunction f; if(cuModuleGetFunction(&f,g_mod,ks[i])!=CUDA_SUCCESS) continue;
@@ -240,7 +252,7 @@ static void prog_hdr(Prog*P,const char*mode,const char*target,const char*pattern
     fprintf(P->csv,"# --- resumed: from swept=%llu (global index %llu) ts_ms=%.0f ---\n",
       g_swept_base, g_orig_start+g_swept_base, now_s()*1000.0); fflush(P->csv); return; }
   /* explicit, one-per-line "# key: value" so --resume can reconstruct the run */
-  fprintf(P->csv,"# bip39rxcrack progress log\n# engine: cuda NVRTC13->compute_120->sm_120  device: RTX 5090\n");
+  fprintf(P->csv,"# bip39rxcrack progress log\n# engine: cuda NVRTC (arch auto-detected from the device)\n");
   fprintf(P->csv,"# mode: %s\n",mode);
   fprintf(P->csv,"# input_kind: %s\n# wp: %s\n# pp: %s\n",g_input_kind?g_input_kind:"",g_wp?g_wp:"",g_pp?g_pp:"");
   fprintf(P->csv,"# target_kind: %s\n# target: %s\n# path: %s\n",g_target_kind?g_target_kind:"",target?target:"",path?path:"");
@@ -2515,9 +2527,9 @@ static void usage(void){
    "  (--miss-gate: prove missing-word/[:Nth:] unrank index == librxe canonical rank)\n");
 }
 int main(int argc,char**argv){
-  /* NVRTC 13 dlopens libnvrtc-builtins.so.13.x via LD_LIBRARY_PATH; ensure it's
-     set (re-exec once so the loader picks it up at startup). */
-  { const char *nl="/usr/local/cuda-13.2/lib64"; const char *cur=getenv("LD_LIBRARY_PATH");
+  /* NVRTC dlopens its libnvrtc-builtins.so via LD_LIBRARY_PATH; ensure NVRTC_LIBDIR
+     is on it (re-exec once so the loader picks it up at startup). */
+  { const char *nl=NVRTC_LIBDIR; const char *cur=getenv("LD_LIBRARY_PATH");
     if(!cur || !strstr(cur,nl)){ char buf[4096]; snprintf(buf,sizeof buf,"%s%s%s",nl,cur?":":"",cur?cur:"");
       setenv("LD_LIBRARY_PATH",buf,1); execv("/proc/self/exe",argv); /* falls through on failure */ } }
   const char *words=0,*xpub=0,*tcc_hex=0,*rankarg=0,*cu="cuda/crack_kernels.cu"; int kernel_key=0;
