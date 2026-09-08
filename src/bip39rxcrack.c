@@ -2202,14 +2202,25 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   unsigned long long f1bits=(unsigned long long)f1b*8ull;
   int k1 = classic1 ? classic_optk(f1bits, n_hint?n_hint:1500000000ULL) : (int)BLOOM_K;   /* classic filter1 picks its own k */
   const char*f1kind = classic1 ? "classic (GPU)" : "blocked (GPU)";
-  uint32_t *f1=calloc(f1b,1); uint8_t *f2=calloc(f2b,1);
-  if(!f1||!f2){ fprintf(stderr,"oom (filters %.2f GiB)\n",(double)(f1b+f2b)/1073741824.0); return 2; }
+  /* mmap the OUTPUT and build the filters IN PLACE: ftruncate to the final size (the map
+     is zero-filled), insert directly into the file-backed region, msync at the end. The
+     kernel pages it to disk, so a build LARGER than RAM works (random inserts thrash past
+     RAM -- possible, not fast). The header sits first; it's written last (n_addrs known
+     only after the stream). Symmetric with --bloom-append, which also mmaps in place. */
+  size_t hdr=sizeof(Blf3Header), total=hdr+f1b+f2b;
+  int ofd=open(outfile,O_RDWR|O_CREAT|O_TRUNC,0644);
+  if(ofd<0){ fprintf(stderr,"cannot create %s\n",outfile); return 2; }
+  if(ftruncate(ofd,(off_t)total)){ fprintf(stderr,"ftruncate %s to %.2f GiB failed\n",outfile,(double)total/1073741824.0); close(ofd); return 2; }
+  void*obase=mmap(0,total,PROT_READ|PROT_WRITE,MAP_SHARED,ofd,0); close(ofd);
+  if(obase==MAP_FAILED){ fprintf(stderr,"mmap %s (%.2f GiB) failed\n",outfile,(double)total/1073741824.0); return 2; }
+  uint32_t *f1=(uint32_t*)((uint8_t*)obase+hdr);
+  uint8_t  *f2=(uint8_t*)obase+hdr+f1b;
   if(n_hint){ double fpr1=classic1?classic_fpr(f1bits,n_hint,k1):blf_fpr(nb1,n_hint); double efpr0=fpr1*classic_fpr((unsigned long long)f2b*8,n_hint,k2);
     fprintf(stderr,"bloom-build: filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d (host cull), est FPR ~%.1e (VERIFY with --bloom-stat), streaming...\n",
             (double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2,efpr0); }
   else fprintf(stderr,"bloom-build: filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d (host cull), streaming...\n",
             (double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2);
-  FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); free(f1); free(f2); return 2; }
+  FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); munmap(obase,total); unlink(outfile); return 2; }
   long n=0,bad=0,skip_wsh=0,skip_other=0; uint32_t purposes[8]; int npurp=0; char line[256];
   double t0=now_s(),tlast=t0;   /* progress: rate + elapsed */
   g_decode_quiet=1;   /* silence per-line errors; we count + categorize instead */
@@ -2228,19 +2239,19 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   if(f!=stdin) fclose(f);
   g_decode_quiet=0;
   if(of){ fclose(of); if(skip_other) fprintf(stderr,"bloom-build: wrote %ld 'other' unparseable line(s) to %s\n",skip_other,other_file); }
-  if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
+  if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); munmap(obase,total); unlink(outfile); return 2; }
   if(bad) fprintf(stderr,"bloom-build: skipped %ld (%ld native-segwit script / other-witness, not seed-derivable; %ld other)\n",bad,skip_wsh,skip_other);
   if(n_hint && (unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target\n",n,n_hint);
   double fpr1f=classic1?classic_fpr(f1bits,(uint64_t)n,k1):blf_fpr(nb1,(uint64_t)n);
   double efpr=fpr1f*classic_fpr((unsigned long long)f2b*8,(uint64_t)n,k2);
-  FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
-  Blf3Header h; memset(&h,0,sizeof h); h.magic=BLF3_MAGIC; h.version=3; h.nblocks1=nb1; h.f2_log2bytes=(uint32_t)log2b2;
-  h.k1=(uint32_t)k1; h.k2=(uint32_t)k2; h.npurp=(uint32_t)npurp; h.rsv=classic1?1u:0u;
-  for(int i=0;i<npurp;i++) h.purposes[i]=purposes[i];
-  h.n_addrs=(uint64_t)n;
-  fwrite(&h,sizeof h,1,o); fwrite(f1,f1b,1,o); fwrite(f2,f2b,1,o);
-  if(fclose(o)){ fprintf(stderr,"write error %s\n",outfile); return 2; }
-  free(f1); free(f2);
+  /* fill in the header (at the front of the mmap) now that n_addrs + purposes are known,
+     then flush the whole file (filters were written in place during the stream). */
+  Blf3Header*h=(Blf3Header*)obase; memset(h,0,sizeof *h); h->magic=BLF3_MAGIC; h->version=3; h->nblocks1=nb1; h->f2_log2bytes=(uint32_t)log2b2;
+  h->k1=(uint32_t)k1; h->k2=(uint32_t)k2; h->npurp=(uint32_t)npurp; h->rsv=classic1?1u:0u;
+  for(int i=0;i<npurp;i++) h->purposes[i]=purposes[i];
+  h->n_addrs=(uint64_t)n;
+  if(msync(obase,total,MS_SYNC)){ fprintf(stderr,"warning: msync %s failed (changes may not be flushed)\n",outfile); }
+  munmap(obase,total);
   fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d = %.2f GiB, %d purpose(s), est combined FPR ~%.1e -> %s\n",
           n,bad,(double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
   fprintf(stderr,"bloom-build: run `--bloom %s --bloom-stat` to MEASURE the true FPR before trusting it.\n",outfile);
