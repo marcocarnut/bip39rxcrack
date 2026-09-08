@@ -56,6 +56,22 @@ All of these are **rejected cleanly today** (a clear error, never a silent wrong
    a handful, chatty for a box with dozens. A per-machine sub-supervisor (one connection
    per box, local fan-out) is the fix. Deferred — not needed at current scale.
 
+## Build / memory
+
+- **mmap-based filter construction (build filters larger than RAM).** The *only* piece
+  that requires the whole filter in RAM is the BUILD: `build_bloom_file` `calloc`s
+  filter1 + filter2, inserts, then `fwrite`s (peak RAM = full filter size, e.g. 14.5 GiB
+  for a 6.5+8 build). Everything else already `mmap`s and so already works on a filter
+  larger than RAM: `load_bloom_file` maps the `.blf` `PROT_READ, MAP_SHARED` and hands the
+  pointers straight to the crack (filter1 -> VRAM via a sequential `cuMemcpyHtoD` from the
+  map; filter2 host cull reads the map directly) and to `--bloom-stat`'s Monte-Carlo FPR
+  measurement (random probes page-fault through the cache — slow but correct). So the fix
+  is just the build: `ftruncate` the output to its final size, `mmap(MAP_SHARED)` it, and
+  insert into the file-backed region. Caveat: bloom inserts are maximally random (k
+  scattered bytes/address), so past RAM the dirty-page writeback thrashes to disk-random-IO
+  speed — mmap makes oversized builds *possible*, not fast. Not needed on the 256 GiB box;
+  worthwhile for low-RAM hosts or very large filters. (Kiko's observation, 2026-09-08.)
+
 ## EC / performance
 
 - **secp256k1 is correctness-only** — double-and-add `k·G` + a Fermat inverse. A
