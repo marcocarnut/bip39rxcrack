@@ -24,9 +24,9 @@
  * The crack is PBKDF2-bound, so this tests whether blocking bought us anything. */
 __device__ int d_f1_classic=0;
 __device__ int d_f1_k=BLOOM_K;
-__device__ unsigned long long d_f1_mask=0;
+__device__ unsigned long long d_f1_bits=0;   /* classic: TOTAL bit count (arbitrary, modulo) */
 __device__ static inline int f1_probe(const u32 *bloom,const u8 *prog,u32 bmask){
-  return d_f1_classic ? bloom_probe_classic(bloom,prog,d_f1_mask,d_f1_k)
+  return d_f1_classic ? bloom_probe_classic(bloom,prog,d_f1_bits,d_f1_k)
                       : bloom_probe(bloom,prog,bmask); }
 
 /* Bloom variant of derive_address_match: for a SET of targets (a blocked bloom),

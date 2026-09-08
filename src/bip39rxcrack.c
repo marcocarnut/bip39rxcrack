@@ -228,12 +228,12 @@ static void push_f1_cfg(int aset_classic,int aset_k,unsigned int prefilter_nbloc
      so the SAME blocked .blf can be A/B'd as classic to isolate probe cost. */
   int classic = getenv("CRACK_F1_CLASSIC") ? atoi(getenv("CRACK_F1_CLASSIC")) : aset_classic;
   int k = getenv("CRACK_F1_K") ? atoi(getenv("CRACK_F1_K")) : (aset_k?aset_k:(int)BLOOM_K);
-  unsigned long long mask=(unsigned long long)prefilter_nblocks*256ull-1ull;   /* nblocks*32B*8 = total bits */
+  unsigned long long bits=(unsigned long long)prefilter_nblocks*256ull;   /* nblocks*32B*8 = TOTAL bits (modulo) */
   CUdeviceptr s; size_t z;
   if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_classic")==CUDA_SUCCESS) CU(cuMemcpyHtoD(s,&classic,4));
   if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_k")==CUDA_SUCCESS)       CU(cuMemcpyHtoD(s,&k,4));
-  if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_mask")==CUDA_SUCCESS)    CU(cuMemcpyHtoD(s,&mask,8));
-  if(classic) fprintf(stderr,"bloom: filter1 probe = CLASSIC k=%d over %llu bits\n",k,(unsigned long long)prefilter_nblocks*256ull);
+  if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_bits")==CUDA_SUCCESS)    CU(cuMemcpyHtoD(s,&bits,8));
+  if(classic) fprintf(stderr,"bloom: filter1 probe = CLASSIC k=%d over %llu bits\n",k,bits);
 }
 
 /* ------------------------- progress reporting -------------------------- */
@@ -2181,12 +2181,16 @@ static int mode_bloom_sizes(unsigned long long n,double fpr,double gib1,double g
 static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2,const char*other_file,int classic1){
   uint32_t nb1; int log2b2,k2;
   FILE*of=0; if(other_file){ of=fopen(other_file,"w"); if(!of) fprintf(stderr,"warning: cannot write --bloom-other %s (continuing)\n",other_file); }
-  if(gib1>0 && gib2>0){ nb1=gib_to_nblocks(gib1); log2b2=gib_to_log2bytes(gib2);
+  if(gib1>0 && gib2>0){
+    /* classic filter1 is ARBITRARY-size (modulo), so DON'T round to a power of two --
+       size it to fill the card exactly; blocked filter1 must stay pow2 (mask). */
+    nb1 = classic1 ? (uint32_t)(gib1*33554432.0) : gib_to_nblocks(gib1);
+    log2b2=gib_to_log2bytes(gib2);
     k2=classic_optk((unsigned long long)1<<(log2b2+3), n_hint?n_hint:1500000000ULL); }
   else { if(!n_hint){ fprintf(stderr,"--bloom-build needs --bloom-n N (or --bloom-gib G1,G2 for explicit sizes)\n"); return 2; }
     blf3_size(n_hint,fpr,&nb1,&log2b2,&k2); }
   size_t f1b=(size_t)nb1*32u, f2b=(size_t)1<<log2b2;
-  unsigned long long f1bits=(unsigned long long)f1b*8ull, f1mask=f1bits-1ull;
+  unsigned long long f1bits=(unsigned long long)f1b*8ull;
   int k1 = classic1 ? classic_optk(f1bits, n_hint?n_hint:1500000000ULL) : (int)BLOOM_K;   /* classic filter1 picks its own k */
   const char*f1kind = classic1 ? "classic (GPU)" : "blocked (GPU)";
   uint32_t *f1=calloc(f1b,1); uint8_t *f2=calloc(f2b,1);
@@ -2206,7 +2210,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
       if(!strncmp(s,"bc1",3)) skip_wsh++; else { skip_other++; if(skip_other<=5) fprintf(stderr,"  skip: %s\n",s); if(of) fprintf(of,"%s\n",s); }
       bad++; continue; }
     (void)pl;
-    if(classic1) bloom_insert_classic(f1,pr,f1mask,k1); else bloom_insert(f1,pr,nb1-1);
+    if(classic1) bloom_insert_classic(f1,pr,f1bits,k1); else bloom_insert(f1,pr,nb1-1);
     classic_insert(f2,pr,log2b2,k2);         /* filter 2 = classic over sha256(program) */
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
@@ -2319,7 +2323,7 @@ static int mode_bloom_stat(const char*file){
     uint8_t pr[32]; memset(pr,0,32);
     for(int b=0;b<20;b+=8){ s+=0x9e3779b97f4a7c15ULL; unsigned long long z=s; z=(z^(z>>30))*0xbf58476d1ce4e5b9ULL; z=(z^(z>>27))*0x94d049bb133111ebULL; z^=z>>31;
       for(int q=0;q<8&&b+q<20;q++) pr[b+q]=(uint8_t)(z>>(8*q)); }
-    int h1=bloom_probe(A.prefilter,pr,m1);
+    int h1 = A.f1_classic ? bloom_probe_classic(A.prefilter,pr,(f1mask_stat+1),A.f1_k) : bloom_probe(A.prefilter,pr,m1);
     int h2; if(A.f2_classic) h2=classic_probe(f2bytes,pr,A.f2_log2bytes,A.f2_k2);
     else { uint8_t sh[32]; sha256_host(pr,32,sh); h2=bloom_probe(A.host_filter,sh,m2); }
     if(h1) f1++;
@@ -2350,7 +2354,7 @@ static int mode_bloom_check(const char*file,const char*addrs){
   char *dup=strdup(addrs),*save=0;
   for(char*a=strtok_r(dup,",",&save); a; a=strtok_r(0,",",&save)){
     uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(a,pr,&pl,&pu)){ fprintf(stderr,"%s: bad address\n",a); continue; }
-    int h1 = A.f1_classic ? bloom_probe_classic(A.prefilter,pr,(unsigned long long)A.prefilter_nblocks*256ull-1ull,A.f1_k)
+    int h1 = A.f1_classic ? bloom_probe_classic(A.prefilter,pr,(unsigned long long)A.prefilter_nblocks*256ull,A.f1_k)
                           : bloom_probe(A.prefilter,pr,A.prefilter_nblocks-1);
     int h2; if(A.f2_classic) h2=classic_probe((const uint8_t*)A.host_filter,pr,A.f2_log2bytes,A.f2_k2);
     else { uint8_t sh[32]; sha256_host(pr,32,sh); h2=bloom_probe(A.host_filter,sh,A.host_filter_nblocks-1); }

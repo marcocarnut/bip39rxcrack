@@ -60,12 +60,18 @@ BLOOM_FN unsigned long long bloom_ab_seed(const unsigned char *P, unsigned long 
   unsigned long long a=0,b=0; int i;
   for(i=0;i<8;i++){ a|=(unsigned long long)P[i]<<(8*i); b|=(unsigned long long)P[8+i]<<(8*i); }
   *bo=b|1ull; return a; }
-BLOOM_FN void bloom_insert_classic(unsigned int *filter,const unsigned char *P,unsigned long long bits_mask,int k){
+/* `bits` is the TOTAL bit count -- ARBITRARY (not power of two): the positions are
+   p_i = (a + i*b) mod bits, accumulated (p += step, conditional subtract) so it never
+   overflows and needs no 64-bit modulo per probe. Arbitrary size lets filter1 fill the
+   card exactly; the probe cost is irrelevant (the crack is PBKDF2-bound). */
+BLOOM_FN void bloom_insert_classic(unsigned int *filter,const unsigned char *P,unsigned long long bits,int k){
   unsigned char *fb=(unsigned char*)filter; unsigned long long b,a=bloom_ab_seed(P,&b);
-  for(int i=0;i<k;i++){ unsigned long long p=(a+(unsigned long long)i*b)&bits_mask; fb[p>>3]|=(unsigned char)(1u<<(p&7)); } }
-BLOOM_FN int bloom_probe_classic(const unsigned int *filter,const unsigned char *P,unsigned long long bits_mask,int k){
+  unsigned long long p=a%bits, step=b%bits;
+  for(int i=0;i<k;i++){ fb[p>>3]|=(unsigned char)(1u<<(p&7)); p+=step; if(p>=bits)p-=bits; } }
+BLOOM_FN int bloom_probe_classic(const unsigned int *filter,const unsigned char *P,unsigned long long bits,int k){
   const unsigned char *fb=(const unsigned char*)filter; unsigned long long b,a=bloom_ab_seed(P,&b);
-  for(int i=0;i<k;i++){ unsigned long long p=(a+(unsigned long long)i*b)&bits_mask; if(!((fb[p>>3]>>(p&7))&1u)) return 0; } return 1; }
+  unsigned long long p=a%bits, step=b%bits;
+  for(int i=0;i<k;i++){ if(!((fb[p>>3]>>(p&7))&1u)) return 0; p+=step; if(p>=bits)p-=bits; } return 1; }
 
 /* pick nblocks (power of two) for n keys at ~bits_per_key; filter = nblocks*32 B. */
 BLOOM_FN unsigned int bloom_nblocks(unsigned long long n, double bits_per_key){
