@@ -109,6 +109,16 @@ effectively zero spurious hits across a trillion-candidate sweep. `--bloom FILE`
 it (filter 1 → each GPU, filter 2 paged on the host), derives each candidate under a
 purpose list (mixed script types), and reports the matched address + full path.
 
+**`--classic1`** builds filter 1 as a *classic* (non-blocked, arbitrary-size) bloom instead.
+The GPU probe cost is hidden behind PBKDF2, so blocking bought nothing (measured: blocked ==
+classic == no-bloom Mc/s), while a classic filter has a far better FPR per byte and can be
+**sized to fill your card**: a ~6.5 GiB classic filter 1 + 8 GiB classic filter 2 gives a
+**measured combined FPR ~2.8e-18 and fits an 8 GiB card** — where the 16 GiB blocked build
+would not. On a big card you can drop filter 2 entirely and hold one large classic filter 1 in
+VRAM. **`--bloom-append LIST FILE`** inserts new addresses into an existing `.blf` in place
+(bloom is additive → O(new), no rebuild) — for daily new-address deltas; FPR only rises, so
+rebuild when it drifts. (Build and append both `mmap` the output, so a filter can exceed RAM.)
+
 **Always `--bloom FILE --bloom-stat` after building** — it *measures* the true
 per-filter and combined FPR (a blocked bloom's real rate is far above the naive
 `fill^k`; the estimator was wrong once, and `--bloom-stat` is the ground truth).
@@ -146,10 +156,13 @@ Gate suite (RTX 5090, native sm_120), all byte-exact, zero mismatches:
 
 ## Requirements & build
 
-- An **NVIDIA GPU**. Blackwell (sm_120, e.g. RTX 5090) needs the **CUDA 12.8+/13**
-  NVRTC toolkit — kernels are NVRTC-compiled at runtime to native `compute_120`
-  and the driver JITs the PTX to sm_120. (Older architectures build with their
-  matching toolkit; paths are set in the `Makefile`.)
+- An **NVIDIA GPU** — anything from an 8 GiB Ampere card (e.g. RTX 3060 Ti, sm_86) up to a
+  5090 (Blackwell, sm_120). The kernel **arch is auto-detected** at runtime and compiled to
+  **native SASS via NVRTC** (`nvrtcGetCUBIN`), loaded with **no driver JIT** — the same source
+  builds for whatever card is present. You need an **NVRTC toolkit new enough for your GPU**
+  (CUDA 12.5 covers Ampere; a 5090 needs 12.8+/13); set `CUDA_HOME`/`NVRTC_HOME` in the
+  `Makefile` or override on the `make` line. First run does a one-time compile (cached as a
+  `.cubin`, with a heads-up message since it can take a few minutes); later runs start in ~1s.
 - **Node 18/20** — the gate vector generators run the reseed39 JS oracle.
 - **librxe** from the sibling [`rxe`](https://github.com/marcocarnut/rxe) repo
   (`RXE_DIR=../rxe`) and a **reseed39** checkout for the oracle (`RESEED39_DIR`).
@@ -174,7 +187,8 @@ set); `--nth` / `--no-nth`; `--no-compact` (compaction is on by default); shardi
 `--start --count --limit --shards N --order`; `--rank` (librxe index of an
 arrangement); `--resume LOG` (continue a killed run); multi-GPU `--device D`,
 `--devices 0,1` / `--gpus N`, `--print-total`; SSH hive `--hosts`, `--remote-bin`,
-`--ssh`; bloom tooling `--bloom-build`, `--bloom-stat`, `--bloom-sizes`,
+`--ssh`; bloom tooling `--bloom-build` (`--classic1` for a card-filling classic filter1),
+`--bloom-append` (incremental updates, no rebuild), `--bloom-stat`, `--bloom-sizes`,
 `--bloom-check`, `--bloom-key` (`.blf` content hash); `--kernel-key` (kernels-version
 hash — both let you check hive hosts are in sync). `bip39rxcrack -h` lists them all.
 
@@ -271,6 +285,11 @@ The full 479M-permutation example recovers in **~23 s** by default (~5 min with
 (10M) passphrase deep-winner is found in ~7 s. These are **per-GPU** figures;
 `--devices` scales them linearly (measured **1.99×** on 2× RTX 5090).
 
+It's **PBKDF2-bound and scales with the card**: the same kernels run **~0.26 Mcand/s at
+`--gap 1` on an 8 GiB RTX 3060 Ti (sm_86)** — about **5.3× slower** than a 5090, matching the
+hardware (SM count × clock). The classic-filter option exists precisely so the "any funded
+address" mode also fits an 8 GiB card, not just a 32 GiB one.
+
 **What moves the needle:** at `--gap 1` the tool is **PBKDF2-bound** (SHA-512
 dominates); at `--gap > 1` the extra secp256k1 derivations per seed make EC a real
 factor too. The biggest wins, in order:
@@ -314,8 +333,9 @@ gate/gen_*.js, gate.c,     oracle-driven vector generators + gate harnesses
 
 ## More docs
 
-- `docs/BLOOM_PLAN.md` — the "any funded address" dual-bloom (blocked GPU prefilter +
-  classic host cull), the FPR analysis, and `--bloom-*` tooling.
+- `docs/BLOOM_PLAN.md` — the "any funded address" bloom (blocked or classic GPU filter +
+  classic host cull), the FPR analysis, the sizing & horizontal-scaling math, and `--bloom-*`
+  tooling.
 - `docs/PASSPHRASE_PATTERNS.md` — the passphrase pattern grammar (classes / POSIX /
   alternation / dictionaries) and the mixed-radix on-GPU unranking.
 - `docs/WORKQUEUE_HIVE_PLAN.md` — the fine-shard work-queue and the SSH hive.
