@@ -72,6 +72,21 @@ All of these are **rejected cleanly today** (a clear error, never a silent wrong
   speed — mmap makes oversized builds *possible*, not fast. Not needed on the 256 GiB box;
   worthwhile for low-RAM hosts or very large filters. (Kiko's observation, 2026-09-08.)
 
+- **`--bloom-append LIST FILE` (incremental updates, no full rebuild).** A bloom is
+  additive, so appending new addresses is just inserting them into the existing filter:
+  `mmap` the `.blf` read-write, for each new address insert into filter1 (blocked or
+  classic per the header's `rsv`/`k1`) + filter2, add any new purpose, bump `n_addrs`,
+  update the header, `msync`. O(new addresses), not O(total) -- turns the 30-60 min
+  rebuild into a few-second daily update (the address source publishes daily new-address
+  lists). Caveat intrinsic to bloom: bits only turn on, so every append monotonically
+  raises the FPR; size with headroom, re-measure with `--bloom-stat`, and rebuild from
+  scratch once it drifts too far. Note it changes the file content hash, so a hive must
+  re-sync the `.blf`. (Kiko's idea, 2026-09-08.)
+- **Build/append progress report.** `build_bloom_file` prints only a bare `\r` count every
+  67M addresses -- no rate or ETA, and it's easily lost. Add elapsed + addresses/s (+ a
+  periodic newline so it survives in logs). More useful once `--bloom-append` exists (watch
+  the daily delta land).
+
 ## EC / performance
 
 - **secp256k1 is correctness-only** — double-and-add `k·G` + a Fermat inverse. A
