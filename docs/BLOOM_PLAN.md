@@ -86,6 +86,44 @@ high fill, ~3× optimistic at low fill — vs 2600× before), but the ground tru
   filter at the same fill — ~2000× better per bit). An 8 GiB classic cull (k=32) ≈ 2e-10, so
   **combined ≈ 5.7e-6 × 2e-10 ≈ 1e-15 at only 16 GiB total** (8 GiB GPU + 8 GiB host).
 
+## FPR sizing & horizontal scaling — how big for a long / huge run
+
+The one relationship that drives all sizing: a **classic** bloom at optimal k needs
+**bits/key ≈ 2.08 · (−ln FPR)** (equivalently `FPR ≈ e^(−0.480 · bits/key)`). Pick a target
+FPR so the *expected false positives over the whole run* stays small: `E[FP] ≈ N_probes ·
+FPR`, where `N_probes ≈ (throughput × runtime) × (addresses probed per candidate:
+gap·change·accounts·purposes)`. For a ~0.1 % chance of *any* FP, target `E[FP] ≈ 1e-3`,
+i.e. `FPR ≈ 1e-3 / N_probes`.
+
+Worked cases (filter sized for **2e9** keys — headroom over today's ~1.5e9):
+
+| run | target FPR | bits/key | standalone classic | combined (÷ a ~1e-8 GPU filter1) |
+|-----|-----------|----------|--------------------|----------------------------------|
+| 1 machine (~1.5 Mc/s), 1 year | ~2e-17 | 80  | 18.6 GiB | ~9.7 GiB |
+| 8,000,000 GPUs (5090s), 1 year | ~2.9e-24 | 113 | 26.3 GiB | ~17.3 GiB |
+
+**Why it scales so well:** `bits/key ∝ ln(throughput)` — every ~2.7× of compute adds only
+~2.08 bits/key. Going from one machine to ~8 million GPUs (≈7 orders of magnitude) moves
+bits/key from 80 to just 113 (18.6 → 26.3 GiB). Horizontal scaling is essentially *free* on
+the filter side; you can point the world's compute at this and the filter barely grows.
+
+**High-end cards → the filter lives entirely on the GPU (no host cull).** The arbitrary-size
+classic filter1 (modulo, fill-the-card) means on a 32 GiB card a ~28 GiB classic filter1 gives
+FPR ≈ 9e-26 *standalone* — under even the 8M-GPU-year requirement — so filter2 becomes
+unnecessary at that scale. The dual split (small blocked/classic GPU filter1 + big classic host
+filter2) is really only needed to fit a **smaller card** like an 8 GiB 3060 Ti; on a 5090 / RTX
+6000-class card you'd just size one big classic filter1 to fill VRAM. We keep the split anyway —
+supporting as much hardware as possible is worth it.
+
+**Append degrades FPR super-linearly** (`FPR_new = FPR_old^(n_old/n_new)`), so for a long run
+**build a fresh filter sized for the run's target capacity**, don't grow into it: e.g. appending
+1.5e9 → 2e9 would take today's 2.8e-18 to ~7e-14, and even daily deltas compound over a year.
+`--bloom-append` is for small incremental updates; a capacity bump is a rebuild.
+
+(Sanity for today: the current `alladdrs_classic.blf` measures **2.82e-18 combined at 1.5e9**,
+already ~7× under the single-machine-year target — a single box is covered for a year now; the
+2-billion rebuild is for when you want the headroom.)
+
 ## The cull (host-side)
 
 > **Update (shipped):** the `--bloom` prebuilt path no longer keeps a sorted exact set.
