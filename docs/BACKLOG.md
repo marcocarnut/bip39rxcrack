@@ -58,19 +58,14 @@ All of these are **rejected cleanly today** (a clear error, never a silent wrong
 
 ## Build / memory
 
-- **mmap-based filter construction (build filters larger than RAM).** The *only* piece
-  that requires the whole filter in RAM is the BUILD: `build_bloom_file` `calloc`s
-  filter1 + filter2, inserts, then `fwrite`s (peak RAM = full filter size, e.g. 14.5 GiB
-  for a 6.5+8 build). Everything else already `mmap`s and so already works on a filter
-  larger than RAM: `load_bloom_file` maps the `.blf` `PROT_READ, MAP_SHARED` and hands the
-  pointers straight to the crack (filter1 -> VRAM via a sequential `cuMemcpyHtoD` from the
-  map; filter2 host cull reads the map directly) and to `--bloom-stat`'s Monte-Carlo FPR
-  measurement (random probes page-fault through the cache — slow but correct). So the fix
-  is just the build: `ftruncate` the output to its final size, `mmap(MAP_SHARED)` it, and
-  insert into the file-backed region. Caveat: bloom inserts are maximally random (k
-  scattered bytes/address), so past RAM the dirty-page writeback thrashes to disk-random-IO
-  speed — mmap makes oversized builds *possible*, not fast. Not needed on the 256 GiB box;
-  worthwhile for low-RAM hosts or very large filters. (Kiko's observation, 2026-09-08.)
+- **mmap-based filter construction — DONE (2026-09-08).** `build_bloom_file` now
+  `ftruncate`s the output to its final size, `mmap(MAP_SHARED)`s it, inserts into the
+  file-backed region, and `msync`s (header written last) — no longer `calloc`s the whole
+  filter, so a build LARGER than RAM works (the kernel pages it to disk). Symmetric with
+  `--bloom-append`, which already mmaps in place. Caveat stands: bloom inserts are
+  maximally random, so past RAM the dirty-page writeback thrashes to disk-random-IO speed
+  — possible, not fast. (Every other path already mmapped the `.blf`, so loading, cracking,
+  `--bloom-stat`, and append already worked on filters larger than RAM.)
 
 - **`--bloom-append LIST FILE` (incremental updates, no full rebuild).** A bloom is
   additive, so appending new addresses is just inserting them into the existing filter:
