@@ -39,7 +39,7 @@ RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 BIN = phase1gate
 CRACK = bip39rxcrack
 
-.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e pass-alt-e2e hive-e2e
+.PHONY: all gate vectors build cracker clean miss-gate multigpu-gate addr-e2e workqueue-gate missing-e2e bloom-selftest bloom-e2e xpubs-e2e pass-e2e account-e2e pass-pattern-e2e pass-alt-e2e hive-e2e bloom-classic-e2e
 all: build cracker
 
 # librxe.a comes from the sibling rxe repo (built there on demand).
@@ -74,6 +74,11 @@ bloom-e2e: $(CRACK)
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_missing.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_mixed.js
 	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_file.js
+
+# CLASSIC (non-blocked, modulo arbitrary-size) filter1 + --bloom-append: build a classic
+# filter without the winner -> NOT FOUND; append the winner -> FOUND at the librxe rank.
+bloom-classic-e2e: $(CRACK)
+	@RESEED39_DIR=$(RESEED39_DIR) node gate/e2e_bloom_classic.js
 
 # multi-xpub via a chaincode bloom (EC-free): winner xpub among a decoy -> FOUND at rank
 xpubs-e2e: $(CRACK)

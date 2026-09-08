@@ -2211,6 +2211,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
             (double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2);
   FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); free(f1); free(f2); return 2; }
   long n=0,bad=0,skip_wsh=0,skip_other=0; uint32_t purposes[8]; int npurp=0; char line[256];
+  double t0=now_s(),tlast=t0;   /* progress: rate + elapsed */
   g_decode_quiet=1;   /* silence per-line errors; we count + categorize instead */
   while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
     char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
@@ -2223,7 +2224,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
     classic_insert(f2,pr,log2b2,k2);         /* filter 2 = classic over sha256(program) */
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
-    n++; if((n&0x3FFFFFF)==0) fprintf(stderr,"  ... %ld addresses\r",n); }
+    n++; if((n&0xFFFFF)==0){ double now=now_s(); if(now-tlast>=2.0){ fprintf(stderr,"  ... %ld addresses inserted (%.2fM/s, %.0fs elapsed)\r",n,n/(now-t0)/1e6,now-t0); fflush(stderr); tlast=now; } } }
   if(f!=stdin) fclose(f);
   g_decode_quiet=0;
   if(of){ fclose(of); if(skip_other) fprintf(stderr,"bloom-build: wrote %ld 'other' unparseable line(s) to %s\n",skip_other,other_file); }
@@ -2243,6 +2244,50 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d = %.2f GiB, %d purpose(s), est combined FPR ~%.1e -> %s\n",
           n,bad,(double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
   fprintf(stderr,"bloom-build: run `--bloom %s --bloom-stat` to MEASURE the true FPR before trusting it.\n",outfile);
+  return 0;
+}
+/* --bloom-append LIST FILE: insert new addresses into an EXISTING BLF3 in place. A
+   bloom is additive, so this just ORs more bits -- O(new), no rebuild. mmap the file
+   read-write, insert into filter1 (classic or blocked per the header) + filter2, bump
+   n_addrs, msync. LIST='-' reads stdin, so `zcat daily.gz | ... --bloom-append - f.blf`.
+   Caveat: bits only turn ON, so every append raises the FPR -- re-measure with
+   --bloom-stat and rebuild from scratch once it drifts. Also changes the file's content
+   hash, so a hive must re-copy the .blf. */
+static int build_bloom_append(const char*listfile,const char*blffile){
+  int fd=open(blffile,O_RDWR); if(fd<0){ fprintf(stderr,"cannot open %s (read-write)\n",blffile); return 2; }
+  struct stat st; if(fstat(fd,&st)){ close(fd); return 2; } size_t sz=(size_t)st.st_size;
+  void*base=mmap(0,sz,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0); close(fd);
+  if(base==MAP_FAILED){ fprintf(stderr,"mmap %s read-write failed\n",blffile); return 2; }
+  if(*(uint32_t*)base!=BLF3_MAGIC){ fprintf(stderr,"%s: not a BLF3 filter -- append supports BLF3 only (rebuild it)\n",blffile); munmap(base,sz); return 2; }
+  Blf3Header*h=(Blf3Header*)base; int f1_classic=(h->rsv==1);
+  size_t f1b=(size_t)h->nblocks1*32u;
+  uint32_t*f1=(uint32_t*)((uint8_t*)base+sizeof(Blf3Header));
+  uint8_t *f2=(uint8_t*)base+sizeof(Blf3Header)+f1b;
+  unsigned long long f1bits=(unsigned long long)f1b*8ull;
+  int k1=(int)h->k1, k2=(int)h->k2;
+  uint32_t purposes[8]; int npurp=(int)h->npurp; for(int i=0;i<npurp&&i<8;i++) purposes[i]=h->purposes[i];
+  fprintf(stderr,"bloom-append: %s (filter1 %.2f GiB %s k1=%d + filter2 classic k=%d, %llu addresses) <- appending %s ...\n",
+          blffile,(double)f1b/1073741824.0,f1_classic?"classic":"blocked",k1,k2,(unsigned long long)h->n_addrs,
+          (!strcmp(listfile,"-"))?"stdin":listfile);
+  FILE*f=(!strcmp(listfile,"-"))?stdin:fopen(listfile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",listfile); munmap(base,sz); return 2; }
+  long n=0,bad=0; char line[256]; double t0=now_s(),tlast=t0; g_decode_quiet=1;
+  while(fgets(line,sizeof line,f)){ char*s=line; while(*s==' '||*s=='\t')s++;
+    char*e=s+strlen(s); while(e>s&&(e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e=0; if(!*s) continue;
+    uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(s,pr,&pl,&pu)){ bad++; continue; } (void)pl;
+    if(f1_classic) bloom_insert_classic(f1,pr,f1bits,k1); else bloom_insert(f1,pr,h->nblocks1-1);
+    classic_insert(f2,pr,h->f2_log2bytes,k2);
+    int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
+    if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
+    n++; if((n&0xFFFFF)==0){ double now=now_s(); if(now-tlast>=1.0){ fprintf(stderr,"  ... +%ld appended (%.0f/s)\r",n,n/(now-t0)); fflush(stderr); tlast=now; } } }
+  if(f!=stdin) fclose(f);
+  g_decode_quiet=0;
+  if(!n){ fprintf(stderr,"\nbloom-append: no new valid addresses (%ld skipped); filter unchanged\n",bad); munmap(base,sz); return 0; }
+  h->n_addrs += (uint64_t)n; h->npurp=(uint32_t)npurp; for(int i=0;i<npurp;i++) h->purposes[i]=purposes[i];
+  unsigned long long total=(unsigned long long)h->n_addrs;
+  if(msync(base,sz,MS_SYNC)) fprintf(stderr,"warning: msync %s failed (changes may not be flushed)\n",blffile);
+  munmap(base,sz);
+  fprintf(stderr,"\nbloom-append: +%ld addresses (%ld skipped) in %.0fs -> %llu total in %s.\n",n,bad,now_s()-t0,total,blffile);
+  fprintf(stderr,"bloom-append: FPR rose (bits only turn on) -- re-measure with `--bloom %s --bloom-stat`; rebuild when it drifts. The file content hash changed (hive must re-copy).\n",blffile);
   return 0;
 }
 /* mmap a .blf: filter1 -> GPU (prefilter); filter2 -> host cull (BLF3=classic,
@@ -2505,6 +2550,12 @@ static void usage(void){
    "                          --fpr P      target combined false-positive rate (default 1e-12)\n"
    "                          --bloom-gib G1,G2  explicit filter1,filter2 sizes in GiB (with --bloom-n)\n"
    "                          --bloom-other FILE  tee unparseable 'other' (non-bc1) lines to FILE\n"
+   "                          --classic1   build filter1 CLASSIC (non-blocked, arbitrary-size):\n"
+   "                            better FPR at the same size + fits a smaller card (probe cost is\n"
+   "                            hidden by PBKDF2). Size it with --bloom-gib to fill your VRAM.\n"
+   "  --bloom-append IN FILE  insert new addresses (IN, '-'=stdin) into an existing BLF3 in place\n"
+   "                          -- O(new), no rebuild (bloom is additive). FPR only rises; re-measure\n"
+   "                          with --bloom-stat, rebuild when it drifts. e.g. daily new-address lists.\n"
    "  --bloom FILE --bloom-stat   MEASURE a .blf's true per-filter + combined FPR (no GPU).\n"
    "                              ALWAYS run this after a build -- the sizing est is approximate.\n"
    "  --bloom FILE --bloom-check A[,B..]  probe address(es) through filter1/filter2 separately\n"
@@ -2583,6 +2634,7 @@ int main(int argc,char**argv){
   const char *addresses=0,*addresses_file=0;   /* bloom target set */
   const char *xpubs=0,*xpubs_file=0;            /* xpub (chaincode) bloom set */
   const char *bloom_file=0,*bbuild_in=0,*bbuild_out=0;  /* prebuilt address bloom */
+  const char *bappend_in=0,*bappend_file=0;             /* --bloom-append: incremental insert into an existing .blf */
   unsigned long long bloom_n=0; double bloom_fpr=1e-12;   /* --bloom-build sizing */
   double bloom_gib1=0, bloom_gib2=0;                       /* --bloom-gib G1,G2 explicit sizes */
   const char *bloom_other=0;                               /* --bloom-other FILE: dump 'other' skips */
@@ -2630,6 +2682,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--bloom-key")) bloom_key=1;
     else if(!strcmp(argv[i],"--bloom-check")&&i+1<argc) bloom_check=argv[++i];
     else if(!strcmp(argv[i],"--bloom-build")&&i+2<argc){ bbuild_in=argv[++i]; bbuild_out=argv[++i]; }
+    else if(!strcmp(argv[i],"--bloom-append")&&i+2<argc){ bappend_in=argv[++i]; bappend_file=argv[++i]; }
     else if(!strcmp(argv[i],"--bloom-n")&&i+1<argc) bloom_n=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--fpr")&&i+1<argc){ double v=atof(argv[++i]); if(v>0&&v<1) bloom_fpr=v; }
     else if(!strcmp(argv[i],"--bloom-gib")&&i+1<argc){ sscanf(argv[++i],"%lf,%lf",&bloom_gib1,&bloom_gib2); }
@@ -2759,6 +2812,7 @@ int main(int argc,char**argv){
   /* gate/util modes need no pattern */
   if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
   if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2,bloom_other,bloom_classic1); }
+  if(bappend_file){ return build_bloom_append(bappend_in,bappend_file); }
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);
