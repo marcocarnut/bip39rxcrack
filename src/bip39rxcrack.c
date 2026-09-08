@@ -163,32 +163,34 @@ static void build_module(const char *cu_path){
   char name[128]; int M=0,m=0; cuDeviceGetName(name,sizeof name,dev);
   cuDeviceGetAttribute(&M,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev);
   cuDeviceGetAttribute(&m,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev);
-  char arch[48]; snprintf(arch,sizeof arch,"--gpu-architecture=compute_%d%d",M,m);
+  char arch[48]; snprintf(arch,sizeof arch,"--gpu-architecture=sm_%d%d",M,m);   /* REAL arch -> CUBIN (native SASS) */
   const char*mr=getenv("CRACK_MAXREG");
   const char*def=getenv("CRACK_DEF");   /* e.g. -DSHA512_UNROLL16 for A/B experiments */
   char *src=inline_includes(k_slurp(cu_path),cu_path);
-  /* PTX cache: NVRTC compile of the full EC+taproot module is slow (~2-3 min);
-     cache the PTX keyed by source+arch hash so unchanged source loads instantly. */
-  char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(def?fnv1a(def):0));
+  /* CUBIN cache: NVRTC compiles AND ptxas-assembles to native SASS ONCE (slow), cached as a
+     .cubin keyed by source+arch(+maxreg). Loading a cubin needs NO driver JIT -- this dodges
+     the driver's own ptxas entirely (some older drivers, e.g. 595, hang JIT-ing this big
+     kernel to sm_120 for minutes), and makes first-run cheaper everywhere. */
+  char key[128]; snprintf(key,sizeof key,"%llx",fnv1a(src)^fnv1a(arch)^(mr?fnv1a(mr):0)^(def?fnv1a(def):0));
   /* handshake key is arch-INDEPENDENT (source only): a mixed-GPU hive runs the same
-     source to the same canonical ranks, so it must not self-refuse on differing arch.
-     The PTX cache filename (key, above) keeps arch so different-arch PTX never collide. */
+     source to the same canonical ranks, so it must not self-refuse on differing arch. */
   snprintf(g_ptx_key,sizeof g_ptx_key,"%llx",fnv1a(src)^(def?fnv1a(def):0));
-  char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_ptx_%s.ptx",key);
-  char *ptx=0; FILE*cf=fopen(cpath,"rb");
+  char cpath[256]; snprintf(cpath,sizeof cpath,"/tmp/bip39rxcrack_cubin_%s.cubin",key);
+  char *img=0; size_t imgn=0; FILE*cf=fopen(cpath,"rb");
   if(cf && !getenv("CRACK_NOCACHE")){
-    fseek(cf,0,SEEK_END); long pn=ftell(cf); fseek(cf,0,SEEK_SET); ptx=malloc(pn+1);
-    if(fread(ptx,1,pn,cf)==(size_t)pn){ ptx[pn]=0; } else { free(ptx); ptx=0; } fclose(cf);
+    fseek(cf,0,SEEK_END); long pn=ftell(cf); fseek(cf,0,SEEK_SET);
+    if(pn>0){ img=malloc(pn); if(fread(img,1,pn,cf)==(size_t)pn){ imgn=(size_t)pn; } else { free(img); img=0; } } fclose(cf);
   } else if(cf) fclose(cf);
-  if(!ptx){
-    /* Cache MISS: this is the slow one-time NVRTC compile (minutes, no further output
-       while it runs). Warn loudly so a stalled-looking run is understood, not killed. */
+  if(!img){
+    /* Cache MISS: the slow one-time compile+assemble (minutes, no output while it runs). */
     double t_compile=now_s();
-    fprintf(stderr,"NVRTC: kernels not cached for this build (compute_%d%d) -- compiling once now.\n"
+    fprintf(stderr,"NVRTC: kernels not cached for this build (sm_%d%d) -- compiling to native SASS once now.\n"
                    "       This takes a few minutes on this host and prints nothing until it finishes;\n"
-                   "       the result is cached (%s) so every later run starts in ~1s.\n",M,m,cpath);
+                   "       the cubin is cached (%s) so every later run starts in ~1s -- and NO driver JIT.\n",M,m,cpath);
     fflush(stderr);
-    const char *opts[]={ arch, def?def:"" }; int nopt = def?2:1;
+    char mrbuf[32]; const char *opts[4]; int nopt=0; opts[nopt++]=arch; if(def) opts[nopt++]=def;
+    if(mr){ snprintf(mrbuf,sizeof mrbuf,"--maxrregcount=%d",atoi(mr)); opts[nopt++]=mrbuf;
+      fprintf(stderr,"(ptxas max registers = %s)\n",mr); }
     nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
     nvrtcResult cr=nvrtcCompileProgram(prog,nopt,opts);
     size_t logn=0; nvrtcGetProgramLogSize(prog,&logn);
@@ -197,18 +199,15 @@ static void build_module(const char *cu_path){
       free(log);
     }
     if(cr!=NVRTC_SUCCESS){ fprintf(stderr,"kernel compile failed\n"); exit(2); }
-    size_t ptxn=0; NVR(nvrtcGetPTXSize(prog,&ptxn)); ptx=malloc(ptxn); NVR(nvrtcGetPTX(prog,ptx)); nvrtcDestroyProgram(&prog);
-    /* Atomic write (tmp+rename): concurrent multi-GPU children never read a
-       half-written PTX -- each sees the old-complete or the new-complete file. */
+    NVR(nvrtcGetCUBINSize(prog,&imgn)); img=malloc(imgn); NVR(nvrtcGetCUBIN(prog,img)); nvrtcDestroyProgram(&prog);
+    /* Atomic write (tmp+rename): concurrent multi-GPU children never read a half-written cubin. */
     char tpath[300]; snprintf(tpath,sizeof tpath,"%s.tmp.%d",cpath,(int)getpid());
-    FILE*wf=fopen(tpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); if(rename(tpath,cpath)) unlink(tpath); }
-    fprintf(stderr,"NVRTC: compiled + cached in %.0fs (later runs skip this).\n",now_s()-t_compile);
+    FILE*wf=fopen(tpath,"wb"); if(wf){ fwrite(img,1,imgn,wf); fclose(wf); if(rename(tpath,cpath)) unlink(tpath); }
+    fprintf(stderr,"NVRTC: compiled to SASS + cached in %.0fs (later runs skip this; no driver JIT).\n",now_s()-t_compile);
   }
   CU(cuCtxCreate(&g_ctx,0,dev));   /* dev/name/M/m already queried above for the arch */
-  { CUjit_option jopt[1]; void*jval[1]; int njit=0;
-    if(mr){ jopt[njit]=CU_JIT_MAX_REGISTERS; jval[njit]=(void*)(size_t)atoi(mr); njit++;
-      fprintf(stderr,"(JIT max registers = %s)\n",mr); }
-    CU(cuModuleLoadDataEx(&g_mod,ptx,njit,jopt,jval)); }
+  CU(cuModuleLoadData(&g_mod,img));   /* cubin is native SASS -> loads directly, no driver JIT */
+  free(img); img=0;
   /* Build the fixed-base comb table once, then point the device global d_comb
      at it so k*G uses the comb (64 adds) instead of double-and-add (~384 ops). */
   { CUdeviceptr tbl; CU(cuMemAlloc(&tbl,(size_t)64*16*8*sizeof(unsigned long long)));
@@ -216,7 +215,7 @@ static void build_module(const char *cu_path){
       void*a[]={&tbl}; CU(cuLaunchKernel(gi,1,1,1,1,1,1,0,0,a,0)); CU(cuCtxSynchronize());
       CUdeviceptr sym; size_t sz; if(cuModuleGetGlobal(&sym,&sz,g_mod,"d_comb")==CUDA_SUCCESS) CU(cuMemcpyHtoD(sym,&tbl,sizeof tbl));
     } }
-  fprintf(stderr,"device %d: %s (sm_%d%d), NVRTC->compute_%d%d PTX->sm_%d%d\n",g_device,name,M,m,M,m,M,m);
+  fprintf(stderr,"device %d: %s (sm_%d%d), NVRTC->sm_%d%d cubin (no driver JIT)\n",g_device,name,M,m,M,m);
   if(getenv("KERN_INFO")){
     const char*ks[]={"g_crack_pass","g_crack_addr","g_crack"};
     for(int i=0;i<3;i++){ CUfunction f; if(cuModuleGetFunction(&f,g_mod,ks[i])!=CUDA_SUCCESS) continue;
@@ -225,7 +224,7 @@ static void build_module(const char *cu_path){
       cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxb,f,128,0);
       fprintf(stderr,"  [kern] %-13s regs=%d local=%dB shared=%dB maxblocks@128=%d\n",ks[i],regs,lmem,smem,maxb); }
   }
-  free(ptx);
+  /* img (cubin) already freed right after cuModuleLoadData */
 }
 static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
 static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?n:1)); if(n&&h) CU(cuMemcpyHtoD(d,h,n)); return d; }
