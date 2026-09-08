@@ -223,15 +223,17 @@ static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?
 /* A/B EXPERIMENT: push the filter1 probe config to the device globals. CRACK_F1_CLASSIC=1
    makes the GPU prefilter probe CLASSIC (k scattered bit-tests over the whole filter of
    prefilter_nblocks*32 B) instead of BLOCKED. Same uploaded bytes -- isolates probe cost. */
-static void push_f1_cfg(unsigned int prefilter_nblocks){
-  int classic=getenv("CRACK_F1_CLASSIC")?atoi(getenv("CRACK_F1_CLASSIC")):0;
-  int k=getenv("CRACK_F1_K")?atoi(getenv("CRACK_F1_K")):(int)BLOOM_K;
+static void push_f1_cfg(int aset_classic,int aset_k,unsigned int prefilter_nblocks){
+  /* the loaded .blf drives this (rsv=1 => classic); CRACK_F1_CLASSIC/_K override it
+     so the SAME blocked .blf can be A/B'd as classic to isolate probe cost. */
+  int classic = getenv("CRACK_F1_CLASSIC") ? atoi(getenv("CRACK_F1_CLASSIC")) : aset_classic;
+  int k = getenv("CRACK_F1_K") ? atoi(getenv("CRACK_F1_K")) : (aset_k?aset_k:(int)BLOOM_K);
   unsigned long long mask=(unsigned long long)prefilter_nblocks*256ull-1ull;   /* nblocks*32B*8 = total bits */
   CUdeviceptr s; size_t z;
   if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_classic")==CUDA_SUCCESS) CU(cuMemcpyHtoD(s,&classic,4));
   if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_k")==CUDA_SUCCESS)       CU(cuMemcpyHtoD(s,&k,4));
   if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_mask")==CUDA_SUCCESS)    CU(cuMemcpyHtoD(s,&mask,8));
-  if(classic) fprintf(stderr,"bloom: filter1 probe = CLASSIC k=%d over %llu bits [A/B experiment]\n",k,(unsigned long long)prefilter_nblocks*256ull);
+  if(classic) fprintf(stderr,"bloom: filter1 probe = CLASSIC k=%d over %llu bits\n",k,(unsigned long long)prefilter_nblocks*256ull);
 }
 
 /* ------------------------- progress reporting -------------------------- */
@@ -728,6 +730,7 @@ typedef struct { uint8_t prog[32]; char *str; int purpose; } AEnt;
 typedef struct { AEnt *ent; long n; uint32_t purposes[8]; int npurp;
                  const uint32_t *host_filter; uint32_t host_filter_nblocks;
                  const uint32_t *prefilter; uint32_t prefilter_nblocks;
+                 int f1_classic, f1_k;    /* filter1: 1 = CLASSIC (over the whole filter), 0 = BLOCKED */
                  int f2_classic, f2_log2bytes, f2_k2; } AddrSet;  /* BLF3: filter2 is a CLASSIC bloom */
 /* classic (non-blocked) bloom over sha256(program): k2 bit positions by double-
    hashing pos_i=(a+i*b) & (2^(log2bytes+3)-1). No block-load variance -> ideal
@@ -828,7 +831,7 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       X->d_bloom=up(hf,fbytes); free(hf); }
-    X->bloom_mask=nb-1; push_f1_cfg(nb);
+    X->bloom_mask=nb-1; push_f1_cfg(aset->f1_classic,aset->f1_k,nb);
     X->hitcap=1u<<18;                                /* 262144 hits/chunk */
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
     X->d_hitcnt=up(&z0,4);
@@ -1081,7 +1084,7 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       M->d_bloom=up(hf,fbytes); free(hf); }
-    M->bloom_mask=nb-1; push_f1_cfg(nb);
+    M->bloom_mask=nb-1; push_f1_cfg(aset->f1_classic,aset->f1_k,nb);
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
     M->bnpurp=aset->npurp; M->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     if(aset->prefilter){
@@ -1428,7 +1431,7 @@ static int crack_pass_setup(PassCtx*P,const char*mnemonic,const PPat*pp,const ui
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       P->d_bloom=up(hf,fbytes); free(hf); }
-    P->bloom_mask=nb-1; push_f1_cfg(nb); P->hitcap=1u<<18;
+    P->bloom_mask=nb-1; push_f1_cfg(aset->f1_classic,aset->f1_k,nb); P->hitcap=1u<<18;
     CU(cuMemAlloc(&P->d_hits,(size_t)P->hitcap*sizeof(BloomHit))); P->d_hitcnt=up(&z0,4);
     P->bnpurp=aset->npurp; P->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     if(aset->prefilter){
@@ -2175,7 +2178,7 @@ static int mode_bloom_sizes(unsigned long long n,double fpr,double gib1,double g
    bloom: filter1 BLOCKED over the raw program (GPU prefilter); filter2 CLASSIC over
    sha256(program) (host cull -- no block-load variance, so ideal FPR). Streamed --
    no sort, no stored programs; only the two filters live in RAM. */
-static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2,const char*other_file){
+static int build_bloom_file(const char*infile,const char*outfile,unsigned long long n_hint,double fpr,double gib1,double gib2,const char*other_file,int classic1){
   uint32_t nb1; int log2b2,k2;
   FILE*of=0; if(other_file){ of=fopen(other_file,"w"); if(!of) fprintf(stderr,"warning: cannot write --bloom-other %s (continuing)\n",other_file); }
   if(gib1>0 && gib2>0){ nb1=gib_to_nblocks(gib1); log2b2=gib_to_log2bytes(gib2);
@@ -2183,13 +2186,16 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   else { if(!n_hint){ fprintf(stderr,"--bloom-build needs --bloom-n N (or --bloom-gib G1,G2 for explicit sizes)\n"); return 2; }
     blf3_size(n_hint,fpr,&nb1,&log2b2,&k2); }
   size_t f1b=(size_t)nb1*32u, f2b=(size_t)1<<log2b2;
+  unsigned long long f1bits=(unsigned long long)f1b*8ull, f1mask=f1bits-1ull;
+  int k1 = classic1 ? classic_optk(f1bits, n_hint?n_hint:1500000000ULL) : (int)BLOOM_K;   /* classic filter1 picks its own k */
+  const char*f1kind = classic1 ? "classic (GPU)" : "blocked (GPU)";
   uint32_t *f1=calloc(f1b,1); uint8_t *f2=calloc(f2b,1);
   if(!f1||!f2){ fprintf(stderr,"oom (filters %.2f GiB)\n",(double)(f1b+f2b)/1073741824.0); return 2; }
-  if(n_hint){ double efpr0=blf_fpr(nb1,n_hint)*classic_fpr((unsigned long long)f2b*8,n_hint,k2);
-    fprintf(stderr,"bloom-build: filter1 %.2f GiB blocked (GPU) + filter2 %.2f GiB classic k=%d (host cull), est FPR ~%.1e (VERIFY with --bloom-stat), streaming...\n",
-            (double)f1b/1073741824.0,(double)f2b/1073741824.0,k2,efpr0); }
-  else fprintf(stderr,"bloom-build: filter1 %.2f GiB blocked (GPU) + filter2 %.2f GiB classic k=%d (host cull), streaming...\n",
-            (double)f1b/1073741824.0,(double)f2b/1073741824.0,k2);
+  if(n_hint){ double fpr1=classic1?classic_fpr(f1bits,n_hint,k1):blf_fpr(nb1,n_hint); double efpr0=fpr1*classic_fpr((unsigned long long)f2b*8,n_hint,k2);
+    fprintf(stderr,"bloom-build: filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d (host cull), est FPR ~%.1e (VERIFY with --bloom-stat), streaming...\n",
+            (double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2,efpr0); }
+  else fprintf(stderr,"bloom-build: filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d (host cull), streaming...\n",
+            (double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2);
   FILE*f=(!strcmp(infile,"-"))?stdin:fopen(infile,"r"); if(!f){ fprintf(stderr,"cannot open %s\n",infile); free(f1); free(f2); return 2; }
   long n=0,bad=0,skip_wsh=0,skip_other=0; uint32_t purposes[8]; int npurp=0; char line[256];
   g_decode_quiet=1;   /* silence per-line errors; we count + categorize instead */
@@ -2200,7 +2206,7 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
       if(!strncmp(s,"bc1",3)) skip_wsh++; else { skip_other++; if(skip_other<=5) fprintf(stderr,"  skip: %s\n",s); if(of) fprintf(of,"%s\n",s); }
       bad++; continue; }
     (void)pl;
-    bloom_insert(f1,pr,nb1-1);
+    if(classic1) bloom_insert_classic(f1,pr,f1mask,k1); else bloom_insert(f1,pr,nb1-1);
     classic_insert(f2,pr,log2b2,k2);         /* filter 2 = classic over sha256(program) */
     int seen=0; for(int k=0;k<npurp;k++) if(purposes[k]==(uint32_t)pu) seen=1;
     if(!seen && npurp<8) purposes[npurp++]=(uint32_t)pu;
@@ -2211,17 +2217,18 @@ static int build_bloom_file(const char*infile,const char*outfile,unsigned long l
   if(!n){ fprintf(stderr,"bloom-build: no valid addresses\n"); return 2; }
   if(bad) fprintf(stderr,"bloom-build: skipped %ld (%ld native-segwit script / other-witness, not seed-derivable; %ld other)\n",bad,skip_wsh,skip_other);
   if(n_hint && (unsigned long long)n>n_hint) fprintf(stderr,"bloom-build: WARNING -- %ld addresses exceeds --bloom-n %llu; FPR is higher than the target\n",n,n_hint);
-  double efpr=blf_fpr(nb1,(uint64_t)n)*classic_fpr((unsigned long long)f2b*8,(uint64_t)n,k2);
+  double fpr1f=classic1?classic_fpr(f1bits,(uint64_t)n,k1):blf_fpr(nb1,(uint64_t)n);
+  double efpr=fpr1f*classic_fpr((unsigned long long)f2b*8,(uint64_t)n,k2);
   FILE*o=fopen(outfile,"wb"); if(!o){ fprintf(stderr,"cannot write %s\n",outfile); return 2; }
   Blf3Header h; memset(&h,0,sizeof h); h.magic=BLF3_MAGIC; h.version=3; h.nblocks1=nb1; h.f2_log2bytes=(uint32_t)log2b2;
-  h.k1=BLOOM_K; h.k2=(uint32_t)k2; h.npurp=(uint32_t)npurp;
+  h.k1=(uint32_t)k1; h.k2=(uint32_t)k2; h.npurp=(uint32_t)npurp; h.rsv=classic1?1u:0u;
   for(int i=0;i<npurp;i++) h.purposes[i]=purposes[i];
   h.n_addrs=(uint64_t)n;
   fwrite(&h,sizeof h,1,o); fwrite(f1,f1b,1,o); fwrite(f2,f2b,1,o);
   if(fclose(o)){ fprintf(stderr,"write error %s\n",outfile); return 2; }
   free(f1); free(f2);
-  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), filter1 %.2f GiB blocked + filter2 %.2f GiB classic k=%d = %.2f GiB, %d purpose(s), est combined FPR ~%.1e -> %s\n",
-          n,bad,(double)f1b/1073741824.0,(double)f2b/1073741824.0,k2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
+  fprintf(stderr,"bloom-build: %ld addresses (%ld skipped), filter1 %.2f GiB %s k1=%d + filter2 %.2f GiB classic k=%d = %.2f GiB, %d purpose(s), est combined FPR ~%.1e -> %s\n",
+          n,bad,(double)f1b/1073741824.0,f1kind,k1,(double)f2b/1073741824.0,k2,(double)(f1b+f2b)/1073741824.0,npurp,efpr,outfile);
   fprintf(stderr,"bloom-build: run `--bloom %s --bloom-stat` to MEASURE the true FPR before trusting it.\n",outfile);
   return 0;
 }
@@ -2246,16 +2253,20 @@ static int load_bloom_file(const char*path,AddrSet*A){
   uint32_t magic=*(uint32_t*)base;
   memset(A,0,sizeof *A);
   if(magic==BLF3_MAGIC){
-    Blf3Header*h=(Blf3Header*)base; if(h->k1!=BLOOM_K){ fprintf(stderr,"%s: k1=%u != %d (rebuild)\n",path,h->k1,BLOOM_K); return 2; }
+    Blf3Header*h=(Blf3Header*)base; int f1_classic=(h->rsv==1);   /* rsv=1 => filter1 is CLASSIC */
+    if(!f1_classic && h->k1!=BLOOM_K){ fprintf(stderr,"%s: k1=%u != %d (rebuild)\n",path,h->k1,BLOOM_K); return 2; }
     size_t f1b=(size_t)h->nblocks1*32u, f2b=(size_t)1<<h->f2_log2bytes;
     A->prefilter=(const uint32_t*)((uint8_t*)base+sizeof(Blf3Header)); A->prefilter_nblocks=h->nblocks1;
+    A->f1_classic=f1_classic; A->f1_k=(int)h->k1;
     A->host_filter=(const uint32_t*)((uint8_t*)base+sizeof(Blf3Header)+f1b);
     A->f2_classic=1; A->f2_log2bytes=(int)h->f2_log2bytes; A->f2_k2=(int)h->k2;
     A->npurp=(int)h->npurp; for(int i=0;i<A->npurp&&i<8;i++) A->purposes[i]=h->purposes[i];
     if(A->npurp==0){ A->npurp=4; A->purposes[0]=44; A->purposes[1]=49; A->purposes[2]=84; A->purposes[3]=86; }
-    double efpr=blf_fpr(h->nblocks1,h->n_addrs)*classic_fpr(f2b*8,h->n_addrs,(int)h->k2);
-    fprintf(stderr,"bloom: loaded %s (BLF3) -- %llu addresses, filter1 %.2f GiB blocked + filter2 %.2f GiB classic k=%u, est FPR ~%.1e, %d purpose(s)\n",
-            path,(unsigned long long)h->n_addrs,(double)f1b/1073741824.0,(double)f2b/1073741824.0,h->k2,efpr,A->npurp);
+    double fpr1=f1_classic ? classic_fpr((unsigned long long)f1b*8,h->n_addrs,(int)h->k1) : blf_fpr(h->nblocks1,h->n_addrs);
+    double efpr=fpr1*classic_fpr(f2b*8,h->n_addrs,(int)h->k2);
+    char f1desc[32]; if(f1_classic) snprintf(f1desc,sizeof f1desc,"classic k=%u",h->k1); else snprintf(f1desc,sizeof f1desc,"blocked");
+    fprintf(stderr,"bloom: loaded %s (BLF3) -- %llu addresses, filter1 %.2f GiB %s + filter2 %.2f GiB classic k=%u, est FPR ~%.1e, %d purpose(s)\n",
+            path,(unsigned long long)h->n_addrs,(double)f1b/1073741824.0,f1desc,(double)f2b/1073741824.0,h->k2,efpr,A->npurp);
     return 0;
   }
   if(magic==BLF_MAGIC){   /* legacy blocked-filter2 */
@@ -2285,7 +2296,11 @@ static double bloom_fill(const uint32_t*f,uint32_t nblocks){
 static int mode_bloom_stat(const char*file){
   AddrSet A; if(load_bloom_file(file,&A)) return 2;
   double fill1=bloom_fill(A.prefilter,A.prefilter_nblocks);
-  fprintf(stderr,"filter 1 (GPU, blocked): %u blocks, fill %.4f (%.2f%% bits set)\n",A.prefilter_nblocks,fill1,100*fill1);
+  unsigned long long f1mask_stat=(unsigned long long)A.prefilter_nblocks*256ull-1ull;
+  if(A.f1_classic) fprintf(stderr,"filter 1 (GPU, CLASSIC k=%d): %.2f GiB (%llu bits), fill %.4f (%.2f%% bits set)\n",
+          A.f1_k,(double)A.prefilter_nblocks*32.0/1073741824.0,f1mask_stat+1,fill1,100*fill1);
+  else fprintf(stderr,"filter 1 (GPU, blocked): %u blocks (%.2f GiB), fill %.4f (%.2f%% bits set)\n",
+          A.prefilter_nblocks,(double)A.prefilter_nblocks*32.0/1073741824.0,fill1,100*fill1);
   double fill2;
   if(A.f2_classic){ size_t f2b=(size_t)1<<A.f2_log2bytes;
     const unsigned long long*p=(const unsigned long long*)A.host_filter; size_t nq=f2b/8; unsigned long long set=0;
@@ -2335,7 +2350,8 @@ static int mode_bloom_check(const char*file,const char*addrs){
   char *dup=strdup(addrs),*save=0;
   for(char*a=strtok_r(dup,",",&save); a; a=strtok_r(0,",",&save)){
     uint8_t pr[32]; memset(pr,0,32); int pl,pu; if(decode_address(a,pr,&pl,&pu)){ fprintf(stderr,"%s: bad address\n",a); continue; }
-    int h1=bloom_probe(A.prefilter,pr,A.prefilter_nblocks-1);
+    int h1 = A.f1_classic ? bloom_probe_classic(A.prefilter,pr,(unsigned long long)A.prefilter_nblocks*256ull-1ull,A.f1_k)
+                          : bloom_probe(A.prefilter,pr,A.prefilter_nblocks-1);
     int h2; if(A.f2_classic) h2=classic_probe((const uint8_t*)A.host_filter,pr,A.f2_log2bytes,A.f2_k2);
     else { uint8_t sh[32]; sha256_host(pr,32,sh); h2=bloom_probe(A.host_filter,sh,A.host_filter_nblocks-1); }
     printf("%s  purpose=%d  filter1=%s  filter2=%s  => %s\n",a,pu,h1?"HIT":"miss",h2?"HIT":"miss",
@@ -2557,6 +2573,7 @@ int main(int argc,char**argv){
   unsigned long long bloom_n=0; double bloom_fpr=1e-12;   /* --bloom-build sizing */
   double bloom_gib1=0, bloom_gib2=0;                       /* --bloom-gib G1,G2 explicit sizes */
   const char *bloom_other=0;                               /* --bloom-other FILE: dump 'other' skips */
+  int bloom_classic1=0;                                    /* --classic1: build filter1 CLASSIC (fits smaller cards, better FPR) */
   unsigned long long bloom_sizes=0; int bloom_sizes_set=0;  /* --bloom-sizes N: dry-run sizing */
   const char *resumearg=0;
   int devs[16], ndev=0, device_set=0;   /* --devices/--gpus: fan out one child per GPU */
@@ -2604,6 +2621,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--fpr")&&i+1<argc){ double v=atof(argv[++i]); if(v>0&&v<1) bloom_fpr=v; }
     else if(!strcmp(argv[i],"--bloom-gib")&&i+1<argc){ sscanf(argv[++i],"%lf,%lf",&bloom_gib1,&bloom_gib2); }
     else if(!strcmp(argv[i],"--bloom-other")&&i+1<argc) bloom_other=argv[++i];
+    else if(!strcmp(argv[i],"--classic1")) bloom_classic1=1;
     else if(!strcmp(argv[i],"--bloom-sizes")&&i+1<argc){ bloom_sizes=strtoull(argv[++i],0,10); bloom_sizes_set=1; }
     else if(!strcmp(argv[i],"--template")&&i+1<argc) templ=argv[++i];
     else if(!strcmp(argv[i],"--pattern")&&i+1<argc) patt=argv[++i];
@@ -2727,7 +2745,7 @@ int main(int argc,char**argv){
   }
   /* gate/util modes need no pattern */
   if(bloom_selftest) return mode_bloom_selftest(bloom_selftest_n);
-  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2,bloom_other); }
+  if(bbuild_out){ return build_bloom_file(bbuild_in,bbuild_out,bloom_n,bloom_fpr,bloom_gib1,bloom_gib2,bloom_other,bloom_classic1); }
   if(decodearg){ uint8_t pr[32]; int pl,pu; if(decode_address(decodearg,pr,&pl,&pu)) return 2;
     char h[66]; tohex_(pr,pl,h); printf("%d %s\n",pu,h); return 0; }
   if(profile) return mode_profile(cu);
