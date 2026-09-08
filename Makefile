@@ -30,8 +30,10 @@ RXE_DIR   ?= ../rxe
 LIBRXE     = $(RXE_DIR)/librxe.a
 
 INC  = -I$(CUDA_HOME)/include -I$(NVRTC_HOME)/include -I$(RXE_DIR) -DNVRTC_LIBDIR='"$(NVRTC_HOME)/lib64"'
-# libnvrtc from NVRTC_HOME (rpath so libnvrtc.so.N resolves at runtime); libcuda from driver.
-LIBS = -L$(NVRTC_HOME)/lib64 -lnvrtc -Wl,-rpath,$(NVRTC_HOME)/lib64 -L$(DRIVER_LIB) -lcuda
+# libnvrtc from NVRTC_HOME (rpath so libnvrtc.so.N resolves at runtime). For -lcuda:
+# prefer a real driver libcuda.so if present, else the toolkit stub (NEEDED soname is
+# libcuda.so.1 either way; the real driver lib loads at runtime from the default path).
+LIBS = -L$(NVRTC_HOME)/lib64 -lnvrtc -Wl,-rpath,$(NVRTC_HOME)/lib64 -L$(DRIVER_LIB) -L$(NVRTC_HOME)/lib64/stubs -lcuda
 RXELIBS = $(LIBRXE) -lgmp -lm -lpthread
 
 BIN = phase1gate

@@ -49,6 +49,24 @@ BLOOM_FN int bloom_probe(const unsigned int *filter, const unsigned char *P, uns
   for(int j=0;j<BLOOM_K;j++){ unsigned int pos = P[4+j]; if(!(b[pos>>5] & (1u<<(pos&31u)))) return 0; }
   return 1;
 }
+/* CLASSIC (non-blocked) bloom over the SAME already-uniform program -- no rehash.
+ * The program is itself a hash, so seed the two double-hashing values a,b straight
+ * from its first 16 bytes (Kirsch-Mitzenmacher); the k positions p_i=(a+i*b)&mask
+ * scatter over the WHOLE filter (mask = totalbits-1), not one 32B block -> no
+ * block-load variance -> ideal FPR ~0.5^k. Same code host (build) + device (probe).
+ * (filter2's classic path rehashes via sha256 only to stay INDEPENDENT of the
+ * blocked filter1; a single classic filter has nothing to decorrelate from.) */
+BLOOM_FN unsigned long long bloom_ab_seed(const unsigned char *P, unsigned long long *bo){
+  unsigned long long a=0,b=0; int i;
+  for(i=0;i<8;i++){ a|=(unsigned long long)P[i]<<(8*i); b|=(unsigned long long)P[8+i]<<(8*i); }
+  *bo=b|1ull; return a; }
+BLOOM_FN void bloom_insert_classic(unsigned int *filter,const unsigned char *P,unsigned long long bits_mask,int k){
+  unsigned char *fb=(unsigned char*)filter; unsigned long long b,a=bloom_ab_seed(P,&b);
+  for(int i=0;i<k;i++){ unsigned long long p=(a+(unsigned long long)i*b)&bits_mask; fb[p>>3]|=(unsigned char)(1u<<(p&7)); } }
+BLOOM_FN int bloom_probe_classic(const unsigned int *filter,const unsigned char *P,unsigned long long bits_mask,int k){
+  const unsigned char *fb=(const unsigned char*)filter; unsigned long long b,a=bloom_ab_seed(P,&b);
+  for(int i=0;i<k;i++){ unsigned long long p=(a+(unsigned long long)i*b)&bits_mask; if(!((fb[p>>3]>>(p&7))&1u)) return 0; } return 1; }
+
 /* pick nblocks (power of two) for n keys at ~bits_per_key; filter = nblocks*32 B. */
 BLOOM_FN unsigned int bloom_nblocks(unsigned long long n, double bits_per_key){
   double blocks = ((double)n * bits_per_key) / 256.0;

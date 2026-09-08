@@ -18,6 +18,17 @@
 #define MN_STRIDE 256   /* max reconstructed mnemonic bytes (24w * ~9 + slack) */
 #define HARD 0x80000000u
 
+/* A/B EXPERIMENT: filter1 (GPU prefilter) probe algorithm, set once at crack setup
+ * from CRACK_F1_CLASSIC. 0 = BLOCKED (default: one 32B cache-line/probe); 1 = CLASSIC
+ * (k scattered bit-tests over the whole filter -> better FPR, more memory accesses).
+ * The crack is PBKDF2-bound, so this tests whether blocking bought us anything. */
+__device__ int d_f1_classic=0;
+__device__ int d_f1_k=BLOOM_K;
+__device__ unsigned long long d_f1_mask=0;
+__device__ static inline int f1_probe(const u32 *bloom,const u8 *prog,u32 bmask){
+  return d_f1_classic ? bloom_probe_classic(bloom,prog,d_f1_mask,d_f1_k)
+                      : bloom_probe(bloom,prog,bmask); }
+
 /* Bloom variant of derive_address_match: for a SET of targets (a blocked bloom),
  * probe every derived program across change x gap and APPEND each hit to a buffer
  * for the host to cull. Unlike the single-target path there may be many hits
@@ -47,7 +58,7 @@ __device__ void derive_address_bloom(const u8 seed[64], const u32 *purposes, int
           u8 ki[32]; modn_add(IL,kch,ki);
           u8 pub[33]; scalar_mul_G(ki,pub);
           u8 prog[32]; int pl; pub_to_program(pub,(int)purpose,prog,&pl);
-          if(bloom_probe(bloom,prog,bmask)){
+          if(f1_probe(bloom,prog,bmask)){
             unsigned int slot=atomicAdd(hitcnt,1u);
             if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=gidx; r->change=c; r->index=i; r->purpose=purpose; r->account=acct;
               for(int b=0;b<tlen;b++) r->prog[b]=prog[b]; for(int b=tlen;b<32;b++) r->prog[b]=0; }
@@ -153,7 +164,7 @@ extern "C" __global__ void g_crack_bloom(const u8 *bw_data, const int *bw_off, c
     for(int pp=0; pp<npurp; pp++){
       u32 idx3[3]={ purposes[pp]|HARD, 0u|HARD, 0u|HARD };
       u8 cc[32],kk[32]; derive_hardened(seed,64,idx3,3,cc,kk);
-      if(bloom_probe(bloom,cc,bmask)){
+      if(f1_probe(bloom,cc,bmask)){
         unsigned int slot=atomicAdd(hitcnt,1u);
         if(slot<hitcap){ BloomHit *r=&hits[slot]; r->gidx=j; r->change=0; r->index=0; r->account=0; r->purpose=purposes[pp];
           for(int b=0;b<32;b++) r->prog[b]=cc[b]; }

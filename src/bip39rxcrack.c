@@ -220,6 +220,19 @@ static void build_module(const char *cu_path){
 }
 static CUfunction kern(const char*n){ CUfunction f; CU(cuModuleGetFunction(&f,g_mod,n)); return f; }
 static CUdeviceptr up(const void*h,size_t n){ CUdeviceptr d; CU(cuMemAlloc(&d,n?n:1)); if(n&&h) CU(cuMemcpyHtoD(d,h,n)); return d; }
+/* A/B EXPERIMENT: push the filter1 probe config to the device globals. CRACK_F1_CLASSIC=1
+   makes the GPU prefilter probe CLASSIC (k scattered bit-tests over the whole filter of
+   prefilter_nblocks*32 B) instead of BLOCKED. Same uploaded bytes -- isolates probe cost. */
+static void push_f1_cfg(unsigned int prefilter_nblocks){
+  int classic=getenv("CRACK_F1_CLASSIC")?atoi(getenv("CRACK_F1_CLASSIC")):0;
+  int k=getenv("CRACK_F1_K")?atoi(getenv("CRACK_F1_K")):(int)BLOOM_K;
+  unsigned long long mask=(unsigned long long)prefilter_nblocks*256ull-1ull;   /* nblocks*32B*8 = total bits */
+  CUdeviceptr s; size_t z;
+  if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_classic")==CUDA_SUCCESS) CU(cuMemcpyHtoD(s,&classic,4));
+  if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_k")==CUDA_SUCCESS)       CU(cuMemcpyHtoD(s,&k,4));
+  if(cuModuleGetGlobal(&s,&z,g_mod,"d_f1_mask")==CUDA_SUCCESS)    CU(cuMemcpyHtoD(s,&mask,8));
+  if(classic) fprintf(stderr,"bloom: filter1 probe = CLASSIC k=%d over %llu bits [A/B experiment]\n",k,(unsigned long long)prefilter_nblocks*256ull);
+}
 
 /* ------------------------- progress reporting -------------------------- */
 /* -p [SECS] : human line to stderr every SECS (default 1.0); ETA from a
@@ -815,7 +828,7 @@ static int crack_addr_setup(CrackCtx*X,const Words*W,const uint8_t tprog[32],int
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       X->d_bloom=up(hf,fbytes); free(hf); }
-    X->bloom_mask=nb-1;
+    X->bloom_mask=nb-1; push_f1_cfg(nb);
     X->hitcap=1u<<18;                                /* 262144 hits/chunk */
     CU(cuMemAlloc(&X->d_hits,(size_t)X->hitcap*sizeof(BloomHit)));
     X->d_hitcnt=up(&z0,4);
@@ -1068,7 +1081,7 @@ static int crack_missing_setup(MissCtx*M,const char*tpl,const uint8_t tprog[32],
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       M->d_bloom=up(hf,fbytes); free(hf); }
-    M->bloom_mask=nb-1;
+    M->bloom_mask=nb-1; push_f1_cfg(nb);
     M->hitcap=1u<<18; CU(cuMemAlloc(&M->d_hits,(size_t)M->hitcap*sizeof(BloomHit))); M->d_hitcnt=up(&z0,4);
     M->bnpurp=aset->npurp; M->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     if(aset->prefilter){
@@ -1415,7 +1428,7 @@ static int crack_pass_setup(PassCtx*P,const char*mnemonic,const PPat*pp,const ui
       nb=bloom_nblocks((uint64_t)ntgt,bpk); fbytes=(size_t)nb*8u*4u;
       uint32_t *hf=calloc(fbytes,1); for(long i=0;i<aset->n;i++) bloom_insert(hf,aset->ent[i].prog,nb-1);
       P->d_bloom=up(hf,fbytes); free(hf); }
-    P->bloom_mask=nb-1; P->hitcap=1u<<18;
+    P->bloom_mask=nb-1; push_f1_cfg(nb); P->hitcap=1u<<18;
     CU(cuMemAlloc(&P->d_hits,(size_t)P->hitcap*sizeof(BloomHit))); P->d_hitcnt=up(&z0,4);
     P->bnpurp=aset->npurp; P->d_purposes=up(aset->purposes,(size_t)aset->npurp*sizeof(uint32_t));
     if(aset->prefilter){
