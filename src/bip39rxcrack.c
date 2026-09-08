@@ -153,6 +153,7 @@ static void kernel_source_key(const char*cu_path,char*out,size_t outn){
   const char*def=getenv("CRACK_DEF");   /* arch-INDEPENDENT: matches build_module's g_ptx_key */
   char *src=inline_includes(k_slurp(cu_path),cu_path);
   snprintf(out,outn,"%llx",fnv1a(src)^(def?fnv1a(def):0)); free(src); }
+static double now_s(void);   /* defined below; used for the compile-timing message */
 static void build_module(const char *cu_path){
   if(g_mod) return;   /* idempotent: a persistent worker builds its context once */
   /* Target the ACTUAL device's compute capability (portable across GPUs: compute_86
@@ -180,6 +181,13 @@ static void build_module(const char *cu_path){
     if(fread(ptx,1,pn,cf)==(size_t)pn){ ptx[pn]=0; } else { free(ptx); ptx=0; } fclose(cf);
   } else if(cf) fclose(cf);
   if(!ptx){
+    /* Cache MISS: this is the slow one-time NVRTC compile (minutes, no further output
+       while it runs). Warn loudly so a stalled-looking run is understood, not killed. */
+    double t_compile=now_s();
+    fprintf(stderr,"NVRTC: kernels not cached for this build (compute_%d%d) -- compiling once now.\n"
+                   "       This takes a few minutes on this host and prints nothing until it finishes;\n"
+                   "       the result is cached (%s) so every later run starts in ~1s.\n",M,m,cpath);
+    fflush(stderr);
     const char *opts[]={ arch, def?def:"" }; int nopt = def?2:1;
     nvrtcProgram prog; NVR(nvrtcCreateProgram(&prog,src,"crack_kernels.cu",0,0,0));
     nvrtcResult cr=nvrtcCompileProgram(prog,nopt,opts);
@@ -194,6 +202,7 @@ static void build_module(const char *cu_path){
        half-written PTX -- each sees the old-complete or the new-complete file. */
     char tpath[300]; snprintf(tpath,sizeof tpath,"%s.tmp.%d",cpath,(int)getpid());
     FILE*wf=fopen(tpath,"wb"); if(wf){ fwrite(ptx,1,strlen(ptx),wf); fclose(wf); if(rename(tpath,cpath)) unlink(tpath); }
+    fprintf(stderr,"NVRTC: compiled + cached in %.0fs (later runs skip this).\n",now_s()-t_compile);
   }
   CU(cuCtxCreate(&g_ctx,0,dev));   /* dev/name/M/m already queried above for the arch */
   { CUjit_option jopt[1]; void*jval[1]; int njit=0;
